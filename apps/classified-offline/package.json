@@ -1,0 +1,10 @@
+{
+	"name": "docxtool-classified-offline",
+	"version": "0.1.0",
+	"private": true,
+	"addonType": "wps",
+	"scripts": {
+		"dev": "vite --port 3889",
+		"build": "vite build"
+	}
+}

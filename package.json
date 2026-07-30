@@ -1,0 +1,32 @@
+{
+  "name": "docxtool-wps",
+  "version": "1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.base.json",
+    "typecheck": "tsc -p tsconfig.base.json --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "build:classified": "npm --prefix apps/classified-offline run build",
+    "build:online": "npm --prefix apps/standard-online run build",
+    "serve:classified": "npm --prefix apps/classified-offline run dev",
+    "serve:online": "npm --prefix apps/standard-online run dev",
+    "verify:manifest": "node scripts/verify-addin.mjs",
+    "verify:addin": "node scripts/verify-addin.mjs",
+    "publish:classified": "npm run verify:addin -- classified-offline && cd apps/classified-offline && npx --no-install wpsjs debug -s",
+    "publish:online": "npm run verify:addin -- standard-online && cd apps/standard-online && npx --no-install wpsjs debug -s",
+    "unpublish:classified": "cd apps/classified-offline && npx --no-install wpsjs unpublish",
+    "unpublish:online": "cd apps/standard-online && npx --no-install wpsjs unpublish",
+    "e2e:classified:prepare": "pwsh -NoProfile -File scripts/e2e-classified.ps1 prepare",
+    "e2e:classified:status": "pwsh -NoProfile -File scripts/e2e-classified.ps1 status",
+    "e2e:classified:stop": "pwsh -NoProfile -File scripts/e2e-classified.ps1 stop",
+    "e2e:classified:report": "pwsh -NoProfile -File scripts/e2e-classified.ps1 report"
+  },
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "typescript": "5.8.3",
+    "vite": "5.4.19",
+    "wps-jsapi": "^1.0.5",
+    "wpsjs": "^2.2.3"
+  }
+}

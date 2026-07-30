@@ -1,0 +1,16 @@
+.runtime/
+apps/classified-offline/ui/e2e-session.js
+tests/e2e-work/
+node_modules/
+dist/
+wps-addon-publish/
+*.whl
+*.log
+*.tsbuildinfo
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+tests/e2e-render-grid-clean/
+tests/e2e-render-grid/
+tests/e2e-render-v9/
+tests/grid-line-only-render/

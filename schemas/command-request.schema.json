@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docxtool.local/schemas/command-request.schema.json",
+  "title": "CommandRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "recognition_result", "profile_id", "profile_version", "client_capabilities", "product_version", "authorization_scope"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9-]{16,64}$"},
+    "recognition_result": {"$ref": "recognition-result.schema.json"},
+    "profile_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,80}$"},
+    "profile_version": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,40}$"},
+    "client_capabilities": {"$ref": "client-capabilities.schema.json"},
+    "product_version": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,40}$"},
+    "authorization_scope": {"enum": ["classified-offline", "standard-online"]}
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docxtool.local/schemas/execution-result.schema.json",
+  "title": "ExecutionResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "transaction_id", "executed_command_ids", "skipped_command_ids", "failed_command_id", "warnings", "rolled_back", "document_revision"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "transaction_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "executed_command_ids": {"type": "array", "items": {"type": "string", "pattern": "^cmd-[0-9]{6}$"}},
+    "skipped_command_ids": {"type": "array", "items": {"type": "string", "pattern": "^cmd-[0-9]{6}$"}},
+    "failed_command_id": {"type": ["string", "null"], "pattern": "^cmd-[0-9]{6}$"},
+    "warnings": {"type": "array", "items": {"type": "string", "maxLength": 200}},
+    "rolled_back": {"type": "boolean"},
+    "document_revision": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}
+  }
+}
