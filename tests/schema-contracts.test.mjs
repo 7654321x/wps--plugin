@@ -7,6 +7,7 @@ const names = [
   "recognition-result.schema.json",
   "command-request.schema.json",
   "formatting-command-set.schema.json",
+  "formatting-command-set-1.1.schema.json",
   "client-capabilities.schema.json",
   "execution-result.schema.json",
 ];
@@ -30,10 +31,10 @@ const capabilities = {
   capabilities: ["paragraph.font", "paragraph.alignment", "paragraph.indent", "paragraph.spacing", "section.page_setup"],
 };
 const commandSet = {
-  schema_version: "1.0", request_id: "request-00000001", service_version: "0.1.0", warnings: [],
+  schema_version: "1.1", request_id: "request-00000001", service_version: "1.0", profile_id: "default", profile_version: "1.0", warnings: [],
   commands: [{
     command_id: "cmd-000001", kind: "paragraph.set_alignment",
-    target: { target_id: "doc-1:p:0:0", source_paragraph_index: 0, text_sha256: SHA },
+    target: { target_id: "doc-1:p:0:0", source_paragraph_index: 0, text_sha256: SHA, text_length: 8, occurrence_index: 0 },
     arguments: { alignment: "justify" }, required_capability: "paragraph.alignment", on_unsupported: "skip",
   }],
 };
@@ -47,7 +48,7 @@ test("all frozen protocol fixtures validate against their JSON Schemas", () => {
       profile_id: "default", profile_version: "1.0", client_capabilities: capabilities,
       product_version: "0.1.0", authorization_scope: "classified-offline",
     },
-    "formatting-command-set.schema.json": commandSet,
+    "formatting-command-set-1.1.schema.json": commandSet,
     "execution-result.schema.json": {
       schema_version: "1.0", transaction_id: "mock-tx-1", executed_command_ids: ["cmd-000001"],
       skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: "rev-1",

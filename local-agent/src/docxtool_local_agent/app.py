@@ -10,7 +10,7 @@ from docxtool.sdk import RecognitionInputError, RecognitionSdkError, recognize_d
 
 
 MAX_REQUEST_BYTES = 32 * 1024
-DEVELOPMENT_ORIGIN = "http://127.0.0.1:3890"
+DEVELOPMENT_ORIGIN = "http://127.0.0.1:3889"
 
 
 def _response(start_response, status, payload, origin=""):
@@ -29,7 +29,11 @@ def _response(start_response, status, payload, origin=""):
 
 
 def _recognized_plan(source_path):
-    plan = recognize_docx(source_path)
+    # The wheel's legacy compatibility mode is its established rendering
+    # vocabulary.  The WPS adapter translates that closed vocabulary to the
+    # newer protocol types; authoritative mode currently reclassifies plain
+    # title fixtures to body before the adapter can preserve their role.
+    plan = recognize_docx(source_path, recognition_mode="legacy")
     return plan.to_dict()
 
 
@@ -85,6 +89,14 @@ def create_app(session_token, e2e_runtime=None, command_endpoint=""):
                 return _response(start_response, "200 OK", result, origin)
             except (UnicodeDecodeError, ValueError, TypeError):
                 return _response(start_response, "400 Bad Request", {"ok": False, "error_code": "READONLY_CHAIN_FAILED"}, origin)
+        if e2e_runtime and method == "POST" and path == "/v1/e2e/format-plan":
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+                payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+                result = run_readonly_chain(e2e_runtime, payload.get("session_id"), command_endpoint, session_token, include_plan=True)
+                return _response(start_response, "200 OK", result, origin)
+            except (UnicodeDecodeError, ValueError, TypeError):
+                return _response(start_response, "400 Bad Request", {"ok": False, "error_code": "FORMAT_PLAN_FAILED"}, origin)
         if method != "POST" or path != "/v1/recognize":
             return _response(start_response, "404 Not Found", {
                 "error": {"code": "NOT_FOUND"},

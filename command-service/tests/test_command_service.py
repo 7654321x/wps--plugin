@@ -101,6 +101,17 @@ def test_pure_core_and_local_cloud_http_produce_identical_commands():
     ]
 
 
+def test_title_continuation_uses_the_frozen_main_title_profile():
+    payload = request_payload()
+    payload["recognition_result"]["paragraphs"][0]["recognized_type"] = "title_continuation"
+    commands = build_formatting_commands(payload)["commands"]
+    font = next(item for item in commands if item["kind"] == "paragraph.set_font")
+    alignment = next(item for item in commands if item["kind"] == "paragraph.set_alignment")
+    assert font["arguments"]["east_asia_font_name"] == "方正小标宋简体"
+    assert font["arguments"]["font_size_pt"] == 22
+    assert alignment["arguments"]["alignment"] == "center"
+
+
 def test_http_requires_the_mode_specific_authentication():
     server, _ = _serve(create_app("local", "local-token"))
     try:
@@ -114,12 +125,12 @@ def test_http_requires_the_mode_specific_authentication():
 def test_cors_preflight_allows_only_fixed_taskpane_origin():
     environ = {}
     setup_testing_defaults(environ)
-    environ.update(REQUEST_METHOD="OPTIONS", PATH_INFO="/v1/commands", HTTP_ORIGIN="http://127.0.0.1:3890", wsgi_input=io.BytesIO())
+    environ.update(REQUEST_METHOD="OPTIONS", PATH_INFO="/v1/commands", HTTP_ORIGIN="http://127.0.0.1:3889", wsgi_input=io.BytesIO())
     captured = {}
     body = b"".join(create_app("local", "local-token")(environ, lambda status, headers: captured.update(status=status, headers=dict(headers))))
     assert body == b"{}"
     assert captured["status"] == "204 No Content"
-    assert captured["headers"]["Access-Control-Allow-Origin"] == "http://127.0.0.1:3890"
+    assert captured["headers"]["Access-Control-Allow-Origin"] == "http://127.0.0.1:3889"
     assert "Authorization" in captured["headers"]["Access-Control-Allow-Headers"]
     environ["HTTP_ORIGIN"] = "https://example.invalid"
     create_app("local", "local-token")(environ, lambda status, headers: captured.update(status=status, headers=dict(headers)))

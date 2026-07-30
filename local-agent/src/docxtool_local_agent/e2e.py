@@ -25,6 +25,27 @@ RECOGNIZED_TYPES = {
 }
 SECTION_KINDS = {"header", "dispatch_meta", "recipient", "body", "meeting_meta", "signature", "source_note", "embedded_document", "attachment_note", "attachment_body"}
 
+# The recognition wheel intentionally preserves its long-lived renderer
+# vocabulary (for example ``title`` and ``sign_date``).  The WPS protocol is
+# newer and uses its own closed vocabulary.  Keep the translation at this
+# boundary so neither the command service nor the WPS executor needs legacy
+# field fallbacks.
+CONTRACT_TYPE_BY_WHEEL_TYPE = {
+    "title": "main_title",
+    "title_cont": "title_continuation",
+    "addressing": "recipient",
+    "sign_org": "signature_org",
+    "sign_date": "signature_date",
+    "responsibility_line": "body",
+    "note": "source_note",
+}
+
+
+def contract_type(wheel_type):
+    """Return one closed protocol role, safely defaulting prose-like types."""
+    value = CONTRACT_TYPE_BY_WHEEL_TYPE.get(str(wheel_type), str(wheel_type))
+    return value if value in RECOGNIZED_TYPES else "body"
+
 
 def _session_path(runtime_root):
     return Path(runtime_root) / "current.json"
@@ -127,7 +148,7 @@ def guard_test_document(runtime_root, session_id, source_path):
         return {"ok": False, "error_code": "E2E_TEST_DOCUMENT_REQUIRED"}
 
 
-def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token):
+def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token, include_plan=False):
     """Run the redacted recognition-to-command flow without exposing a path or token."""
     try:
         session = load_session(runtime_root)
@@ -140,7 +161,11 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
             source = (Path(runtime_root) / session_id / metadata["working_file"]).resolve()
         before = hashlib.sha256(source.read_bytes()).hexdigest()
         paragraphs = [paragraph.text for paragraph in Document(source).paragraphs]
-        plan = recognize_docx(source).to_dict()
+        # The wheel's legacy compatibility result is the renderer contract
+        # used by the existing docxtool formatting engine.  It remains the
+        # same local SDK entry point, but avoids an authoritative-mode
+        # reclassification of deliberately plain E2E fixture paragraphs.
+        plan = recognize_docx(source, recognition_mode="legacy").to_dict()
         after = hashlib.sha256(source.read_bytes()).hexdigest()
         if before != after:
             return {"ok": False, "error_code": "INPUT_FILE_CHANGED"}
@@ -156,7 +181,7 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
             occurrence = occurrences.get(text_hash, 0)
             occurrences[text_hash] = occurrence + 1
             target_id = "e2e:%s:%d:%d" % (before[:16], index, occurrence)
-            recognized_type = "main_title" if block["type_id"] == "title" else block["type_id"]
+            recognized_type = contract_type(block["type_id"])
             recognition_paragraphs.append({
                 "target_id": target_id, "source_paragraph_index": index,
                 "recognized_type": recognized_type if recognized_type in RECOGNIZED_TYPES else "unknown",
@@ -198,7 +223,13 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
         allowed = {"paragraph.set_font", "paragraph.set_alignment", "paragraph.set_indent", "paragraph.set_spacing", "section.set_page_setup"}
         if not all(kind in allowed for kind in kinds):
             return {"ok": False, "error_code": "UNKNOWN_COMMAND"}
-        return {"ok": True, "command_count": len(kinds), "anchors": anchors}
+        result = {"ok": True, "command_count": len(kinds), "anchors": anchors}
+        if include_plan:
+            # Both payloads are redacted contracts: hashes, indices, role names
+            # and format values only. They contain neither document text nor paths.
+            result["recognition"] = request_payload["recognition_result"]
+            result["commands"] = commands
+        return result
     except Exception:
         # The browser receives a stable code only; details stay out of runtime results.
         return {"ok": False, "error_code": "READONLY_CHAIN_FAILED"}

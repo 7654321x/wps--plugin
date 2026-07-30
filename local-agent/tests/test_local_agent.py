@@ -60,9 +60,9 @@ def test_recognition_returns_a_redacted_sdk_plan_and_keeps_input_unchanged(tmp_p
 
 def test_cors_only_allows_the_fixed_taskpane_origin_and_preflight_headers():
     app = create_app("test-token")
-    status, _, headers = _call(app, "OPTIONS", "/v1/e2e/session", origin="http://127.0.0.1:3890")
+    status, _, headers = _call(app, "OPTIONS", "/v1/e2e/session", origin="http://127.0.0.1:3889")
     assert status == "204 No Content"
-    assert headers["Access-Control-Allow-Origin"] == "http://127.0.0.1:3890"
+    assert headers["Access-Control-Allow-Origin"] == "http://127.0.0.1:3889"
     assert "POST" in headers["Access-Control-Allow-Methods"]
     assert "Authorization" in headers["Access-Control-Allow-Headers"]
     _, _, rejected = _call(app, "OPTIONS", "/v1/e2e/session", origin="http://127.0.0.1:3999")

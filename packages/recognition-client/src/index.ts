@@ -1,9 +1,11 @@
-import { PROTOCOL_VERSION, type RecognitionParagraph, type RecognitionResult, type ReviewLevel } from "../../contracts/src/index.js";
+import { RECOGNITION_RESULT_VERSION, type RecognitionParagraph, type RecognitionResult, type ReviewLevel } from "../../contracts/src/index.js";
 
 export interface LocalDocumentSnapshot {
   documentId: string; revision: string; sourceSha256: string;
   localDocxPath?: string;
   paragraphs: Array<{ sourceParagraphIndex: number; text: string }>;
+  /** Local-only revision data. It is never sent to the recognition service. */
+  formattingRevision?: string; paragraphOrderHash?: string; sectionCount?: number;
 }
 export interface WheelRecognitionPlan {
   schema_version: string; engine_version: string; document_mode: RecognitionResult["document_mode"];
@@ -12,6 +14,13 @@ export interface WheelRecognitionPlan {
 }
 export interface LocalRecognitionTransport { recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan>; }
 export interface RecognitionProvider { recognize(snapshot: LocalDocumentSnapshot): Promise<RecognitionResult>; }
+const CONTRACT_TYPE_BY_WHEEL_TYPE: Record<string, RecognitionParagraph["recognized_type"]> = {
+  title: "main_title", title_cont: "title_continuation", addressing: "recipient",
+  sign_org: "signature_org", sign_date: "signature_date", responsibility_line: "body", note: "source_note",
+};
+function contractType(type: string): RecognitionParagraph["recognized_type"] {
+  return CONTRACT_TYPE_BY_WHEEL_TYPE[type] ?? (type as RecognitionParagraph["recognized_type"]);
+}
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
@@ -23,24 +32,29 @@ export class LocalWheelRecognitionProvider implements RecognitionProvider {
     const sourceByIndex = new Map(snapshot.paragraphs.map((item) => [item.sourceParagraphIndex, item]));
     const occurrences = new Map<string, number>();
     const paragraphs: RecognitionParagraph[] = [];
-    for (const block of plan.blocks) {
-      if (block.source_paragraph_index === null) continue;
-      const source = sourceByIndex.get(block.source_paragraph_index);
-      if (!source) throw new Error("WHEEL_ANCHOR_NOT_FOUND");
+    const blocksByIndex = new Map(plan.blocks.filter((block) => block.source_paragraph_index !== null).map((block) => [block.source_paragraph_index!, block]));
+    // A section-break final paragraph is omitted by some wheel versions.  The
+    // host still owns a concrete, text-safe paragraph anchor, so format that
+    // uncovered paragraph as ordinary body instead of silently leaving it
+    // unformatted.  This is a recognition coverage rule, not a WPS write path.
+    for (const source of snapshot.paragraphs) {
+      const block = blocksByIndex.get(source.sourceParagraphIndex);
+      const sourceIndex = source.sourceParagraphIndex;
+      if (block?.source_paragraph_index === null) continue;
       const textHash = await sha256(source.text);
       const occurrence = occurrences.get(textHash) ?? 0;
       occurrences.set(textHash, occurrence + 1);
       paragraphs.push({
-        target_id: snapshot.documentId + ":p:" + source.sourceParagraphIndex + ":" + occurrence,
-        source_paragraph_index: source.sourceParagraphIndex, recognized_type: block.type_id,
-        section_kind: block.section, text_sha256: textHash, text_length: source.text.length,
-        occurrence_index: occurrence, confidence: block.review_level === "confirmed" ? 1 : 0.5,
-        review_level: block.review_level,
-        needs_review: block.review_level === "review" || block.review_level === "critical_review",
+        target_id: snapshot.documentId + ":p:" + sourceIndex + ":" + occurrence,
+        source_paragraph_index: sourceIndex, recognized_type: contractType(block?.type_id ?? "body"),
+        section_kind: block?.section ?? "body", text_sha256: textHash, text_length: source.text.length,
+        occurrence_index: occurrence, confidence: block?.review_level === "confirmed" ? 1 : 0.5,
+        review_level: block?.review_level ?? "review",
+        needs_review: block?.review_level === "review" || block?.review_level === "critical_review",
       });
     }
     return {
-      schema_version: PROTOCOL_VERSION, recognition_engine_version: plan.engine_version,
+      schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: plan.engine_version,
       document_id: snapshot.documentId, document_revision: snapshot.revision,
       source_sha256: snapshot.sourceSha256, document_mode: plan.document_mode,
       document_mode_confidence: plan.document_mode_confidence, paragraphs,

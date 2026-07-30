@@ -1,5 +1,5 @@
-import { PROTOCOL_VERSION, assertFormattingCommandSet, type ClientCapabilities, type ExecutionResult, type FormattingCommand, type FormattingCommandSet } from "../../contracts/src/index.js";
-import type { CapabilityProvider, DocumentExecutor, DocumentReader, TransactionManager } from "../../application/src/ports.js";
+import { CLIENT_CAPABILITIES_VERSION, EXECUTION_RESULT_VERSION, assertFormattingCommandSet, type ClientCapabilities, type ExecutionResult, type FormattingCommand, type FormattingCommandSet, type SetPageSetupArguments } from "../../contracts/src/index.js";
+import type { CapabilityProvider, DocumentExecutor, DocumentReader, FontCapability, FontCapabilityProvider, TransactionManager } from "../../application/src/ports.js";
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
 import { WpsUnitConverter } from "./format-validation.js";
 import { DEFAULT_GRID_MODE, DocumentGridCapabilityProvider, GridReadbackValidator, type GridCapability, type GridMode } from "./grid.js";
@@ -26,6 +26,25 @@ function paragraphAt(document: WpsObject, index: number): WpsObject {
   if (!paragraph || !paragraph.Range) throw new Error("TARGET_NOT_FOUND");
   return paragraph;
 }
+function sectionPageSetups(document: WpsObject, fallback: WpsObject): WpsObject[] {
+  const count = Number(document.Sections?.Count ?? 0);
+  if (!count || typeof document.Sections?.Item !== "function") return [fallback];
+  const setups: WpsObject[] = [];
+  for (let index = 1; index <= count; index += 1) {
+    const setup = document.Sections.Item(index)?.PageSetup as WpsObject | undefined;
+    if (!setup) throw new Error("SECTION_PAGE_SETUP_UNREADABLE");
+    setups.push(setup);
+  }
+  return setups;
+}
+function sectionTarget(args: SetPageSetupArguments, setup: WpsObject): { width: number; height: number; top: number; bottom: number; left: number; right: number } {
+  const landscape = Number(setup.Orientation) === 1;
+  const value = (centimeters: number) => WpsUnitConverter.centimetersToPoints(centimeters);
+  if (!landscape) return { width: value(args.page_width_cm), height: value(args.page_height_cm), top: value(args.margin_top_cm), bottom: value(args.margin_bottom_cm), left: value(args.margin_left_cm), right: value(args.margin_right_cm) };
+  // Preserve horizontal sections and rotate physical page edges exactly like
+  // the root DOCX engine: horizontal top=portrait left, etc.
+  return { width: value(args.page_height_cm), height: value(args.page_width_cm), top: value(args.margin_left_cm), bottom: value(args.margin_right_cm), left: value(args.margin_bottom_cm), right: value(args.margin_top_cm) };
+}
 
 async function activeRevision(): Promise<string> {
   const document = app().ActiveDocument as WpsObject | undefined;
@@ -34,7 +53,19 @@ async function activeRevision(): Promise<string> {
   const text: string[] = [];
   for (let index = 0; index < count; index += 1) text.push(normalizeText(paragraphAt(document, index).Range.Text));
   const sourceSha256 = await sha256(text.join("\u001f"));
-  return sourceSha256 + ":" + count + ":" + String(document.Saved);
+  return sourceSha256 + ":" + count;
+}
+function property(value: unknown): string { return value === undefined || value === null ? "" : String(value); }
+async function formattingRevision(document: WpsObject, count: number): Promise<string> {
+  const values: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const range = paragraphAt(document, index).Range as WpsObject;
+    const font = range.Font as WpsObject | undefined; const format = range.ParagraphFormat as WpsObject | undefined;
+    values.push([font?.NameAscii, font?.NameOther, font?.NameFarEast, font?.Size, font?.Bold, format?.Alignment, format?.CharacterUnitFirstLineIndent, format?.CharacterUnitLeftIndent, format?.CharacterUnitRightIndent, format?.LineUnitBefore, format?.LineUnitAfter, format?.LineSpacingRule, format?.LineSpacing, format?.PageBreakBefore, format?.OutlineLevel].map(property).join("\u001e"));
+  }
+  const sections = Number(document.Sections?.Count ?? 0);
+  for (let index = 1; index <= sections; index += 1) { const page = document.Sections.Item(index)?.PageSetup as WpsObject | undefined; values.push([page?.PageWidth, page?.PageHeight, page?.TopMargin, page?.BottomMargin, page?.LeftMargin, page?.RightMargin, page?.Orientation].map(property).join("\u001e")); }
+  return sha256(values.join("\u001f"));
 }
 
 export interface RuntimeProbeItem {
@@ -88,7 +119,7 @@ export class WpsCapabilityProvider {
     // beforehand made the formal Ribbon path unreachable in a real host.
     const has = (name: string) => report.some((item) => item.api === name && item.supported && item.readable);
     return {
-      schema_version: PROTOCOL_VERSION,
+      schema_version: CLIENT_CAPABILITIES_VERSION,
       capabilities: [
         ...(has("Range.Font") ? ["paragraph.font" as const] : []),
         ...(has("Range.ParagraphFormat") ? ["paragraph.alignment" as const, "paragraph.indent" as const, "paragraph.spacing" as const] : []),
@@ -98,11 +129,36 @@ export class WpsCapabilityProvider {
   }
 }
 
+/** Reads names only; no font file is opened, copied, uploaded or emitted. */
+export class WpsFontCapabilityProvider implements FontCapabilityProvider {
+  inspect(fontNames: string[]): FontCapability[] {
+    const requested = [...new Set(fontNames.filter(Boolean))];
+    let names: string[] | null = null;
+    try {
+      const collection = app().FontNames as WpsObject | undefined;
+      const count = Number(collection?.Count ?? 0);
+      if (collection && count >= 0 && typeof collection.Item === "function") {
+        names = [];
+        for (let index = 1; index <= count; index += 1) names.push(String(collection.Item(index).Name ?? collection.Item(index)));
+      }
+    } catch { names = null; }
+    return requested.map((font) => {
+      const normalized = font.trim().toLocaleLowerCase();
+      const match = names?.find((name) => name.trim().toLocaleLowerCase() === normalized) ?? null;
+      return { requested_font: font, normalized_font: normalized, installed: match !== null, matched_name: match, source: names ? "Application.FontNames" : "WPS_FONT_ENUMERATION_UNAVAILABLE" };
+    });
+  }
+  assertAvailable(fontNames: string[]): void {
+    const missing = this.inspect(fontNames).find((item) => !item.installed);
+    if (missing) throw new Error("FONT_NOT_INSTALLED");
+  }
+}
+
 export class WpsDocumentReader implements DocumentReader {
-  async readSnapshot(): Promise<LocalDocumentSnapshot> {
+  async readSnapshot(options: { allowUnsaved?: boolean } = {}): Promise<LocalDocumentSnapshot> {
     const document = app().ActiveDocument as WpsObject | undefined;
     if (!document) throw new Error("NO_ACTIVE_DOCUMENT");
-    if (!document.Saved || typeof document.FullName !== "string" || !document.FullName.toLowerCase().endsWith(".docx")) {
+    if ((!document.Saved && !options.allowUnsaved) || typeof document.FullName !== "string" || !document.FullName.toLowerCase().endsWith(".docx")) {
       throw new Error("DOCUMENT_MUST_BE_SAVED");
     }
     const paragraphs: Array<{ sourceParagraphIndex: number; text: string }> = [];
@@ -111,20 +167,46 @@ export class WpsDocumentReader implements DocumentReader {
       paragraphs.push({ sourceParagraphIndex: index, text: normalizeText(paragraphAt(document, index).Range.Text) });
     }
     const sourceSha256 = await sha256(paragraphs.map((item) => item.text).join("\u001f"));
+    const orderHash = await sha256(paragraphs.map((item) => `${item.sourceParagraphIndex}:${item.text}`).join("\u001f"));
     return {
       documentId: "wps-" + sourceSha256.slice(0, 16),
-      revision: sourceSha256 + ":" + count + ":" + String(document.Saved),
-      sourceSha256, localDocxPath: document.FullName, paragraphs,
+      revision: sourceSha256 + ":" + count,
+      sourceSha256, localDocxPath: document.FullName, paragraphs, paragraphOrderHash: orderHash,
+      sectionCount: Number(document.Sections?.Count ?? 0), formattingRevision: await formattingRevision(document, count),
     };
   }
 }
 
-/** The executor owns the WPS restore journal; this manager records use-case state. */
+/** One transaction owns capture, reverse rollback and the post-rollback check. */
+export class WpsFormattingTransaction {
+  private readonly journals = new Map<string, Array<() => void>>();
+  begin(transactionId: string): void { this.journals.set(transactionId, []); }
+  capture(transactionId: string, restore: () => void): void {
+    // Direct executor contract tests may supply an externally generated id.
+    // The production use case always begins first; this fallback still keeps
+    // a single journal rather than creating an executor-local restore stack.
+    if (!this.journals.has(transactionId)) this.begin(transactionId);
+    const journal = this.journals.get(transactionId)!;
+    journal.push(restore);
+  }
+  commit(transactionId: string): void { this.journals.delete(transactionId); }
+  rollback(transactionId: string): boolean {
+    const journal = this.journals.get(transactionId);
+    if (!journal) return true;
+    try { for (const restore of journal.reverse()) restore(); this.journals.delete(transactionId); return true; }
+    catch { return false; }
+  }
+  verifyRollback(transactionId: string): boolean { return !this.journals.has(transactionId); }
+}
+
 export class WpsTransactionManager implements TransactionManager {
   private sequence = 0;
-  begin(): string { this.sequence += 1; return "wps-grid-tx-" + this.sequence; }
-  commit(_transactionId: string): void { /* WPS state is already committed by the executor. */ }
-  rollback(_transactionId: string): void { /* The executor has already restored its reverse journal. */ }
+  readonly transaction = new WpsFormattingTransaction();
+  begin(): string { this.sequence += 1; const id = "wps-format-tx-" + this.sequence; this.transaction.begin(id); return id; }
+  capture(transactionId: string, restore: () => void): void { this.transaction.capture(transactionId, restore); }
+  commit(transactionId: string): void { this.transaction.commit(transactionId); }
+  rollback(transactionId: string): boolean { return this.transaction.rollback(transactionId); }
+  verifyRollback(transactionId: string): boolean { return this.transaction.verifyRollback(transactionId); }
 }
 
 export class WpsTargetLocator {
@@ -132,18 +214,20 @@ export class WpsTargetLocator {
     if (!SHA256.test(target.text_sha256)) throw new Error("TARGET_HASH_MISMATCH");
     const document = app().ActiveDocument as WpsObject;
     const direct = paragraphAt(document, target.source_paragraph_index);
-    if (await sha256(normalizeText(direct.Range.Text)) === target.text_sha256) return direct;
+    const directText = normalizeText(direct.Range.Text);
+    if (directText.length === target.text_length && await sha256(directText) === target.text_sha256) return direct;
     const count = Number(document.Paragraphs?.Count ?? 0);
-    const start = Math.max(0, target.source_paragraph_index - 3);
-    const end = Math.min(count, target.source_paragraph_index + 4);
+    // Revision protection rejects broad document changes before this point.
+    // Once an anchor moved, occurrence_index deterministically selects among
+    // duplicate and empty paragraphs rather than guessing or reporting ambiguity.
     const matches: WpsObject[] = [];
-    for (let index = start; index < end; index += 1) {
+    for (let index = 0; index < count; index += 1) {
       const candidate = paragraphAt(document, index);
-      if (await sha256(normalizeText(candidate.Range.Text)) === target.text_sha256) matches.push(candidate);
+      const text = normalizeText(candidate.Range.Text);
+      if (text.length === target.text_length && await sha256(text) === target.text_sha256) matches.push(candidate);
     }
-    if (matches.length > 1) throw new Error("TARGET_AMBIGUOUS");
-    if (!matches.length) throw new Error("TARGET_NOT_FOUND");
-    return matches[0];
+    if (target.occurrence_index >= matches.length) throw new Error("TARGET_NOT_FOUND");
+    return matches[target.occurrence_index];
   }
 }
 
@@ -154,17 +238,17 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
     private readonly locator = new WpsTargetLocator(),
     private readonly capabilities: CapabilityProvider = new WpsCapabilityProvider(),
     private readonly gridMode: GridMode = DEFAULT_GRID_MODE,
+    private readonly transaction = new WpsTransactionManager(),
   ) {}
   async execute(commandSet: FormattingCommandSet, transactionId: string, revision: string): Promise<ExecutionResult> {
     const supported = new Set(this.capabilities.capabilities().capabilities);
     const executed: string[] = [];
-    const journal: Array<() => void> = [];
     try {
       assertFormattingCommandSet(commandSet, commandSet.request_id);
       if (await activeRevision() !== revision) throw new Error("DOCUMENT_CHANGED");
       for (const command of commandSet.commands) {
         if (!supported.has(command.required_capability)) throw new Error("CLIENT_CAPABILITY_MISSING");
-        journal.push(await this.apply(command));
+        this.transaction.capture(transactionId, await this.apply(command));
         executed.push(command.command_id);
       }
       // Page commands are emitted before the paragraph commands by the service.
@@ -176,20 +260,19 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
         const paragraph = await this.locator.locate(command.target);
         this.validateGridReadback(paragraph, command.arguments);
       }
-      return { schema_version: PROTOCOL_VERSION, transaction_id: transactionId, executed_command_ids: executed, skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: revision };
+      return { schema_version: EXECUTION_RESULT_VERSION, transaction_id: transactionId, executed_command_ids: executed, skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: revision };
     } catch (error) {
-      let rolledBack = true;
-      try { for (const restore of journal.reverse()) restore(); } catch { rolledBack = false; }
-      return { schema_version: PROTOCOL_VERSION, transaction_id: transactionId, executed_command_ids: executed, skipped_command_ids: [], failed_command_id: commandSet.commands[executed.length]?.command_id ?? null, warnings: [error instanceof Error ? error.message : "WPS_API_EXECUTION_FAILED", ...(rolledBack ? [] : ["ROLLBACK_FAILED"])], rolled_back: rolledBack, document_revision: revision };
+      const rolledBack = this.transaction.rollback(transactionId) && this.transaction.verifyRollback(transactionId);
+      return { schema_version: EXECUTION_RESULT_VERSION, transaction_id: transactionId, executed_command_ids: executed, skipped_command_ids: [], failed_command_id: commandSet.commands[executed.length]?.command_id ?? null, warnings: [error instanceof Error ? error.message : "WPS_API_EXECUTION_FAILED", ...(rolledBack ? [] : ["ROLLBACK_FAILED"])], rolled_back: rolledBack, document_revision: revision };
     }
   }
   private async apply(command: FormattingCommand): Promise<() => void> {
     const paragraph = await this.locator.locate(command.target);
-    const args = command.arguments;
     if (command.kind === "paragraph.set_font") {
+      const args = command.arguments;
       const font = paragraph!.Range.Font as WpsObject;
       const before = { NameAscii: font.NameAscii, NameOther: font.NameOther, NameFarEast: font.NameFarEast, Size: font.Size, Bold: font.Bold, Spacing: font.Spacing, Scaling: font.Scaling, DisableCharacterSpaceGrid: font.DisableCharacterSpaceGrid };
-      const latin = args.latin_font_name ?? args.font_family; const east = args.east_asia_font_name ?? args.font_family;
+      const latin = args.latin_font_name; const east = args.east_asia_font_name;
       font.NameAscii = latin; font.NameOther = latin; font.NameFarEast = east; font.Size = args.font_size_pt; font.Bold = args.bold ? 1 : 0;
       // Explicitly neutralize direct character scaling/spacing.  This is
       // independent from paragraph alignment and keeps titles and body text
@@ -199,11 +282,13 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       if (font.NameAscii !== latin || font.NameOther !== latin || font.NameFarEast !== east || !WpsUnitConverter.close(Number(font.Size), Number(args.font_size_pt)) || Boolean(font.Bold) !== args.bold || !WpsUnitConverter.close(Number(font.Spacing), 0) || !WpsUnitConverter.close(Number(font.Scaling), 100) || !Boolean(font.DisableCharacterSpaceGrid)) throw new Error("WRITE_READBACK_MISMATCH");
       return () => { Object.assign(font, before); };
     } else if (command.kind === "paragraph.set_alignment") {
+      const args = command.arguments;
       const format = paragraph!.Range.ParagraphFormat as WpsObject; const before = format.Alignment;
       format.Alignment = alignment[String(args.alignment)];
       if (format.Alignment !== alignment[String(args.alignment)]) throw new Error("WRITE_READBACK_MISMATCH");
       return () => { format.Alignment = before; };
     } else if (command.kind === "paragraph.set_indent") {
+      const args = command.arguments;
       const format = paragraph!.Range.ParagraphFormat as WpsObject;
       const before = { CharacterUnitFirstLineIndent: format.CharacterUnitFirstLineIndent, CharacterUnitLeftIndent: format.CharacterUnitLeftIndent, CharacterUnitRightIndent: format.CharacterUnitRightIndent };
       format.CharacterUnitFirstLineIndent = args.first_line_indent_chars;
@@ -211,6 +296,7 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       if (format.CharacterUnitFirstLineIndent !== args.first_line_indent_chars || format.CharacterUnitLeftIndent !== args.left_indent_chars || format.CharacterUnitRightIndent !== args.right_indent_chars) throw new Error("WRITE_READBACK_MISMATCH");
       return () => { Object.assign(format, before); };
     } else if (command.kind === "paragraph.set_spacing") {
+      const args = command.arguments;
       const format = paragraph!.Range.ParagraphFormat as WpsObject;
       const before = { LineUnitBefore: format.LineUnitBefore, LineUnitAfter: format.LineUnitAfter, LineSpacingRule: format.LineSpacingRule, LineSpacing: format.LineSpacing, PageBreakBefore: format.PageBreakBefore, OutlineLevel: format.OutlineLevel, SnapToGrid: format.SnapToGrid };
       const beforeLines = Number(args.space_before_lines); const afterLines = Number(args.space_after_lines); const outlineLevel = Number(args.outline_level ?? 10);
@@ -218,30 +304,40 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       if (!WpsUnitConverter.close(Number(format.LineUnitBefore), beforeLines) || !WpsUnitConverter.close(Number(format.LineUnitAfter), afterLines) || Number(format.LineSpacingRule) !== 4 || !WpsUnitConverter.close(Number(format.LineSpacing), Number(args.line_spacing_pt)) || Boolean(format.PageBreakBefore) !== Boolean(args.page_break_before) || Number(format.OutlineLevel) !== outlineLevel || Boolean(format.SnapToGrid)) throw new Error("WRITE_READBACK_MISMATCH");
       return () => { Object.assign(format, before); };
     } else if (command.kind === "section.set_page_setup") {
-      // WPS exposes PageSetup on Range and Section.  Range.PageSetup targets the
-      // section that contains the command anchor; Document.PageSetup would instead
-      // risk applying the first section's settings to a multi-section document.
-      const setup = paragraph!.Range.PageSetup as WpsObject;
-      const before = { PageWidth: setup.PageWidth, PageHeight: setup.PageHeight, TopMargin: setup.TopMargin, BottomMargin: setup.BottomMargin, LeftMargin: setup.LeftMargin, RightMargin: setup.RightMargin, LinesPage: setup.LinesPage, CharsLine: setup.CharsLine, LayoutMode: setup.LayoutMode, ShowGrid: setup.ShowGrid };
-      const mode = (args.grid_mode ?? this.gridMode) as GridMode;
+      const args = command.arguments;
+      const document = app().ActiveDocument as WpsObject;
+      const setups = sectionPageSetups(document, paragraph!.Range.PageSetup as WpsObject);
+      const before = setups.map((setup) => ({ setup, PageWidth: setup.PageWidth, PageHeight: setup.PageHeight, TopMargin: setup.TopMargin, BottomMargin: setup.BottomMargin, LeftMargin: setup.LeftMargin, RightMargin: setup.RightMargin, LinesPage: setup.LinesPage, CharsLine: setup.CharsLine, LayoutMode: setup.LayoutMode, ShowGrid: setup.ShowGrid }));
+      const mode = args.grid_mode;
       if (mode === "strict_lines_and_chars") new GridReadbackValidator().assertStrictSupported();
-      setup.PageWidth = WpsUnitConverter.centimetersToPoints(Number(args.page_width_cm)); setup.PageHeight = WpsUnitConverter.centimetersToPoints(Number(args.page_height_cm));
-      setup.TopMargin = WpsUnitConverter.centimetersToPoints(Number(args.margin_top_cm)); setup.BottomMargin = WpsUnitConverter.centimetersToPoints(Number(args.margin_bottom_cm));
-      setup.LeftMargin = WpsUnitConverter.centimetersToPoints(Number(args.margin_left_cm)); setup.RightMargin = WpsUnitConverter.centimetersToPoints(Number(args.margin_right_cm));
-      // line_only (the formal default) deliberately does not write LinesPage
-      // or CharsLine.  In WPS either setting can reactivate a character grid;
-      // fixed 28 pt paragraph spacing is the verifiable 22-line strategy.
-      setup.LayoutMode = 0; setup.ShowGrid = false;
-      if (!WpsUnitConverter.close(setup.PageWidth, WpsUnitConverter.centimetersToPoints(Number(args.page_width_cm))) || !WpsUnitConverter.close(setup.PageHeight, WpsUnitConverter.centimetersToPoints(Number(args.page_height_cm))) || !WpsUnitConverter.close(setup.TopMargin, WpsUnitConverter.centimetersToPoints(Number(args.margin_top_cm))) || !WpsUnitConverter.close(setup.BottomMargin, WpsUnitConverter.centimetersToPoints(Number(args.margin_bottom_cm))) || !WpsUnitConverter.close(setup.LeftMargin, WpsUnitConverter.centimetersToPoints(Number(args.margin_left_cm))) || !WpsUnitConverter.close(setup.RightMargin, WpsUnitConverter.centimetersToPoints(Number(args.margin_right_cm)))) throw new Error("WRITE_READBACK_MISMATCH");
-      return () => { Object.assign(setup, before); };
+      const restoreAll = () => {
+        for (const item of before.reverse()) {
+          item.setup.PageWidth = item.PageWidth; item.setup.PageHeight = item.PageHeight;
+          item.setup.TopMargin = item.TopMargin; item.setup.BottomMargin = item.BottomMargin;
+          item.setup.LeftMargin = item.LeftMargin; item.setup.RightMargin = item.RightMargin;
+          item.setup.LinesPage = item.LinesPage; item.setup.CharsLine = item.CharsLine;
+          item.setup.LayoutMode = item.LayoutMode; item.setup.ShowGrid = item.ShowGrid;
+        }
+      };
+      try {
+        for (const setup of setups) {
+          const target = sectionTarget(args, setup);
+          setup.PageWidth = target.width; setup.PageHeight = target.height;
+          setup.TopMargin = target.top; setup.BottomMargin = target.bottom; setup.LeftMargin = target.left; setup.RightMargin = target.right;
+          // line_only deliberately does not write LinesPage or CharsLine.
+          setup.LayoutMode = 0; setup.ShowGrid = false;
+          if (!WpsUnitConverter.close(setup.PageWidth, target.width) || !WpsUnitConverter.close(setup.PageHeight, target.height) || !WpsUnitConverter.close(setup.TopMargin, target.top) || !WpsUnitConverter.close(setup.BottomMargin, target.bottom) || !WpsUnitConverter.close(setup.LeftMargin, target.left) || !WpsUnitConverter.close(setup.RightMargin, target.right)) throw new Error("WRITE_READBACK_MISMATCH");
+        }
+      } catch (error) { restoreAll(); throw error; }
+      return restoreAll;
     } else throw new Error("COMMAND_NOT_ALLOWED");
   }
-  private validateGridReadback(paragraph: WpsObject, args: Record<string, unknown>): void {
+  private validateGridReadback(paragraph: WpsObject, args: SetPageSetupArguments): void {
     const range = paragraph.Range as WpsObject;
     const setup = range.PageSetup as WpsObject;
     const format = range.ParagraphFormat as WpsObject;
     const font = range.Font as WpsObject;
-    const mode = (args.grid_mode ?? this.gridMode) as GridMode;
+    const mode = args.grid_mode;
     const actualAlignment = Object.entries(alignment).find(([, value]) => value === Number(format.Alignment))?.[0] ?? "left";
     const readback = {
       mode, pageWidthPt: Number(setup.PageWidth), pageHeightPt: Number(setup.PageHeight), topMarginPt: Number(setup.TopMargin), bottomMarginPt: Number(setup.BottomMargin), leftMarginPt: Number(setup.LeftMargin), rightMarginPt: Number(setup.RightMargin), landscape: Number(setup.Orientation) === 1,

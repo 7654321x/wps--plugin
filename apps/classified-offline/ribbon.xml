@@ -5,7 +5,7 @@
       <button id="preview" label="预览排版" onAction="OnAction" size="large"/>
       <button id="apply" label="一键排版" onAction="OnAction" size="large"/>
       <button id="taskpane" label="打开任务窗格" onAction="OnAction" size="large"/>
-      <button id="probe" label="运行能力检测" onAction="OnAction" size="large"/>
+      <button id="closeTaskpane" label="关闭任务窗格" onAction="OnAction" size="large"/>
       <button id="about" label="关于" onAction="OnAction" size="large"/>
     </group>
   </tab></tabs></ribbon>

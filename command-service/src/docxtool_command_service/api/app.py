@@ -7,7 +7,7 @@ from .dependencies import build_authenticator
 from .routes import capabilities, commands, health, version
 
 
-DEVELOPMENT_ORIGIN = "http://127.0.0.1:3890"
+DEVELOPMENT_ORIGIN = "http://127.0.0.1:3889"
 
 
 def _response(start_response, status, payload, origin=""):

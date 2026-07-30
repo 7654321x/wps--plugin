@@ -20,7 +20,12 @@
     "e2e:classified:prepare": "pwsh -NoProfile -File scripts/e2e-classified.ps1 prepare",
     "e2e:classified:status": "pwsh -NoProfile -File scripts/e2e-classified.ps1 status",
     "e2e:classified:stop": "pwsh -NoProfile -File scripts/e2e-classified.ps1 stop",
-    "e2e:classified:report": "pwsh -NoProfile -File scripts/e2e-classified.ps1 report"
+    "e2e:classified:report": "pwsh -NoProfile -File scripts/e2e-classified.ps1 report",
+    "verify:all": "pwsh -NoProfile -File scripts/verify-all.ps1",
+    "e2e:classified:auto": "pwsh -NoProfile -File scripts/e2e-classified.ps1 auto",
+    "acceptance:real-doc:prepare": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 prepare",
+    "acceptance:real-doc:status": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 status",
+    "acceptance:real-doc:report": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 report"
   },
   "devDependencies": {
     "ajv": "8.17.1",

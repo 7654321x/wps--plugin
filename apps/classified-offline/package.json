@@ -2,9 +2,10 @@
 	"name": "docxtool-classified-offline",
 	"version": "0.1.0",
 	"private": true,
+	"type": "module",
 	"addonType": "wps",
 	"scripts": {
-		"dev": "vite --port 3889",
-		"build": "vite build"
+		"dev": "node ../../scripts/generate-classified-build-info.mjs && vite --port 3895",
+		"build": "node ../../scripts/generate-classified-build-info.mjs && vite build"
 	}
 }

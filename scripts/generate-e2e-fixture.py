@@ -1,74 +1,83 @@
-"""Generate an intentionally unformatted, non-sensitive WPS visual test fixture."""
+"""Generate anonymous one-click-format fixtures with intentionally plain text."""
 
+import argparse
 from pathlib import Path
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
 
 
-fixtures = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
-target = fixtures / "wps-e2e-baseline.docx"
-target.parent.mkdir(parents=True, exist_ok=True)
-document = Document()
-
-# These labels start as plain document paragraphs.  The WPS automatic-format test
-# applies every visible property after the user clicks its single test button.
-for text in (
-    "文档网格验证",
+FIXTURE_LINES = (
+    "Docxtool 一键排版自动验收",
+    "主标题测试段落",
+    "一、一级标题测试段落",
+    "（一）二级标题测试段落",
+    "1.三级标题测试段落",
+    "（1）四级标题测试段落",
+    "普通正文测试段落：这是脱敏示例文字，用于验证正文格式是否写入。",
+    "中英文混排正文：Docxtool WPS 123 ABC 与中文混排。",
+    "称呼测试段落：各位同志：",
+    "附件说明测试段落：附件：1.测试材料",
+    "附件正文标题测试段落",
+    "附件正文测试段落：仅用于自动验收。",
+    "落款署名测试段落：测试单位",
+    "落款日期测试段落：2026年7月30日",
+    "重复段落测试",
+    "重复段落测试",
+    "重复段落测试",
+    "",
+    "已有错误缩进段落：此行从零缩进起始。",
+    "已有错误行距段落：此行用于覆盖错误行距。",
+    "已有错误字体段落：ABC 123 中文。",
     "左对齐",
     "居中",
     "右对齐",
     "两端对齐：这是用于观察两端对齐效果的脱敏示例文字。",
     "分散对齐：这是用于观察分散对齐效果的脱敏示例文字。",
-    "主标题格式",
-    "一级标题格式",
-    "二级标题格式",
-    "三级标题格式：1.测试",
-    "四级标题格式：（1）测试",
-    "正文格式：仿宋三号、首行缩进 2 字符、固定行距 28 磅。",
-    "这是 Chinese English 123456 与中文混合排版测试。",
-    "测试两端对齐。",
-    "测试分散对齐。",
-    "重复段落",
-    "重复段落",
-    "",
-    "称呼格式：各位同志：",
-    "日期行格式：2026年7月30日",
-    "作者行格式：测试作者",
-    "职务姓名格式：测试职务  测试姓名",
-    "居中小标题格式",
-    "结束语格式",
-    "名词解释条目格式：测试名词是脱敏示例。",
-    "段前 1 行、段后 0 行",
-    "附件说明格式：附件：1.测试材料",
-    "附件说明续项格式：2.测试材料",
-    "附件正文标记格式：附件1",
-    "附件正文标题格式",
-    "附件正文格式：这是脱敏附件正文。",
-    "落款署名格式：测试单位",
-    "落款日期格式：2026年7月30日",
-):
-    document.add_paragraph(text)
+)
 
-document.add_section()
-document.add_paragraph("页面设置：A4、四边距、固定 28 pt 行距、目标每页 22 行；不强制每行 28 字符，字符网格关闭。")
-document.add_section()
-document.add_paragraph("横向分节测试：此页将在自动测试时设置为横向页面。")
 
-# python-docx seeds every new section with w:docGrid/@linePitch.  WPS can
-# interpret that incomplete node as an active character grid, even though no
-# character count was requested.  The visual fixture must start genuinely
-# grid-free so a later WPS readback cannot confuse baseline inheritance with
-# a formatter write.
-for section in document.sections:
-    section_properties = section._sectPr
-    grid = section_properties.find(qn("w:docGrid"))
-    if grid is not None:
-        section_properties.remove(grid)
-document.save(target)
-# Named, immutable test inputs/outputs make E2E evidence easy to find.  The
-# strict output is intentionally not emitted here: WPS JSAPI 1.0.5 cannot
-# persist the full charSpace/linePitch/compatibility contract.
-document.save(fixtures / "01-grid-original.docx")
-document.save(fixtures / "03-grid-wps-line-only.docx")
-document.save(fixtures / "04-grid-rollback-restored.docx")
+def remove_grids(document):
+    for section in document.sections:
+        grid = section._sectPr.find(qn("w:docGrid"))
+        if grid is not None:
+            section._sectPr.remove(grid)
+
+
+def build_document():
+    document = Document()
+    for index, text in enumerate(FIXTURE_LINES):
+        paragraph = document.add_paragraph()
+        # A multi-run paragraph is still intentionally direct-format free.
+        if index == 7:
+            paragraph.add_run("中英文混排正文：Docxtool ")
+            paragraph.add_run("WPS 123 ABC")
+            paragraph.add_run(" 与中文混排。")
+        else:
+            paragraph.add_run(text)
+    document.add_section()
+    document.add_paragraph("纵向分节测试：该节用于验证多节页面设置。")
+    landscape = document.add_section()
+    landscape.orientation = WD_ORIENT.LANDSCAPE
+    landscape.page_width, landscape.page_height = landscape.page_height, landscape.page_width
+    document.add_paragraph("横向分节测试：该节必须在一键排版后保持横向。")
+    document.add_section()
+    document.add_paragraph("纵横混合多节测试：最后一节恢复纵向。")
+    remove_grids(document)
+    return document
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parents[1] / "tests" / "fixtures")
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    document = build_document()
+    # These are plain-text baselines. The WPS host writes the after-format copy.
+    for name in ("wps-e2e-baseline.docx", "01-before-format.docx", "02-rollback-test.docx", "03-after-one-click-format.docx"):
+        document.save(args.output_dir / name)
+
+
+if __name__ == "__main__":
+    main()

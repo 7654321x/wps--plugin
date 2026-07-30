@@ -1,6 +1,6 @@
 from ...core.command_policy import ALLOWED_COMMANDS
-from ...core.version import PROTOCOL_VERSION
+from ...core.version import CLIENT_CAPABILITIES_VERSION
 
 
 def payload():
-    return {"schema_version": PROTOCOL_VERSION, "commands": sorted(ALLOWED_COMMANDS)}
+    return {"schema_version": CLIENT_CAPABILITIES_VERSION, "commands": sorted(ALLOWED_COMMANDS)}

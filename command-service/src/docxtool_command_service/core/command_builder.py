@@ -4,7 +4,20 @@ from .capability_matcher import match_capabilities
 from .command_policy import CAPABILITY_BY_COMMAND
 from .profile_registry import resolve_profile
 from .validation import CommandServiceError, validate_command_request, validate_command_set
-from .version import PROTOCOL_VERSION, SERVICE_VERSION
+from .version import FORMATTING_COMMAND_SET_VERSION, SERVICE_VERSION
+
+
+# The protocol keeps title continuation distinct for recognition and review,
+# while the frozen default profile intentionally renders it exactly as a main
+# title.  This is a profile alias, not a legacy command fallback.
+STYLE_ROLE_ALIASES = {
+    "title_continuation": "main_title",
+    "addressing": "recipient",
+}
+
+
+def _style_for(profile, recognized_type):
+    return profile["styles"].get(STYLE_ROLE_ALIASES.get(recognized_type, recognized_type))
 
 
 def _command(command_number, kind, target, arguments):
@@ -23,6 +36,8 @@ def _paragraph_commands(command_number, paragraph, style):
         "target_id": paragraph["target_id"],
         "source_paragraph_index": paragraph["source_paragraph_index"],
         "text_sha256": paragraph["text_sha256"],
+        "text_length": paragraph["text_length"],
+        "occurrence_index": paragraph["occurrence_index"],
     }
     commands = []
     commands.append(_command(command_number + len(commands), "paragraph.set_font", target, {
@@ -61,7 +76,9 @@ def build_formatting_commands(request):
         page_target = {
             "target_id": "document:%s" % recognition["document_id"],
             "source_paragraph_index": paragraphs[0]["source_paragraph_index"],
-            "text_sha256": recognition["source_sha256"],
+            "text_sha256": paragraphs[0]["text_sha256"],
+            "text_length": paragraphs[0]["text_length"],
+            "occurrence_index": paragraphs[0]["occurrence_index"],
         }
         page = profile["page_setup"]
         commands.append(_command(1, "section.set_page_setup", page_target, {
@@ -71,7 +88,7 @@ def build_formatting_commands(request):
             )
         }))
     for paragraph in paragraphs:
-        style = profile["styles"].get(paragraph["recognized_type"])
+        style = _style_for(profile, paragraph["recognized_type"])
         if style:
             commands.extend(_paragraph_commands(len(commands) + 1, paragraph, style))
     try:
@@ -81,9 +98,11 @@ def build_formatting_commands(request):
     except ValueError as exc:
         raise CommandServiceError("CAPABILITY_REQUIRED", str(exc))
     result = {
-        "schema_version": PROTOCOL_VERSION,
+        "schema_version": FORMATTING_COMMAND_SET_VERSION,
         "request_id": request["request_id"],
         "service_version": SERVICE_VERSION,
+        "profile_id": request["profile_id"],
+        "profile_version": request["profile_version"],
         "commands": commands,
         "warnings": warnings,
     }

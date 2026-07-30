@@ -1,9 +1,10 @@
-import { ALLOWED_COMMANDS, PROTOCOL_VERSION, type ClientCapabilities, type ExecutionResult, type FormattingCommandSet } from "../../contracts/src/index.js";
+import { ALLOWED_COMMANDS, CLIENT_CAPABILITIES_VERSION, EXECUTION_RESULT_VERSION, type ClientCapabilities, type ExecutionResult, type FormattingCommandSet } from "../../contracts/src/index.js";
 import type { DocumentExecutor, DocumentReader, TransactionManager } from "../../application/src/ports.js";
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
 export * from "./official-host.js";
 export * from "./format-validation.js";
 export * from "./grid.js";
+export * from "./preview-comments.js";
 export class CommandRegistry { allows(kind: string): boolean { return ALLOWED_COMMANDS.has(kind as never); } }
 export class MockDocumentReader implements DocumentReader {
   constructor(private readonly snapshot: LocalDocumentSnapshot) {}
@@ -17,7 +18,7 @@ export class MockTransactionManager implements TransactionManager {
 }
 export class MockCapabilityProvider {
   capabilities(): ClientCapabilities {
-    return { schema_version: PROTOCOL_VERSION, capabilities: ["paragraph.font", "paragraph.alignment", "paragraph.indent", "paragraph.spacing", "section.page_setup", "transaction.undo"] };
+    return { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: ["paragraph.font", "paragraph.alignment", "paragraph.indent", "paragraph.spacing", "section.page_setup", "transaction.undo"] };
   }
 }
 export class MockDocumentExecutor implements DocumentExecutor {
@@ -29,10 +30,10 @@ export class MockDocumentExecutor implements DocumentExecutor {
       if (!this.registry.allows(command.kind)) throw new Error("UNKNOWN_COMMAND");
       if (command.command_id === this.failAtCommandId) {
         this.executed.splice(this.executed.length - executedThisRun.length, executedThisRun.length);
-        return { schema_version: PROTOCOL_VERSION, transaction_id: transactionId, executed_command_ids: [], skipped_command_ids: [], failed_command_id: command.command_id, warnings: ["mock execution failure"], rolled_back: true, document_revision: documentRevision };
+        return { schema_version: EXECUTION_RESULT_VERSION, transaction_id: transactionId, executed_command_ids: [], skipped_command_ids: [], failed_command_id: command.command_id, warnings: ["mock execution failure"], rolled_back: true, document_revision: documentRevision };
       }
       this.executed.push(command.command_id); executedThisRun.push(command.command_id);
     }
-    return { schema_version: PROTOCOL_VERSION, transaction_id: transactionId, executed_command_ids: executedThisRun, skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: documentRevision };
+    return { schema_version: EXECUTION_RESULT_VERSION, transaction_id: transactionId, executed_command_ids: executedThisRun, skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: documentRevision };
   }
 }

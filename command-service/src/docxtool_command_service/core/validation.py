@@ -12,7 +12,12 @@ from .command_policy import (
     CAPABILITY_BY_COMMAND,
     FORBIDDEN_FIELD_NAMES,
 )
-from .version import PROTOCOL_VERSION
+from .version import (
+    CLIENT_CAPABILITIES_VERSION,
+    COMMAND_REQUEST_VERSION,
+    FORMATTING_COMMAND_SET_VERSION,
+    RECOGNITION_RESULT_VERSION,
+)
 
 
 class CommandServiceError(ValueError):
@@ -66,9 +71,12 @@ def _number(value, name, minimum, maximum):
         _fail("INVALID_PARAMETER", "%s is outside its allowed range" % name)
 
 
-def _target(value):
+def _target(value, command_target=False):
     item = _require_object(value, "target")
-    if set(item) != {"target_id", "source_paragraph_index", "text_sha256"}:
+    required = {"target_id", "source_paragraph_index", "text_sha256"}
+    if command_target:
+        required.update({"text_length", "occurrence_index"})
+    if set(item) != required:
         _fail("INVALID_SCHEMA", "target fields are not allowed")
     if not _TARGET_ID.match(str(item.get("target_id", ""))):
         _fail("INVALID_SCHEMA", "invalid target_id")
@@ -77,6 +85,10 @@ def _target(value):
         _fail("INVALID_SCHEMA", "invalid source_paragraph_index")
     if not _SHA256.match(str(item.get("text_sha256", ""))):
         _fail("INVALID_SCHEMA", "invalid text_sha256")
+    if command_target:
+        for name in ("text_length", "occurrence_index"):
+            if not isinstance(item.get(name), int) or isinstance(item[name], bool) or item[name] < 0:
+                _fail("INVALID_SCHEMA", "invalid " + name)
 
 
 def validate_recognition_result(value):
@@ -89,7 +101,7 @@ def validate_recognition_result(value):
     required = allowed - {"review_items"}
     if not required.issubset(item) or not set(item).issubset(allowed):
         _fail("INVALID_SCHEMA", "invalid RecognitionResult fields")
-    if item.get("schema_version") != PROTOCOL_VERSION:
+    if item.get("schema_version") != RECOGNITION_RESULT_VERSION:
         _fail("UNSUPPORTED_SCHEMA_VERSION", "RecognitionResult schema version is not supported")
     if not _SHA256.match(str(item.get("source_sha256", ""))):
         _fail("INVALID_SCHEMA", "source_sha256 must be SHA-256")
@@ -144,7 +156,7 @@ def validate_command_request(value):
     }
     if set(request) != required:
         _fail("INVALID_SCHEMA", "invalid CommandRequest fields")
-    if request["schema_version"] != PROTOCOL_VERSION:
+    if request["schema_version"] != COMMAND_REQUEST_VERSION:
         _fail("UNSUPPORTED_SCHEMA_VERSION", "CommandRequest schema version is not supported")
     if not _REQUEST_ID.match(str(request["request_id"])):
         _fail("INVALID_SCHEMA", "invalid request_id")
@@ -153,7 +165,7 @@ def validate_command_request(value):
     capabilities = _require_object(request["client_capabilities"], "client_capabilities")
     if set(capabilities) != {"schema_version", "capabilities"}:
         _fail("INVALID_SCHEMA", "invalid ClientCapabilities fields")
-    if capabilities["schema_version"] != PROTOCOL_VERSION or not isinstance(capabilities["capabilities"], list):
+    if capabilities["schema_version"] != CLIENT_CAPABILITIES_VERSION or not isinstance(capabilities["capabilities"], list):
         _fail("INVALID_SCHEMA", "invalid client capabilities")
     validate_recognition_result(request["recognition_result"])
 
@@ -172,7 +184,7 @@ def validate_command(command):
         _fail("INVALID_COMMAND", "command capability is invalid")
     if item["on_unsupported"] not in ("skip", "fail"):
         _fail("INVALID_COMMAND", "invalid unsupported policy")
-    _target(item["target"])
+    _target(item["target"], command_target=True)
     arguments = _require_object(item["arguments"], "arguments")
     _validate_arguments(item["kind"], arguments)
 
@@ -230,9 +242,9 @@ def _validate_arguments(kind, arguments):
 
 def validate_command_set(value):
     result = _require_object(value, "FormattingCommandSet")
-    if set(result) != {"schema_version", "request_id", "service_version", "commands", "warnings"}:
+    if set(result) != {"schema_version", "request_id", "service_version", "profile_id", "profile_version", "commands", "warnings"}:
         _fail("INVALID_SCHEMA", "invalid FormattingCommandSet fields")
-    if result["schema_version"] != PROTOCOL_VERSION:
+    if result["schema_version"] != FORMATTING_COMMAND_SET_VERSION:
         _fail("UNSUPPORTED_SCHEMA_VERSION", "FormattingCommandSet schema version is not supported")
     if not _REQUEST_ID.match(str(result["request_id"])):
         _fail("INVALID_SCHEMA", "invalid request_id")
