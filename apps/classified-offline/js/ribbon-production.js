@@ -1,4 +1,4 @@
-var DOCXTOOL_RIBBON_COMMANDS = Object.freeze({ recognize: "recognize_document", preview: "preview_document", apply: "format_document", taskpane: "open_taskpane", about: "show_about" });
+var DOCXTOOL_RIBBON_COMMANDS = Object.freeze({ preview: "preview_document", apply: "format_document", health: "health_check" });
 function OnAddinLoad(ribbonUI) { window.Application.ribbonUI = ribbonUI; return true; }
 function DocxtoolPersistHostError(callbackName, errorCode) {
   try {
@@ -15,18 +15,7 @@ function DocxtoolFallbackShowTaskPane() {
     pane.Visible = true;
   } catch (ignore) {}
 }
-function DocxtoolCloseTaskPane() {
-  try {
-    var saved = window.Application.PluginStorage.getItem("docxtool_classified_taskpane");
-    if (!saved) return true;
-    var pane = window.Application.GetTaskPane(Number(saved));
-    if (!pane) { window.Application.PluginStorage.setItem("docxtool_classified_taskpane", ""); return true; }
-    pane.Visible = false;
-    return true;
-  } catch (ignore) { DocxtoolPersistHostError("OnAction:closeTaskpane", "TASKPANE_HIDE_FAILED"); return false; }
-}
 function OnAction(control) {
-  if (control && control.Id === "closeTaskpane") { DocxtoolCloseTaskPane(); return true; }
   var command = control && DOCXTOOL_RIBBON_COMMANDS[control.Id];
   if (!command) { DocxtoolPersistHostError("OnAction:" + String(control && control.Id), "RIBBON_CALLBACK_NOT_FOUND"); DocxtoolFallbackShowTaskPane(); return true; }
   if (typeof window.DocxtoolHostDispatch !== "function") { DocxtoolPersistHostError("OnAction:" + control.Id, "HOST_COMMAND_ROUTER_NOT_READY"); DocxtoolFallbackShowTaskPane(); return true; }

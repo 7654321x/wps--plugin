@@ -21,6 +21,13 @@ export class ResponseValidator {
     assertFormattingCommandSet(value, requestId); return value;
   }
 }
+function commandServiceErrorCode(payload: unknown): string | undefined {
+  if (payload === null || typeof payload !== "object") return undefined;
+  const error = (payload as { error?: unknown }).error;
+  if (error === null || typeof error !== "object") return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+}
 export class HttpCommandServiceClient implements CommandServiceClient {
   constructor(private readonly endpointProvider: EndpointProvider, private readonly responseValidator = new ResponseValidator()) {}
   async requestCommands(request: CommandRequest): Promise<FormattingCommandSet> {
@@ -30,8 +37,13 @@ export class HttpCommandServiceClient implements CommandServiceClient {
       method: "POST", headers: { "Content-Type": "application/json", ...this.endpointProvider.headers() },
       body: JSON.stringify(request),
     });
-    const payload: unknown = await response.json();
-    if (!response.ok) throw new Error("COMMAND_SERVICE_" + response.status);
+    let payload: unknown;
+    try { payload = await response.json(); }
+    catch {
+      if (!response.ok) throw new Error("COMMAND_SERVICE_" + response.status);
+      throw new Error("COMMAND_SERVICE_INVALID_JSON");
+    }
+    if (!response.ok) throw new Error(commandServiceErrorCode(payload) ?? ("COMMAND_SERVICE_" + response.status));
     return this.responseValidator.validate(payload as FormattingCommandSet, request.request_id);
   }
 }

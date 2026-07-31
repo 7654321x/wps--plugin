@@ -18,12 +18,15 @@ const ajv = new Ajv2020({ strict: false });
 schemas.forEach((schema) => ajv.addSchema(schema));
 const SHA = "a".repeat(64);
 const recognition = {
-  schema_version: "1.0", recognition_engine_version: "3.0", document_id: "doc-1",
+  schema_version: "1.1", recognition_engine_version: "3.0", document_id: "doc-1",
   document_revision: "rev-1", source_sha256: SHA, document_mode: "normal",
   document_mode_confidence: 1, paragraphs: [{
     target_id: "doc-1:p:0:0", source_paragraph_index: 0, recognized_type: "body",
     section_kind: "body", text_sha256: SHA, text_length: 8, occurrence_index: 0,
     confidence: 1, review_level: "confirmed", needs_review: false,
+    physical_paragraph_index: 0, physical_text_sha256: SHA,
+    range_start_utf16: 0, range_end_utf16: 8, locator_verified: true,
+    mixed_structure: false, formatting_disposition: "apply",
   }],
 };
 const capabilities = {

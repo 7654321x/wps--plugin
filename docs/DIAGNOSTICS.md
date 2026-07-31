@@ -4,9 +4,9 @@
 
 网络错误不会直接显示浏览器的 `Failed to fetch`。固定代码包括 `LOCAL_AGENT_UNREACHABLE`、`COMMAND_SERVICE_UNREACHABLE`、`SERVICE_TIMEOUT`、`PREFLIGHT_FAILED`、`CORS_BLOCKED`、`MIXED_CONTENT_BLOCKED`、`INVALID_SERVICE_ENDPOINT`、`LOOPBACK_POLICY_REJECTED`、`SESSION_UNAUTHORIZED`、`SERVICE_RESPONSE_INVALID` 和 `UNKNOWN_FETCH_FAILURE`。
 
-开发任务窗格唯一允许的跨源 origin 是 `http://127.0.0.1:3890`。local-agent 和 command-service 对该 origin 仅返回 `GET, POST, OPTIONS`、`Content-Type, X-Docxtool-Session, Authorization` 的 CORS 头；未知 loopback origin 和公网 origin 均不授权。任务窗格不持有或显示 session token。
+开发任务窗格的识别与命令检测共用 `http://127.0.0.1:9528`。统一服务对固定开发 origin 仅返回 `GET, POST, OPTIONS`、`Content-Type, X-Docxtool-Session, Authorization` 的 CORS 头；未知 loopback origin 和公网 origin 均不授权。任务窗格不显示 session token。
 
-自动诊断只读。高级验证中的字体、对齐、缩进、间距、页面设置和回滚仍需操作员单独确认，且以下项必须为 PASS：WPS 宿主、E2E 会话、测试文档守卫、两项本地服务、识别、命令、目标定位、revision 和对应读取能力。
+自动诊断只读。识别与命令是统一服务上的两个正式接口；状态面板可分别报告能力，但不代表存在两个本机进程或端口。
 
 点击“导出脱敏报告”后，`.runtime/e2e/current.json` 会保存每项 `check_id`、组、状态、错误码、摘要、耗时和依赖；不保存正文、文件名、路径、Range.Text、令牌或原始协议对象。运行 `npm run e2e:classified:report` 可输出分组汇总和首个根因。
 

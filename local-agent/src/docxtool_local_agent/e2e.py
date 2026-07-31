@@ -3,10 +3,9 @@
 import hashlib
 import json
 from pathlib import Path
-from urllib.request import Request, urlopen
-
 from docx import Document
 from docxtool.sdk import recognize_docx
+from docxtool_command_service.core.command_builder import build_formatting_commands
 
 
 RESULT_STATUSES = {"PASS", "FAIL", "UNSUPPORTED", "NOT_RUN"}
@@ -38,6 +37,7 @@ CONTRACT_TYPE_BY_WHEEL_TYPE = {
     "sign_date": "signature_date",
     "responsibility_line": "body",
     "note": "source_note",
+    "__object_caption__": "caption",
 }
 
 
@@ -148,7 +148,7 @@ def guard_test_document(runtime_root, session_id, source_path):
         return {"ok": False, "error_code": "E2E_TEST_DOCUMENT_REQUIRED"}
 
 
-def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token, include_plan=False):
+def run_readonly_chain(runtime_root, session_id, include_plan=False):
     """Run the redacted recognition-to-command flow without exposing a path or token."""
     try:
         session = load_session(runtime_root)
@@ -165,7 +165,7 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
         # used by the existing docxtool formatting engine.  It remains the
         # same local SDK entry point, but avoids an authoritative-mode
         # reclassification of deliberately plain E2E fixture paragraphs.
-        plan = recognize_docx(source, recognition_mode="legacy").to_dict()
+        plan = recognize_docx(source, recognition_mode="legacy", include_text=True).to_dict()
         after = hashlib.sha256(source.read_bytes()).hexdigest()
         if before != after:
             return {"ok": False, "error_code": "INPUT_FILE_CHANGED"}
@@ -191,6 +191,13 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
                 "confidence": 1 if block["review_level"] == "confirmed" else 0.5,
                 "review_level": block["review_level"],
                 "needs_review": block["review_level"] in ("review", "critical_review"),
+                "physical_paragraph_index": block.get("physical_paragraph_index", index),
+                "physical_text_sha256": block.get("physical_text_sha256", text_hash),
+                "range_start_utf16": block.get("range_start_utf16", 0),
+                "range_end_utf16": block.get("range_end_utf16", len(paragraph)),
+                "locator_verified": bool(block.get("locator_verified", False)),
+                "mixed_structure": False,
+                "formatting_disposition": "apply",
             })
             anchors.append({
                 "source_paragraph_index": index, "text_sha256": text_hash,
@@ -202,7 +209,7 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
         request_payload = {
             "schema_version": "1.0", "request_id": "e2e-" + session_id,
             "recognition_result": {
-                "schema_version": "1.0", "recognition_engine_version": plan["engine_version"],
+                "schema_version": "1.1", "recognition_engine_version": plan["engine_version"],
                 "document_id": "e2e-" + before[:16], "document_revision": before,
                 "source_sha256": before, "document_mode": plan["document_mode"],
                 "document_mode_confidence": plan["document_mode_confidence"], "paragraphs": recognition_paragraphs,
@@ -213,12 +220,7 @@ def run_readonly_chain(runtime_root, session_id, command_endpoint, session_token
             ]},
             "product_version": session.get("plugin_version", "0.1.0"), "authorization_scope": "classified-offline",
         }
-        encoded = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
-        request = Request(command_endpoint.rstrip("/") + "/v1/commands", data=encoded, headers={
-            "Content-Type": "application/json", "X-Docxtool-Session": session_token,
-        }, method="POST")
-        with urlopen(request, timeout=5) as response:
-            commands = json.loads(response.read().decode("utf-8"))
+        commands = build_formatting_commands(request_payload)
         kinds = [item.get("kind") for item in commands.get("commands", [])]
         allowed = {"paragraph.set_font", "paragraph.set_alignment", "paragraph.set_indent", "paragraph.set_spacing", "section.set_page_setup"}
         if not all(kind in allowed for kind in kinds):

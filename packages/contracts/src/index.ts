@@ -1,5 +1,5 @@
 /** Contract versions are independent.  Do not merge these into a global version. */
-export const RECOGNITION_RESULT_VERSION = "1.0" as const;
+export const RECOGNITION_RESULT_VERSION = "1.1" as const;
 export const COMMAND_REQUEST_VERSION = "1.0" as const;
 export const FORMATTING_COMMAND_SET_VERSION = "1.1" as const;
 export const CLIENT_CAPABILITIES_VERSION = "1.0" as const;
@@ -34,6 +34,13 @@ export interface CommandTarget extends Target {
 export interface RecognitionParagraph extends Target {
   recognized_type: string; section_kind: string; text_length: number; occurrence_index: number;
   confidence: number; review_level: ReviewLevel; needs_review: boolean;
+  physical_paragraph_index: number; physical_text_sha256: string;
+  range_start_utf16: number; range_end_utf16: number; locator_verified: boolean;
+  mixed_structure: boolean; formatting_disposition: "apply" | "review_only";
+}
+export interface UnresolvedRecognitionBlock {
+  block_index: number; recognized_type: string; review_level: ReviewLevel;
+  reason: "RECOGNITION_LOCATOR_UNVERIFIED" | "RECOGNITION_LOCATOR_AMBIGUOUS";
 }
 export interface RecognitionResult {
   schema_version: typeof RECOGNITION_RESULT_VERSION; recognition_engine_version: string; document_id: string;
@@ -41,6 +48,7 @@ export interface RecognitionResult {
   document_mode: "unknown" | "normal" | "report" | "notice" | "plan" | "meeting_minutes";
   document_mode_confidence: number; paragraphs: RecognitionParagraph[];
   review_items?: Array<{ target_id: string; level: "review" | "critical_review"; confidence: number }>;
+  unresolved_blocks?: UnresolvedRecognitionBlock[];
 }
 export interface ClientCapabilities { schema_version: typeof CLIENT_CAPABILITIES_VERSION; capabilities: Capability[]; }
 export interface CommandRequest {
@@ -112,7 +120,9 @@ export function assertCommandRequest(request: CommandRequest): void {
   if (!SHA256.test(request.recognition_result.source_sha256)) throw new Error("INVALID_SOURCE_SHA256");
   request.recognition_result.paragraphs.forEach((paragraph) => {
     if (!SHA256.test(paragraph.text_sha256)) throw new Error("INVALID_TEXT_SHA256");
+    if (!SHA256.test(paragraph.physical_text_sha256)) throw new Error("INVALID_PHYSICAL_TEXT_SHA256");
     if (paragraph.text_length < 0 || paragraph.occurrence_index < 0) throw new Error("INVALID_ANCHOR");
+    if (!paragraph.locator_verified || paragraph.range_start_utf16 < 0 || paragraph.range_end_utf16 <= paragraph.range_start_utf16) throw new Error("INVALID_RANGE_LOCATOR");
   });
 }
 export function assertFormattingCommandSet(result: FormattingCommandSet, expectedRequestId: string): void {

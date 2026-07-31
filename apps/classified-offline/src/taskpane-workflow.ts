@@ -1,10 +1,12 @@
-type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
+type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface HostState {
   build_id: string; asset_hash: string; host_context_id: string; command_status: string; active_view: "recognition" | "preview" | "execution" | "issues";
   recognition_summary: string; paragraph_recognition_models: Array<{ paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean }>;
   formatting_preview_models: Array<{ paragraph_index: number; recognized_type: string; plan: string; needs_review: boolean }>;
   preview_comment_status: string; formatting_progress: string; formatting_result: string; latest_error: string; updated_at: string;
+  unresolved_block_count?: number; mixed_paragraph_count?: number;
+  health_overall?: "PASS" | "WARN" | "FAIL" | ""; health_report?: string;
 }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; }
 type BridgeWindow = Window & { DocxtoolBuildInfo?: BuildInfo; Application?: { PluginStorage?: StorageLike; GetTaskPane?: (id: number) => { Visible: boolean } | undefined } };
@@ -29,6 +31,12 @@ function closeTaskPane(): void {
   catch { text("issues", "TASKPANE_HIDE_FAILED：WPS 未能关闭任务窗格。"); }
 }
 function rows(id: string, values: string[]): void { node(id).replaceChildren(...values.map((value) => { const row = document.createElement("div"); row.className = "row"; row.textContent = value; return row; })); }
+function issueText(state: HostState): string {
+  if (state.latest_error === "MIXED_PARAGRAPH_REQUIRES_SPLIT") return `检测到 ${state.mixed_paragraph_count ?? 0} 个物理段落包含多个角色。预览批注已按文字范围分别标出；请先拆分这些段落，再执行一键排版。`;
+  if (state.latest_error === "RECOGNITION_LOCATOR_UNVERIFIED") return `有 ${state.unresolved_block_count ?? 0} 个识别块无法证明原文位置。系统没有猜测定位，请根据预览批注复核。`;
+  if (state.latest_error === "RECOGNITION_LOCATOR_AMBIGUOUS") return `有 ${state.unresolved_block_count ?? 0} 个识别块存在重复位置歧义。系统没有猜测定位，请根据预览批注复核。`;
+  return state.latest_error || "暂无问题。";
+}
 function render(state: HostState): void {
   const build = bridgeWindow.DocxtoolBuildInfo; const expected = new URLSearchParams(location.search).get("host_build");
   if (!build || state.build_id !== build.build_id || (expected && expected !== build.build_id)) { const warning = node("context-warning"); warning.hidden = false; warning.textContent = "ADDIN_CONTEXT_STALE：当前 WPS 加载的是旧版 Docxtool，请关闭全部 WPS 窗口后重新打开。"; return; }
@@ -36,12 +44,13 @@ function render(state: HostState): void {
   rows("recognition-rows", state.paragraph_recognition_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · 置信度 ${Math.round(item.confidence * 100)}%${item.needs_review ? " · 需要复核" : ""}`));
   text("preview-summary", state.preview_comment_status || "不会写入格式；空段落不添加批注。");
   rows("preview-rows", state.formatting_preview_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · ${item.plan}${item.needs_review ? " · 需要复核" : ""}`));
-  text("workflow-status", state.formatting_progress || state.command_status || "就绪"); text("execution-result", state.formatting_result || ""); text("issues", state.latest_error || "暂无问题。");
+  text("workflow-status", state.formatting_progress || state.command_status || "就绪"); text("execution-result", state.formatting_result || ""); text("issues", issueText(state));
+  text("health-summary", state.health_report || "尚未运行功能检测。");
   document.body.dataset.activeView = state.active_view;
 }
 let lastUpdated = "";
 function poll(): void { const storage = bridgeWindow.Application?.PluginStorage; if (!storage) return; const state = parse<HostState>(storage.getItem(RESULT_KEY)); if (state && state.updated_at !== lastUpdated) { lastUpdated = state.updated_at; render(state); } }
-for (const [id, command] of [["recognize-document", "recognize_document"], ["preview-document", "preview_document"], ["clear-preview", "clear_preview"], ["format-document", "format_document"]] as const) node(id).addEventListener("click", () => request(command));
+for (const [id, command] of [["recognize-document", "recognize_document"], ["preview-document", "preview_document"], ["clear-preview", "clear_preview"], ["format-document", "format_document"], ["health-check", "health_check"]] as const) node(id).addEventListener("click", () => request(command));
 node("close-taskpane").addEventListener("click", closeTaskPane);
 const build = bridgeWindow.DocxtoolBuildInfo; text("plugin-version", build?.plugin_version ?? "未知"); text("build-id", build?.build_id?.slice(0, 20) ?? "未知");
 window.setInterval(poll, 250); poll();

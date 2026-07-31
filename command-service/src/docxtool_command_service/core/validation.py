@@ -97,8 +97,9 @@ def validate_recognition_result(value):
         "schema_version", "recognition_engine_version", "document_id",
         "document_revision", "source_sha256", "document_mode",
         "document_mode_confidence", "paragraphs", "review_items",
+        "unresolved_blocks",
     }
-    required = allowed - {"review_items"}
+    required = allowed - {"review_items", "unresolved_blocks"}
     if not required.issubset(item) or not set(item).issubset(allowed):
         _fail("INVALID_SCHEMA", "invalid RecognitionResult fields")
     if item.get("schema_version") != RECOGNITION_RESULT_VERSION:
@@ -115,6 +116,19 @@ def validate_recognition_result(value):
         _fail("INVALID_SCHEMA", "paragraphs must be an array")
     for paragraph in paragraphs:
         _validate_paragraph(paragraph)
+    unresolved = item.get("unresolved_blocks", [])
+    if not isinstance(unresolved, list):
+        _fail("INVALID_SCHEMA", "unresolved_blocks must be an array")
+    for block in unresolved:
+        value = _require_object(block, "unresolved_block")
+        if set(value) != {"block_index", "recognized_type", "review_level", "reason"}:
+            _fail("INVALID_SCHEMA", "invalid unresolved block fields")
+        if not isinstance(value["block_index"], int) or value["block_index"] < 0:
+            _fail("INVALID_SCHEMA", "invalid unresolved block index")
+        if value["review_level"] not in ("confirmed", "info", "review", "critical_review"):
+            _fail("INVALID_SCHEMA", "invalid unresolved review level")
+        if value["reason"] not in ("RECOGNITION_LOCATOR_UNVERIFIED", "RECOGNITION_LOCATOR_AMBIGUOUS"):
+            _fail("INVALID_SCHEMA", "invalid unresolved reason")
 
 
 def _validate_paragraph(value):
@@ -123,6 +137,9 @@ def _validate_paragraph(value):
         "target_id", "source_paragraph_index", "recognized_type", "section_kind",
         "text_sha256", "text_length", "occurrence_index", "confidence",
         "review_level", "needs_review",
+        "physical_paragraph_index", "physical_text_sha256", "range_start_utf16",
+        "range_end_utf16", "locator_verified", "mixed_structure",
+        "formatting_disposition",
     }
     if set(item) != required:
         _fail("INVALID_SCHEMA", "invalid paragraph fields")
@@ -144,6 +161,20 @@ def _validate_paragraph(value):
         _fail("INVALID_SCHEMA", "invalid review level")
     if not isinstance(item["needs_review"], bool):
         _fail("INVALID_SCHEMA", "needs_review must be boolean")
+    if not isinstance(item["physical_paragraph_index"], int) or item["physical_paragraph_index"] < 0:
+        _fail("INVALID_SCHEMA", "invalid physical_paragraph_index")
+    if not _SHA256.match(str(item["physical_text_sha256"])):
+        _fail("INVALID_SCHEMA", "invalid physical_text_sha256")
+    if not isinstance(item["range_start_utf16"], int) or not isinstance(item["range_end_utf16"], int) or item["range_start_utf16"] < 0 or item["range_end_utf16"] <= item["range_start_utf16"]:
+        _fail("INVALID_SCHEMA", "invalid range locator")
+    if item["locator_verified"] is not True:
+        _fail("INVALID_SCHEMA", "locator must be verified")
+    if not isinstance(item["mixed_structure"], bool):
+        _fail("INVALID_SCHEMA", "mixed_structure must be boolean")
+    if item["formatting_disposition"] not in ("apply", "review_only"):
+        _fail("INVALID_SCHEMA", "invalid formatting disposition")
+    if item["mixed_structure"] and item["formatting_disposition"] != "review_only":
+        _fail("INVALID_SCHEMA", "mixed structure must be review only")
 
 
 def validate_command_request(value):

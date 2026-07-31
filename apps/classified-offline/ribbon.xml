@@ -1,12 +1,9 @@
 <customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
   <ribbon><tabs><tab id="docxtoolClassifiedTab" label="Docxtool 涉密版">
     <group id="docxtoolActions" label="公文排版">
-      <button id="recognize" label="仅识别" onAction="OnAction" size="large"/>
       <button id="preview" label="预览排版" onAction="OnAction" size="large"/>
       <button id="apply" label="一键排版" onAction="OnAction" size="large"/>
-      <button id="taskpane" label="打开任务窗格" onAction="OnAction" size="large"/>
-      <button id="closeTaskpane" label="关闭任务窗格" onAction="OnAction" size="large"/>
-      <button id="about" label="关于" onAction="OnAction" size="large"/>
+      <button id="health" label="功能检测" onAction="OnAction" size="large"/>
     </group>
   </tab></tabs></ribbon>
 </customUI>

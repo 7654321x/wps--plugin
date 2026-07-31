@@ -30,7 +30,7 @@ def request_payload():
         "schema_version": "1.0",
         "request_id": "request-00000001",
         "recognition_result": {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "recognition_engine_version": "3.0",
             "document_id": "doc-1",
             "document_revision": "rev-1",
@@ -48,6 +48,13 @@ def request_payload():
                 "confidence": 1.0,
                 "review_level": "confirmed",
                 "needs_review": False,
+                "physical_paragraph_index": 0,
+                "physical_text_sha256": SHA,
+                "range_start_utf16": 0,
+                "range_end_utf16": 8,
+                "locator_verified": True,
+                "mixed_structure": False,
+                "formatting_disposition": "apply",
             }],
         },
         "profile_id": "default",
@@ -162,6 +169,15 @@ def test_unsupported_schema_version_and_invalid_parameters_are_rejected():
     with pytest.raises(CommandServiceError) as exc_info:
         validate_command(command)
     assert exc_info.value.code == "INVALID_PARAMETER"
+
+
+def test_recognition_1_1_requires_a_verified_locator():
+    payload = request_payload()
+    validate_command_request(payload)
+    payload["recognition_result"]["paragraphs"][0].pop("range_start_utf16")
+    with pytest.raises(CommandServiceError) as exc_info:
+        validate_command_request(payload)
+    assert exc_info.value.code == "INVALID_SCHEMA"
 
 
 def test_unknown_and_text_modification_commands_are_rejected():

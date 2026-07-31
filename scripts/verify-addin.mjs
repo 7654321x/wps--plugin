@@ -23,8 +23,11 @@ async function verify(edition) {
   if (!/^docxtool-(classified-offline|standard-online)$/.test(packageJson.name)) throw new Error("ADDIN_ID_INVALID");
   if (!manifest.includes("<JsPlugin>") || !manifest.includes("<ApiVersion>")) throw new Error("MANIFEST_INVALID");
   if (!ribbon.includes("http://schemas.microsoft.com/office/2006/01/customui") || !ribbon.includes('onLoad="OnAddinLoad"') || !ribbon.includes('onAction="OnAction"')) throw new Error("RIBBON_XML_INVALID");
-  if (!ribbon.includes('id="taskpane"') || !ribbon.includes('label="打开任务窗格"')) throw new Error("TASKPANE_RIBBON_MISSING");
-  if (edition === "classified-offline" && /https:\/\//.test(await mustRead(resolve(root, "src/composition-root.ts"), "COMPOSITION_ROOT_MISSING"))) throw new Error("CLASSIFIED_PUBLIC_URL_FORBIDDEN");
+  if (edition === "classified-offline") {
+    const buttons = [...ribbon.matchAll(/<button\s+id="([^"]+)"\s+label="([^"]+)"\s+onAction="([^"]+)"/g)].map((match) => match.slice(1));
+    if (JSON.stringify(buttons) !== JSON.stringify([["preview", "预览排版", "OnAction"], ["apply", "一键排版", "OnAction"], ["health", "功能检测", "OnAction"]])) throw new Error("CLASSIFIED_RIBBON_ACTIONS_INVALID");
+    if (/https:\/\//.test(await mustRead(resolve(root, "src/composition-root.ts"), "COMPOSITION_ROOT_MISSING"))) throw new Error("CLASSIFIED_PUBLIC_URL_FORBIDDEN");
+  } else if (!ribbon.includes('id="taskpane"') || !ribbon.includes('label="打开任务窗格"')) throw new Error("TASKPANE_RIBBON_MISSING");
   console.log(`ADDIN_VERIFY_PASS ${packageJson.name}`);
 }
 

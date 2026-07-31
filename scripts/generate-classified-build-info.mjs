@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const app = resolve(root, "apps/classified-offline");
-const files = ["ribbon.xml", "main.js", "main.production.js", "js/ribbon.js", "js/ribbon-production.js", "src/host-runtime.ts", "src/taskpane-workflow.ts", "src/composition-root.ts", "ui/taskpane.html", "ui/taskpane-development.html"];
+const files = ["ribbon.xml", "main.js", "main.production.js", "js/ribbon.js", "js/ribbon-production.js", "src/host-runtime.ts", "src/health-check.ts", "src/formal-e2e-usecase.ts", "src/taskpane-workflow.ts", "src/composition-root.ts", "ui/taskpane.html", "ui/taskpane-development.html", "ui/default-format-profile.js"];
 const content = await Promise.all(files.map((file) => readFile(resolve(app, file))));
 const assetHash = createHash("sha256").update(Buffer.concat(content)).digest("hex");
 const packageJson = JSON.parse(await readFile(resolve(app, "package.json"), "utf8"));

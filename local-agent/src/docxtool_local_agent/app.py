@@ -7,9 +7,12 @@ from pathlib import Path
 from .e2e import guard_test_document, load_session, record_diagnostics, record_result, run_readonly_chain
 
 from docxtool.sdk import RecognitionInputError, RecognitionSdkError, recognize_docx
+from docxtool_command_service.core.command_builder import build_formatting_commands
+from docxtool_command_service.core.validation import CommandServiceError
 
 
 MAX_REQUEST_BYTES = 32 * 1024
+MAX_COMMAND_REQUEST_BYTES = 4 * 1024 * 1024
 DEVELOPMENT_ORIGIN = "http://127.0.0.1:3889"
 
 
@@ -33,12 +36,12 @@ def _recognized_plan(source_path):
     # vocabulary.  The WPS adapter translates that closed vocabulary to the
     # newer protocol types; authoritative mode currently reclassifies plain
     # title fixtures to body before the adapter can preserve their role.
-    plan = recognize_docx(source_path, recognition_mode="legacy")
+    plan = recognize_docx(source_path, recognition_mode="legacy", include_text=True)
     return plan.to_dict()
 
 
-def create_app(session_token, e2e_runtime=None, command_endpoint=""):
-    """Return a loopback WSGI application with short-lived token authentication."""
+def create_app(session_token, e2e_runtime=None):
+    """Return the single loopback API used by the classified WPS add-in."""
     def app(environ, start_response):
         method = environ.get("REQUEST_METHOD", "")
         path = environ.get("PATH_INFO", "")
@@ -85,7 +88,7 @@ def create_app(session_token, e2e_runtime=None, command_endpoint=""):
             try:
                 length = int(environ.get("CONTENT_LENGTH") or "0")
                 payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
-                result = run_readonly_chain(e2e_runtime, payload.get("session_id"), command_endpoint, session_token)
+                result = run_readonly_chain(e2e_runtime, payload.get("session_id"))
                 return _response(start_response, "200 OK", result, origin)
             except (UnicodeDecodeError, ValueError, TypeError):
                 return _response(start_response, "400 Bad Request", {"ok": False, "error_code": "READONLY_CHAIN_FAILED"}, origin)
@@ -93,15 +96,34 @@ def create_app(session_token, e2e_runtime=None, command_endpoint=""):
             try:
                 length = int(environ.get("CONTENT_LENGTH") or "0")
                 payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
-                result = run_readonly_chain(e2e_runtime, payload.get("session_id"), command_endpoint, session_token, include_plan=True)
+                result = run_readonly_chain(e2e_runtime, payload.get("session_id"), include_plan=True)
                 return _response(start_response, "200 OK", result, origin)
             except (UnicodeDecodeError, ValueError, TypeError):
                 return _response(start_response, "400 Bad Request", {"ok": False, "error_code": "FORMAT_PLAN_FAILED"}, origin)
+        if method == "POST" and path == "/v1/commands":
+            if environ.get("HTTP_X_DOCXTOOL_SESSION", "") != session_token:
+                return _response(start_response, "401 Unauthorized", {
+                    "error": {"code": "UNAUTHORIZED"},
+                }, origin)
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+                if length < 1 or length > MAX_COMMAND_REQUEST_BYTES:
+                    raise CommandServiceError("INVALID_REQUEST", "invalid request length")
+                request = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+                return _response(start_response, "200 OK", build_formatting_commands(request), origin)
+            except CommandServiceError as exc:
+                return _response(start_response, "400 Bad Request", {
+                    "error": {"code": exc.code, "message": str(exc)},
+                }, origin)
+            except (UnicodeDecodeError, ValueError, TypeError):
+                return _response(start_response, "400 Bad Request", {
+                    "error": {"code": "INVALID_JSON", "message": "request must be JSON"},
+                }, origin)
         if method != "POST" or path != "/v1/recognize":
             return _response(start_response, "404 Not Found", {
                 "error": {"code": "NOT_FOUND"},
             }, origin)
-        if environ.get("HTTP_X_DOCTOOL_SESSION", "") != session_token:
+        if environ.get("HTTP_X_DOCXTOOL_SESSION", "") != session_token:
             return _response(start_response, "401 Unauthorized", {
                 "error": {"code": "UNAUTHORIZED"},
             }, origin)

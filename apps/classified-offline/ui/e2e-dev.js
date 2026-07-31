@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  var AGENT = "http://127.0.0.1:9528", COMMAND = "http://127.0.0.1:9529", session = null, results = {};
+  var AGENT = "http://127.0.0.1:9528", COMMAND = AGENT, session = null, results = {};
   var groups = [
     ["加载项与页面", ["ADDIN_ENTRY_LOADED", "TASKPANE_PAGE_LOADED", "TASKPANE_BRIDGE_READY", "EDITION_CONFIG_VALID", "PRODUCTION_GUARD_VALID"]],
     ["WPS 宿主环境", ["WPS_ROOT_AVAILABLE", "WPS_APPLICATION_AVAILABLE", "WPS_VERSION_AVAILABLE", "ACTIVE_DOCUMENT_API_AVAILABLE", "TASKPANE_API_AVAILABLE"]],

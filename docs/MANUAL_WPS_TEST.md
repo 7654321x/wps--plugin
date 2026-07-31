@@ -4,8 +4,8 @@
 
 ## 第三阶段操作步骤
 
-1. 在 `wps` 目录运行 `npm run e2e:classified:prepare`。预期输出三个服务均为 `PASS` 和 `E2E_SESSION_READY`；命令不会输出路径、正文或令牌。
-2. 运行 `npm run e2e:classified:status`，确认 static resources、local-agent、command-service 和 debug registration 均为 `PASS`。
+1. 在 `wps` 目录运行 `npm run e2e:classified:prepare`。预期静态资源、本地统一服务和注册均为 `PASS`，并输出 `E2E_SESSION_READY`；命令不会输出路径、正文或令牌。
+2. 运行 `npm run e2e:classified:status`，确认 static resources、local-agent、command-service（统一入口）和 debug registration 均为 `PASS`。识别与命令均通过 9528，9529 不应监听。
 3. 关闭所有 WPS 窗口，再重新打开 WPS 文字；打开本次会话生成的工作副本。不要打开 `tests/fixtures` 中的原始基准文件。
 4. 确认 `Docxtool 涉密离线版` Ribbon 可见，点击“打开任务窗格”，进入“开发验证”。重复点击不应增加窗格。
 5. 依次手工点击“确认 Ribbon 与任务窗格”“检查宿主环境”“检查活动文档”“检查本地服务”。正常结果记录为 `PASS`；未加载时记录稳定错误码，例如 `WPS_HOST_NOT_DETECTED` 或 `LOCAL_SERVICE_UNAVAILABLE`。

@@ -51,7 +51,7 @@ function Show-Status {
   [pscustomobject]@{
     static_resources = if (Test-Port 3891 "/ui/taskpane-development.html") { "PASS" } else { "FAIL" }
     local_agent = if (Test-Port 9528) { "PASS" } else { "FAIL" }
-    command_service = if (Test-Port 9529) { "PASS" } else { "FAIL" }
+    command_service = if (Test-Port 9528) { "PASS（统一入口）" } else { "FAIL" }
     debug_registration = Get-Registration
     session_id = if ($session) { $session.session_id } else { "" }
     expected_build_id = $expected

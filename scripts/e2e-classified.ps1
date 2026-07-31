@@ -5,13 +5,22 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtime = Join-Path $root ".runtime\e2e"
 $python = Join-Path $root "..\.venv\Scripts\python.exe"
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
-$staticPort = 3891; $agentPort = 9528; $commandPort = 9529
+$staticPort = 3889; $agentPort = 9528; $remoteDebugPort = 9222
 
 function Test-Health([int]$Port) {
   try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$Port/v1/health").StatusCode -eq 200 } catch { return $false }
 }
 function Test-Static {
   try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$staticPort/index.html").StatusCode -eq 200 } catch { return $false }
+}
+function Test-SessionToken([int]$Port, [string]$Path, [string]$Token) {
+  if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
+  try {
+    $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Method Post -ContentType "application/json" -Headers @{ "X-Docxtool-Session"=$Token } -Body "{}" "http://127.0.0.1:$Port$Path"
+    return $true
+  } catch {
+    try { return ([int]$_.Exception.Response.StatusCode) -ne 401 } catch { return $false }
+  }
 }
 function Get-Session {
   $path = Join-Path $runtime "current.json"
@@ -22,11 +31,11 @@ function Show-Status {
   $session = Get-Session
   $registered = $false
   $publish = Join-Path $env:APPDATA "kingsoft\wps\jsaddons\publish.xml"
-  if (Test-Path -LiteralPath $publish) { $registered = (Get-Content -Raw -LiteralPath $publish) -match 'name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:3891/' }
+  if (Test-Path -LiteralPath $publish) { $registered = (Get-Content -Raw -LiteralPath $publish) -match ('name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:' + $staticPort + '/') }
   [pscustomobject]@{
     static_resources = if (Test-Static) { "PASS" } else { "FAIL" }
     local_agent = if (Test-Health $agentPort) { "PASS" } else { "FAIL" }
-    command_service = if (Test-Health $commandPort) { "PASS" } else { "FAIL" }
+    command_service = if (Test-Health $agentPort) { "PASS（统一入口）" } else { "FAIL" }
     debug_registration = if ($registered) { "PASS" } else { "FAIL" }
     session_id = if ($session) { $session.session_id } else { "" }
     host_reported = if ($session -and $session.test_results.PSObject.Properties.Count -gt 0) { "YES" } else { "NO" }
@@ -82,22 +91,32 @@ if ($Action -eq "prepare") {
   $session = [ordered]@{ session_id=$sessionId; edition="classified-offline"; plugin_version="0.1.0"; wps_version=""; started_at=(Get-Date).ToUniversalTime().ToString("o"); completed_at=""; current_stage="bootstrap_started"; test_results=[ordered]@{}; stable_errors=@(); overall_status="REAL_WPS_E2E_NOT_RUN" }
   $session | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $runtime "current.json")
   $env:PYTHONPATH = "$root\local-agent\src;$root\command-service\src;$root\..\src"
-  $token = [Guid]::NewGuid().ToString("N")
-  $processes = @()
-  if (-not (Test-Health $agentPort)) { $processes += [pscustomobject]@{ name="local-agent"; pid=(Start-Managed "local-agent" $python @("-m", "docxtool_local_agent", "--port", "$agentPort", "--session-token", $token, "--e2e-runtime", $runtime, "--command-endpoint", "http://127.0.0.1:$commandPort")).Id } }
-  if (-not (Test-Health $commandPort)) { $processes += [pscustomobject]@{ name="command-service"; pid=(Start-Managed "command-service" $python @("-m", "docxtool_command_service", "--mode", "local", "--port", "$commandPort", "--session-token", $token)).Id } }
+  $tokenFile = Join-Path $runtime "session-token.txt"
+  $token = if (Test-Path -LiteralPath $tokenFile) { (Get-Content -Raw -LiteralPath $tokenFile).Trim() } else { "" }
+  if ($token -notmatch '^[a-f0-9]{32}$') { $token = [Guid]::NewGuid().ToString("N") }
+  $servicesUseToken = (Test-Health $agentPort) -and (Test-SessionToken $agentPort "/v1/recognize" $token) -and (Test-SessionToken $agentPort "/v1/commands" $token)
+  if (-not $servicesUseToken) {
+    Stop-ManagedPort $agentPort
+    $null = Start-Managed "local-agent" $python @("-m", "docxtool_local_agent", "--port", "$agentPort", "--session-token", $token, "--e2e-runtime", $runtime)
+  }
+  Set-Content -NoNewline -Encoding ascii -LiteralPath $tokenFile -Value $token
   $runtimeScript = Join-Path $root "apps\classified-offline\ui\e2e-session.js"
-  ('window.DocxtoolRuntimeConfig=' + (@{ recognitionEndpoint="http://127.0.0.1:$agentPort"; commandEndpoint="http://127.0.0.1:$commandPort"; sessionToken=$token } | ConvertTo-Json -Compress) + ';') | Set-Content -Encoding utf8 $runtimeScript
+  ('window.DocxtoolRuntimeConfig=' + (@{ recognitionEndpoint="http://127.0.0.1:$agentPort"; commandEndpoint="http://127.0.0.1:$agentPort"; sessionToken=$token } | ConvertTo-Json -Compress) + ';') | Set-Content -Encoding utf8 $runtimeScript
   $publish = Join-Path $env:APPDATA "kingsoft\wps\jsaddons\publish.xml"
-  $registeredAtFixedPort = (Test-Path -LiteralPath $publish) -and ((Get-Content -Raw -LiteralPath $publish) -match 'name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:3891/')
+  $registeredAtFixedPort = (Test-Path -LiteralPath $publish) -and ((Get-Content -Raw -LiteralPath $publish) -match 'name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:3889/')
   if (-not ((Test-Static) -and $registeredAtFixedPort)) {
     Stop-ManagedPort $staticPort
     $logs = Join-Path $runtime "logs"; New-Item -ItemType Directory -Force -Path $logs | Out-Null
-    $debug = Start-Process -FilePath "npx.cmd" -ArgumentList @("--no-install", "wpsjs", "debug", "-p", "$staticPort", "-s") -WorkingDirectory (Join-Path $root "apps\classified-offline") -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "wpsjs.out.log") -RedirectStandardError (Join-Path $logs "wpsjs.err.log") -PassThru
-    $processes += [pscustomobject]@{ name="wpsjs"; pid=$debug.Id }
+    $debug = Start-Process -FilePath "npx.cmd" -ArgumentList @("--no-install", "wpsjs", "debug", "-p", "$staticPort", "-d", "-r", "$remoteDebugPort") -WorkingDirectory (Join-Path $root "apps\classified-offline") -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "wpsjs.out.log") -RedirectStandardError (Join-Path $logs "wpsjs.err.log") -PassThru
+    $null = $debug
+  }
+  for ($i = 0; $i -lt 30 -and (-not ((Test-Static) -and (Test-Health $agentPort))); $i++) { Start-Sleep -Milliseconds 500 }
+  $processes = @()
+  foreach ($entry in @(@{name="local-service";port=$agentPort}, @{name="wpsjs";port=$staticPort})) {
+    $processId = Get-NetTCPConnection -State Listen -LocalPort $entry.port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -First 1
+    if ($processId) { $processes += [pscustomobject]@{ name=$entry.name; pid=$processId } }
   }
   $processes | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $runtime "processes.json")
-  for ($i = 0; $i -lt 30 -and (-not ((Test-Static) -and (Test-Health $agentPort) -and (Test-Health $commandPort))); $i++) { Start-Sleep -Milliseconds 500 }
   Show-Status
   Write-Output "E2E_SESSION_READY $sessionId"
   exit
@@ -105,41 +124,53 @@ if ($Action -eq "prepare") {
 if ($Action -eq "auto") {
   # The E2E owns only these fixed loopback development ports. Restarting them
   # prevents a registered add-in from attaching to stale source or CORS rules.
-  foreach ($port in @($staticPort, $agentPort, $commandPort)) { Stop-ManagedPort $port }
+  foreach ($port in @($staticPort, $agentPort, 9529, $remoteDebugPort)) { Stop-ManagedPort $port }
   & pwsh -NoProfile -File $PSCommandPath prepare
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
   $session = Get-Session
   if (-not $session) { throw "E2E_SESSION_NOT_FOUND" }
   $metadata = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $runtime $session.session_id) "test-document.json") | ConvertFrom-Json
   $working = Join-Path $root $metadata.working_project_relative
+  $reportDirectory = Join-Path $root (".runtime\reports\" + $session.session_id); New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+  $before = Join-Path $root "tests\fixtures\wps-e2e-baseline.docx"
+  $originalOutput = Join-Path $reportDirectory "01-original-test-copy.docx"
+  $previewOutput = Join-Path $reportDirectory "02-preview-comments.docx"
+  $finalOutput = Join-Path $reportDirectory "03-final-format.docx"
+  Copy-Item -LiteralPath $before -Destination $originalOutput -Force
   $wps = Find-WpsWriter
-  Start-Process -FilePath $wps -ArgumentList @($working) -WindowStyle Hidden | Out-Null
+  Start-Process -FilePath $wps -ArgumentList @($working) | Out-Null
+  $previewCopied = $false
   for ($i = 0; $i -lt 240; $i++) {
     Start-Sleep -Milliseconds 500
     $session = Get-Session
-    if ($session.test_results.one_click_format) { break }
+    if (-not $previewCopied -and $session.test_results.preview_document.status -eq "PASS") {
+      if (-not (Test-Path -LiteralPath $previewOutput)) { Copy-Item -LiteralPath $working -Destination $previewOutput -Force }
+      $previewCopied = $true
+    }
+    if ($session.test_results.host_command_router) { break }
   }
-  $reportDirectory = Join-Path $root ".runtime\reports"; New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+  $health = if ($session.test_results.health_check) { $session.test_results.health_check } else { @{ status="FAIL"; error_code="HEALTH_CHECK_NOT_REPORTED" } }
+  $preview = if ($session.test_results.preview_document) { $session.test_results.preview_document } else { @{ status="FAIL"; error_code="PREVIEW_NOT_REPORTED" } }
   $result = if ($session.test_results.one_click_format) { $session.test_results.one_click_format } else { @{ status="FAIL"; error_code="WPS_HOST_CALLBACK_TIMEOUT" } }
   $rollback = if ($session.test_results.rollback) { $session.test_results.rollback } else { @{ status="FAIL"; error_code="ROLLBACK_NOT_REPORTED" } }
-  $before = Join-Path $root "tests\fixtures\wps-e2e-baseline.docx"
   if ($result.status -eq "PASS") {
     & $python (Join-Path $root "scripts\inspect-one-click-ooxml.py") $before --out (Join-Path $reportDirectory "one-click-before-ooxml.json")
+    if (-not (Test-Path -LiteralPath $previewOutput)) { throw "PREVIEW_ARTIFACT_NOT_CAPTURED" }
+    & $python (Join-Path $root "scripts\inspect-one-click-ooxml.py") $previewOutput --out (Join-Path $reportDirectory "preview-comments-ooxml.json")
     & $python (Join-Path $root "scripts\inspect-one-click-ooxml.py") $working --out (Join-Path $reportDirectory "one-click-ooxml.json")
     & $python (Join-Path $root "scripts\verify-one-click-format.py") $working --profile (Join-Path $root "command-service\src\docxtool_command_service\profiles\docxtool-default.json") --expectations (Join-Path $root "tests\fixtures\one-click-format-expectations.json") --out (Join-Path $reportDirectory "one-click-format-values.json")
     $formatValues = Get-Content -Raw (Join-Path $reportDirectory "one-click-format-values.json") | ConvertFrom-Json
     $beforeInfo = Get-Content -Raw (Join-Path $reportDirectory "one-click-before-ooxml.json") | ConvertFrom-Json
+    $previewInfo = Get-Content -Raw (Join-Path $reportDirectory "preview-comments-ooxml.json") | ConvertFrom-Json
     $afterInfo = Get-Content -Raw (Join-Path $reportDirectory "one-click-ooxml.json") | ConvertFrom-Json
-    $contentIntegrity = [ordered]@{ body_sha256_matches=($beforeInfo.body_sha256 -eq $afterInfo.body_sha256); paragraph_count_matches=($beforeInfo.paragraph_count -eq $afterInfo.paragraph_count); paragraph_order_matches=(($beforeInfo.paragraphs.text_sha256 -join ',') -eq ($afterInfo.paragraphs.text_sha256 -join ',')) }
-    Copy-Item -LiteralPath $before -Destination (Join-Path $reportDirectory "01-before-format.docx") -Force
-    Copy-Item -LiteralPath $before -Destination (Join-Path $reportDirectory "02-rollback-test.docx") -Force
-    Copy-Item -LiteralPath $working -Destination (Join-Path $reportDirectory "03-after-one-click-format.docx") -Force
-  } else { $contentIntegrity = [ordered]@{ body_sha256_matches=$false; paragraph_count_matches=$false; paragraph_order_matches=$false }; $formatValues = [ordered]@{ status="FAIL"; failures=@(@{ property="format_validation_not_run" }) } }
-  $passed = $result.status -eq "PASS" -and $rollback.status -eq "PASS" -and $contentIntegrity.body_sha256_matches -and $contentIntegrity.paragraph_count_matches -and $contentIntegrity.paragraph_order_matches -and $formatValues.status -eq "PASS"
-  $safe = [ordered]@{ overall_status=if ($passed) { "ONE_CLICK_FORMATTING_PASS" } else { "ONE_CLICK_FORMATTING_FAIL" }; wps_version=$session.wps_version; plugin_version=$session.plugin_version; one_click=$result; rollback=$rollback; content_integrity=$contentIntegrity; saved_format_validation=$formatValues; fixture_before=(Join-Path $runtime ($session.session_id + "\test-document.json")); after_document=(Join-Path $reportDirectory "03-after-one-click-format.docx") }
+    $contentIntegrity = [ordered]@{ body_sha256_matches=($beforeInfo.body_sha256 -eq $afterInfo.body_sha256); paragraph_count_matches=($beforeInfo.paragraph_count -eq $afterInfo.paragraph_count); paragraph_order_matches=(($beforeInfo.paragraphs.text_sha256 -join ',') -eq ($afterInfo.paragraphs.text_sha256 -join ',')); preview_docxtool_comments_present=($previewInfo.comments.docxtool_preview -gt 0); preview_fields_complete=($previewInfo.comments.docxtool_preview_complete -eq $previewInfo.comments.docxtool_preview); preview_role_colors_distinct=($previewInfo.comments.docxtool_role_author_count -ge 3); preview_user_comments_preserved=($previewInfo.comments.user_owned -eq $beforeInfo.comments.user_owned); final_docxtool_comments_cleared=($afterInfo.comments.docxtool_preview -eq 0); final_user_comments_preserved=($afterInfo.comments.user_owned -eq $beforeInfo.comments.user_owned) }
+    Copy-Item -LiteralPath $working -Destination $finalOutput -Force
+  } else { $contentIntegrity = [ordered]@{ body_sha256_matches=$false; paragraph_count_matches=$false; paragraph_order_matches=$false; preview_docxtool_comments_present=$false; preview_user_comments_preserved=$false; final_docxtool_comments_cleared=$false; final_user_comments_preserved=$false }; $formatValues = [ordered]@{ status="FAIL"; failures=@(@{ property="format_validation_not_run" }) } }
+  $passed = $health.status -eq "PASS" -and $preview.status -eq "PASS" -and $result.status -eq "PASS" -and $rollback.status -eq "PASS" -and $contentIntegrity.body_sha256_matches -and $contentIntegrity.paragraph_count_matches -and $contentIntegrity.paragraph_order_matches -and $contentIntegrity.preview_docxtool_comments_present -and $contentIntegrity.preview_fields_complete -and $contentIntegrity.preview_role_colors_distinct -and $contentIntegrity.preview_user_comments_preserved -and $contentIntegrity.final_docxtool_comments_cleared -and $contentIntegrity.final_user_comments_preserved -and $formatValues.status -eq "PASS"
+  $safe = [ordered]@{ overall_status=if ($passed) { "CLASSIFIED_THREE_ACTIONS_PASS" } else { "CLASSIFIED_THREE_ACTIONS_FAIL" }; wps_version=$session.wps_version; plugin_version=$session.plugin_version; health_check=$health; preview=$preview; one_click=$result; rollback=$rollback; content_integrity=$contentIntegrity; saved_format_validation=$formatValues; fixture_before=(Join-Path $runtime ($session.session_id + "\test-document.json")); original_document=$originalOutput; preview_document=$previewOutput; final_document=$finalOutput }
   $safe | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 (Join-Path $reportDirectory "one-click-e2e.json")
-  ("# WPS 一键排版自动验收`n`n状态：" + $safe.overall_status + "`n`n写入：" + $result.status + "`n`n回滚：" + $rollback.status + "`n`n保存后格式：" + $formatValues.status + "`n`n正文哈希：" + $contentIntegrity.body_sha256_matches + "`n`n段落顺序：" + $contentIntegrity.paragraph_order_matches + "`n`n错误码：" + $result.error_code) | Set-Content -Encoding utf8 (Join-Path $reportDirectory "one-click-e2e.md")
-  if (-not $passed) { throw $(if ($result.status -ne "PASS") { $result.error_code } elseif ($rollback.status -ne "PASS") { $rollback.error_code } elseif ($formatValues.status -ne "PASS") { "SAVED_DOCX_FORMAT_MISMATCH" } else { "SAVED_DOCX_CONTENT_MISMATCH" }) }
+  ("# WPS 涉密版三功能自动验收`n`n状态：" + $safe.overall_status + "`n`n功能检测：" + $health.status + "`n`n预览排版：" + $preview.status + "`n`n一键排版：" + $result.status + "`n`n回滚：" + $rollback.status + "`n`n保存后格式：" + $formatValues.status + "`n`n正文哈希：" + $contentIntegrity.body_sha256_matches + "`n`n预览批注：" + $contentIntegrity.preview_docxtool_comments_present + "`n`n用户批注保留：" + $contentIntegrity.final_user_comments_preserved + "`n`n错误码：" + $result.error_code) | Set-Content -Encoding utf8 (Join-Path $reportDirectory "one-click-e2e.md")
+  if (-not $passed) { throw $(if ($health.status -ne "PASS") { $health.error_code } elseif ($preview.status -ne "PASS") { $preview.error_code } elseif ($result.status -ne "PASS") { $result.error_code } elseif ($rollback.status -ne "PASS") { $rollback.error_code } elseif ($formatValues.status -ne "PASS") { "SAVED_DOCX_FORMAT_MISMATCH" } else { "SAVED_DOCX_CONTENT_OR_COMMENT_MISMATCH" }) }
   exit
 }
 if ($Action -eq "stop") {

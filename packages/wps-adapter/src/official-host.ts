@@ -10,7 +10,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 function normalizeText(value: unknown): string {
   // WPS appends paragraph, manual-line-break and section/page-break control
   // characters to Range.Text. python-docx paragraph.text excludes them.
-  return String(value ?? "").replace(/[\r\n\v\f]+$/g, "");
+  return String(value ?? "").replace(/\r\n/g, "\n").replace(/[\r\v]/g, "\n").replace(/[\n\f]+$/g, "");
 }
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -74,19 +74,26 @@ export interface RuntimeProbeItem {
 }
 
 export class WpsRuntimeProbe {
+  constructor(private readonly application?: WpsObject) {}
   probe(): RuntimeProbeItem[] {
     try {
-      const application = app();
+      const application = this.application ?? app();
       const document = application.ActiveDocument as WpsObject | undefined;
       const paragraph = document?.Paragraphs?.Count ? paragraphAt(document, 0) : undefined;
       const range = paragraph?.Range as WpsObject | undefined;
+      const comments = document?.Comments as WpsObject | undefined;
       return [
+        ["Application", true, true],
         ["Application.ActiveDocument", !!document, !!document],
+        ["Document.IsDocx", typeof document?.FullName === "string" && document.FullName.toLowerCase().endsWith(".docx"), typeof document?.FullName === "string"],
+        ["Document.Saved", typeof document?.Saved === "boolean", typeof document?.Saved === "boolean"],
         ["Document.Paragraphs", !!document?.Paragraphs, !!document?.Paragraphs],
         ["Paragraph.Range.Text", !!range, typeof range?.Text === "string"],
         ["Range.Font", !!range?.Font, !!range?.Font],
         ["Range.ParagraphFormat", !!range?.ParagraphFormat, !!range?.ParagraphFormat],
         ["Range.PageSetup", !!range?.PageSetup, !!range?.PageSetup],
+        ["Document.Comments", !!comments, !!comments],
+        ["Comments.Add", typeof comments?.Add === "function", typeof comments?.Add === "function"],
         ["Application.CreateTaskPane", typeof application.CreateTaskPane === "function", false],
         ["Application.ApiEvent", !!application.ApiEvent, false],
       ].map(([api, supported, readable]) => ({
@@ -131,11 +138,12 @@ export class WpsCapabilityProvider {
 
 /** Reads names only; no font file is opened, copied, uploaded or emitted. */
 export class WpsFontCapabilityProvider implements FontCapabilityProvider {
+  constructor(private readonly application?: WpsObject) {}
   inspect(fontNames: string[]): FontCapability[] {
     const requested = [...new Set(fontNames.filter(Boolean))];
     let names: string[] | null = null;
     try {
-      const collection = app().FontNames as WpsObject | undefined;
+      const collection = (this.application ?? app()).FontNames as WpsObject | undefined;
       const count = Number(collection?.Count ?? 0);
       if (collection && count >= 0 && typeof collection.Item === "function") {
         names = [];
@@ -161,18 +169,20 @@ export class WpsDocumentReader implements DocumentReader {
     if ((!document.Saved && !options.allowUnsaved) || typeof document.FullName !== "string" || !document.FullName.toLowerCase().endsWith(".docx")) {
       throw new Error("DOCUMENT_MUST_BE_SAVED");
     }
-    const paragraphs: Array<{ sourceParagraphIndex: number; text: string }> = [];
+    const paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable?: boolean }> = [];
     const count = Number(document.Paragraphs?.Count ?? 0);
     for (let index = 0; index < count; index += 1) {
-      paragraphs.push({ sourceParagraphIndex: index, text: normalizeText(paragraphAt(document, index).Range.Text) });
+      const range = paragraphAt(document, index).Range as WpsObject;
+      paragraphs.push({ sourceParagraphIndex: index, text: normalizeText(range.Text), isInTable: Number(range.Tables?.Count ?? 0) > 0 });
     }
     const sourceSha256 = await sha256(paragraphs.map((item) => item.text).join("\u001f"));
     const orderHash = await sha256(paragraphs.map((item) => `${item.sourceParagraphIndex}:${item.text}`).join("\u001f"));
+    const documentFullNameHash = await sha256(String(document.FullName).toLocaleLowerCase());
     return {
       documentId: "wps-" + sourceSha256.slice(0, 16),
       revision: sourceSha256 + ":" + count,
       sourceSha256, localDocxPath: document.FullName, paragraphs, paragraphOrderHash: orderHash,
-      sectionCount: Number(document.Sections?.Count ?? 0), formattingRevision: await formattingRevision(document, count),
+      sectionCount: Number(document.Sections?.Count ?? 0), formattingRevision: await formattingRevision(document, count), documentFullNameHash,
     };
   }
 }

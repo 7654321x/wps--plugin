@@ -33,6 +33,7 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
   const previewComments = new WpsPreviewCommentService();
   return {
     telemetry,
+    previewTracker: tracker,
     recognizeUseCase: new RecognizeDocumentUseCase(reader, recognition),
     previewUseCase: new PreviewDocumentUseCase(reader, recognition, commands, validator, capability, license, fonts, previewComments, tracker),
     clearPreviewUseCase: new ClearFormattingPreviewUseCase(previewComments, tracker),

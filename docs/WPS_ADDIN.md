@@ -24,4 +24,4 @@ wpsjs debug 会自动选择可用端口，当前版本没有将请求的端口�
 
 状态：OFFICIAL_DEVELOPMENT_REGISTERED；REAL_WPS_GUI_NOT_RUN（当前自动化策略阻止启动或控制可见 WPS 窗口）。
 
-涉密版开发任务窗格的跨端口请求仅允许固定 origin `http://127.0.0.1:3890`。local-agent 与 command-service 显式处理 `OPTIONS`，并仅允许 `GET, POST, OPTIONS` 和诊断所需的 `Content-Type`、`X-Docxtool-Session`、`Authorization` 请求头；不使用 `*`，不接受公网 origin。
+涉密版 WPS 只连接一个本机业务入口 `http://127.0.0.1:9528`。该统一服务同时提供 `/v1/recognize` 与 `/v1/commands`，命令路由直接复用正式 command-service 核心，不再启动或访问 9529。统一入口显式处理 `OPTIONS`，仅允许固定开发 origin 和诊断所需请求头；不使用 `*`，不接受公网 origin。
