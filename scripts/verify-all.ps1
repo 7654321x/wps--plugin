@@ -2,7 +2,7 @@ param()
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$python = Join-Path $root "..\.venv\Scripts\python.exe"
+$python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { throw "VERIFY_PYTHON_NOT_FOUND" }
 
 Push-Location $root
@@ -13,7 +13,7 @@ try {
   if ($LASTEXITCODE) { throw "TYPESCRIPT_TEST_FAILED" }
   & $python (Join-Path $root "scripts\sync-default-format-profile.py") --check
   if ($LASTEXITCODE) { throw "PROFILE_SYNC_CHECK_FAILED" }
-  $env:PYTHONPATH = "$root\command-service\src;$root\local-agent\src;$(Join-Path $root '..\src')"
+  $env:PYTHONPATH = "$root\command-service\src;$root\local-agent\src"
   & $python -m pytest command-service\tests local-agent\tests tests\test_grid_inspector.py -q
   if ($LASTEXITCODE) { throw "PYTHON_TEST_FAILED" }
   & $python -m ruff check command-service local-agent scripts tests

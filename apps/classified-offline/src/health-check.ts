@@ -1,6 +1,7 @@
 import { DiagnosticRunner, type DiagnosticResult } from "../../../packages/diagnostics/src/index.js";
 import { CommentPreviewCapabilityProvider, WpsFontCapabilityProvider, WpsRuntimeProbe } from "../../../packages/wps-adapter/src/index.js";
 import type { ClassifiedRuntimeConfig } from "./composition-root.js";
+import { errorMessage } from "./error-messages.js";
 
 export type HealthStatus = "PASS" | "WARN" | "FAIL";
 export interface SafeHealthItem { check_id: string; title: string; status: HealthStatus; error_code: string; summary: string; }
@@ -47,7 +48,7 @@ async function getJson(fetcher: Fetcher, base: string, path: string): Promise<Re
   } finally { clearTimeout(timer); }
 }
 function reportText(overall: HealthStatus, items: SafeHealthItem[], missingFonts: string[]): string {
-  const lines = ["DocxTool 功能检测", "", ...items.map((item) => `${item.title}：${item.status}${item.error_code ? `（${item.error_code}）` : ""}`), "", `总体结果：${overall}`];
+  const lines = ["DocxTool 功能检测", "", ...items.map((item) => `${item.title}：${item.status}${item.error_code ? `（${errorMessage(item.error_code)}；错误码：${item.error_code}）` : ""}`), "", `总体结果：${overall}`];
   if (missingFonts.length) lines.push("", "缺少字体：", ...missingFonts);
   return lines.join("\n");
 }
@@ -90,7 +91,22 @@ export class ClassifiedHealthChecker {
         catch { return { status: "FAIL", error_code: "LOCAL_AGENT_UNAVAILABLE", summary: "本地识别服务不可达" }; }
       },
       recognition_wheel: async () => {
-        try { const value = await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/version"); return typeof value.recognition_sdk === "string" && value.recognition_sdk.includes("recognize_docx") ? { status: "PASS", summary: "recognition wheel 非正文握手通过" } : { status: "FAIL", error_code: "RECOGNITION_WHEEL_UNAVAILABLE", summary: "识别引擎握手未通过" }; }
+        try {
+          const value = await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/version");
+          const ready = typeof value.recognition_sdk === "string"
+            && value.recognition_sdk.includes("recognize_docx")
+            && typeof value.package_version === "string"
+            && typeof value.locator_version === "string"
+            && value.host_text_contract_version === "host-text-v1";
+          const handshake = ready ? await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/handshake") : {};
+          const handshakeReady = handshake.ok === true
+            && handshake.package_version === value.package_version
+            && handshake.locator_version === value.locator_version
+            && handshake.host_text_contract_version === "host-text-v1";
+          return ready && handshakeReady
+            ? { status: "PASS", summary: "recognition wheel、来源定位、绑定与 host-text-v1 握手通过" }
+            : { status: "FAIL", error_code: "RECOGNITION_WHEEL_UNAVAILABLE", summary: "识别引擎版本或定位契约不兼容" };
+        }
         catch { return { status: "FAIL", error_code: "RECOGNITION_WHEEL_UNAVAILABLE", summary: "识别引擎握手失败" }; }
       },
       command_service: async () => {

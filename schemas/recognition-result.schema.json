@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "recognition_engine_version", "document_id", "document_revision", "source_sha256", "document_mode", "document_mode_confidence", "paragraphs"],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "recognition_engine_version": {"type": "string", "minLength": 1, "maxLength": 64},
     "document_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
     "document_revision": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
@@ -22,10 +22,14 @@
     "paragraph": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["target_id", "source_paragraph_index", "recognized_type", "section_kind", "text_sha256", "text_length", "occurrence_index", "confidence", "review_level", "needs_review", "physical_paragraph_index", "physical_text_sha256", "range_start_utf16", "range_end_utf16", "locator_verified", "mixed_structure", "formatting_disposition"],
+      "required": ["target_id", "source_paragraph_index", "host_paragraph_index", "host_raw_start_utf16", "host_raw_end_utf16", "host_raw_text_sha256", "recognized_type", "section_kind", "text_sha256", "text_length", "occurrence_index", "confidence", "review_level", "needs_review", "physical_paragraph_index", "physical_text_sha256", "range_start_utf16", "range_end_utf16", "locator_verified", "mixed_structure", "formatting_disposition", "host_text_contract_version", "host_canonical_start_utf16", "host_canonical_end_utf16", "binding_status", "binding_confidence", "segment_count_total", "segment_count_located", "segment_count_confirmed"],
       "properties": {
         "target_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,160}$"},
         "source_paragraph_index": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "host_paragraph_index": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "host_raw_start_utf16": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "host_raw_end_utf16": {"type": "integer", "minimum": 1, "maximum": 10000000},
+        "host_raw_text_sha256": {"$ref": "#/$defs/sha256"},
         "recognized_type": {"enum": ["main_title", "title_continuation", "dispatch_number", "recipient", "body", "heading1", "heading2", "heading3", "heading4", "key_value", "meeting_meta", "signature_org", "signature_date", "source_note", "embedded_document_title", "attachment_note", "attachment_title", "addressing", "date_line", "author_line", "role_name", "title2", "glossary_title", "glossary_item", "attachment_note_item", "attachment_page_mark", "attachment_body", "heading1_report", "list", "list_item", "quote", "annotation", "closing", "number", "letter", "page_number", "superscript", "caption", "unknown"]},
         "section_kind": {"enum": ["header", "dispatch_meta", "recipient", "body", "meeting_meta", "signature", "source_note", "embedded_document", "attachment_note", "attachment_body"]},
         "text_sha256": {"$ref": "#/$defs/sha256"},
@@ -41,6 +45,14 @@
         ,"locator_verified": {"const": true}
         ,"mixed_structure": {"type": "boolean"}
         ,"formatting_disposition": {"enum": ["apply", "review_only"]}
+        ,"host_text_contract_version": {"const": "host-text-v1"}
+        ,"host_canonical_start_utf16": {"type": "integer", "minimum": 0, "maximum": 10000000}
+        ,"host_canonical_end_utf16": {"type": "integer", "minimum": 1, "maximum": 10000000}
+        ,"binding_status": {"enum": ["confirmed", "review"]}
+        ,"binding_confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        ,"segment_count_total": {"type": "integer", "minimum": 1, "maximum": 100000}
+        ,"segment_count_located": {"type": "integer", "minimum": 1, "maximum": 100000}
+        ,"segment_count_confirmed": {"type": "integer", "minimum": 1, "maximum": 100000}
       }
     },
     "unresolved": {
@@ -51,7 +63,7 @@
         "block_index": {"type": "integer", "minimum": 0},
         "recognized_type": {"type": "string", "minLength": 1, "maxLength": 80},
         "review_level": {"enum": ["confirmed", "info", "review", "critical_review"]},
-        "reason": {"enum": ["RECOGNITION_LOCATOR_UNVERIFIED", "RECOGNITION_LOCATOR_AMBIGUOUS"]}
+        "reason": {"enum": ["RECOGNITION_LOCATOR_UNVERIFIED", "RECOGNITION_LOCATOR_AMBIGUOUS", "BINDING_NOT_CONFIRMED", "SEGMENT_GROUP_INCOMPLETE"]}
       }
     },
     "review": {

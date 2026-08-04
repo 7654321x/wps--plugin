@@ -122,6 +122,14 @@
 - 正确方案：每个外部命令执行后立即检查 `$LASTEXITCODE`，非零时立刻 `throw`；优先使用项目锁定的 `.venv`，避免系统 Python 缺少依赖导致伪代码故障。
 - 自动验证门槛：发布记录分别列出 pytest、Node、Ruff、构建和 WPS `verify:all` 的独立成功结果；任何一步失败都不得进入 commit/push。
 
+## P015 WPS 本级虚拟环境与 wheel 安装被上级源码绕过
+
+- 症状：用户要求恢复或重装 wheel 后，`pip show docxtool` 在 WPS 本级 `.venv` 中为空，或 9528 服务仍能运行但实际从上级 `..\src` 加载 `docxtool`，导致 wheel 重装不生效。
+- 根因：WPS 脚本曾指向 `D:\PycharmProjects\docxtool\.venv`，并把 `D:\PycharmProjects\docxtool\src` 放入 `PYTHONPATH`；这会绕过 `D:\PycharmProjects\docxtool\wps\.venv` 中安装的 wheel。
+- 禁止：WPS 插件运行、验证或服务启动时依赖上级 `.venv` 或上级 `src`；不得用“接口能通”证明 wheel 已恢复。
+- 正确方案：WPS 项目固定使用 `D:\PycharmProjects\docxtool\wps\.venv`；local-agent 与 command-service 通过本仓库源码路径加载，`docxtool` 只能来自本级 `.venv` 已安装的 wheel；`local-agent` 依赖版本必须与当前 wheel 版本一致。
+- 自动验证门槛：`wps\.venv\Scripts\python.exe -m pip show docxtool` 显示当前 wheel 版本；Python 直接导入路径位于 `wps\.venv\Lib\site-packages\docxtool`；9528 重启后真实识别返回 78 个段落 locator verified 和 1 个跳过的 table block；`scripts\verify-all.ps1` PASS。
+
 ## 本轮固定批注模板
 
 ```text
@@ -153,3 +161,43 @@ WPS 可能把 `\n`、`\r` 或宿主换行控制符互相转换；批注读回和
 当前 WPS 的批注集合即时读回不作为 PASS 门槛。预览调用只记录未抛异常的创建操作；是否真正成功必须由保存后的 `comments.xml` 中 DocxTool 批注存在、完整字段存在以及用户批注数量不变共同判定。
 
 WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修订指纹。预览后的过期识别拒绝必须以正文 SHA-256、段落数、段落顺序、节数和文档身份为准；不得仅因批注导致的格式指纹变化报 `DOCUMENT_CHANGED`。正式执行前仍由事务重新捕获当前格式。
+
+## P016 source、canonical、host 与 WPS Range 坐标混用
+
+- 症状：本地只读 E2E 能生成命令，但包含软换行、重复段落或一个物理段内多个逻辑片段时，命令目标可能按逻辑块序号或 source UTF-16 偏移落到错误 WPS 段落。
+- 根因：source locator 只证明 DOCX 原始物理段落内的片段位置；canonical 偏移只用于规范化比较；host snapshot 偏移也不是 WPS API 的绝对 Range 坐标。任何一个坐标系被直接复用都会绕过实际段落和文字读回。
+- 禁止：使用 `block_index`、`source_paragraph_index`、裸段落序号、全文首次匹配或 source raw/canonical offset 直接创建 WPS Range；不得让不完整片段组以部分 confirmed 状态进入一键排版。
+- 正确方案：先以 `bind_recognition_plan()` 绑定完整 HostSnapshot，再以 `host_paragraph_index + host_raw_start_utf16 + host_raw_end_utf16 + host_raw_text_sha256` 重新读取 WPS 物理段落，验证子 Range 哈希后才创建目标。`review` 仅预览，`unresolved` 和混合片段组全部跳过。跨语言文本规范化必须通过同步的 `HOST_TEXT_V1_GOLDEN.json`。
+- 自动验证门槛：`local-agent/tests/test_local_agent.py` 的只读链路测试必须确认命令服务不接收正文，`tests/host-text-golden.test.mjs` 必须匹配 Python 金标，`tests/wps-phase-one.test.mjs` 必须覆盖精确 Range、混合片段跳过、表格跳过和事务回滚，`pwsh -NoProfile -File scripts/verify-all.ps1` 必须通过。
+
+## P017 wheel 升级后仍向绑定入口传旧版简化 HostSnapshot
+
+- 症状：wheel 可导入且识别成功，但 `/v1/handshake` 或 `/v1/recognize` 在绑定前返回 `INVALID_HOST_SNAPSHOT`，错误路径指向 `schema_version`、`host`、`snapshot_id` 或段落故事字段。
+- 根因：WPS 对外请求仍是简化段落快照，local-agent 直接把该对象传给新版 `bind_recognition_plan()`；新版 SDK 要求所有 Mapping 先通过正式 JSON Schema，不能再依赖旧对象构造器的隐式补全。
+- 禁止：放宽 wheel Schema、绕过 `host_snapshot_from_dict()`，或让 WPS 前端自行拼两套不同版本的绑定对象。
+- 正确方案：WPS 请求格式保持稳定，只在 local-agent 的唯一适配边界补齐 `host-snapshot-v1`、协议版本、稳定 snapshot/paragraph ID、story 位置、文档修订、`utf16_code_unit` 和严格 boolean，再交给 wheel 校验和绑定。
+- 自动验证门槛：local-agent handshake、识别和只读命令链测试通过；隔离导入显示 wheel 版本正确；`scripts/verify-all.ps1` 全部通过。
+
+## P018 WPS 配置同步脚本依赖上级 docxtool 源码目录
+
+- 症状：WPS 仓库移动为独立目录或只安装 wheel 后，`sync-default-format-profile.py --check` 查找不存在的上级 `src/docxtool/resources/config/default-format.json`，导致总门禁失败。
+- 根因：脚本按固定父目录层级定位 DocxTool 源码，绕过了 WPS 本级 `.venv` 中已安装 wheel 的包资源。
+- 禁止：恢复绝对路径、`..\src`、上级 `PYTHONPATH` 或复制一份无人维护的默认配置作为新真值。
+- 正确方案：通过 `importlib.resources` 从本级已安装 `docxtool.resources` 读取默认配置，并通过包元数据写入实际 wheel 版本；生成的命令配置仍保留在 WPS 仓库内。
+- 自动验证门槛：导入路径位于 `wps\.venv\Lib\site-packages\docxtool`；profile `--check` 通过；`scripts/verify-all.ps1` 输出 `VERIFY_ALL_PASS`。
+
+## P019 稳定错误码直接暴露给用户
+
+- 症状：任务窗格“执行状态”“问题与复核”或“功能检测”只显示 `DOCUMENT_MUST_BE_SAVED`、`LOCAL_AGENT_UNAVAILABLE` 等英文错误码，用户无法直接判断下一步怎么处理。
+- 根因：HostResultStore 只保存稳定错误码，任务窗格和 Ribbon 兜底脚本直接渲染该字段，没有统一的用户可读中文映射。
+- 禁止：在用户界面只显示英文错误码；不得在多个分支中各自硬拼一套不一致的中文说明。
+- 正确方案：稳定错误码继续保留用于排查和自动化判断；用户界面统一调用中文错误映射，显示“中文处理说明 + 错误码”。`DOCUMENT_MUST_BE_SAVED` 必须明确提示先在 WPS 中保存为本地 DOCX 文件。
+- 自动验证门槛：Node 测试覆盖 `DOCUMENT_MUST_BE_SAVED` 中文说明和错误码保留；功能检测失败报告包含中文原因；`npm test` 与 classified build 通过。
+
+## P020 任务窗格按钮点击后无反应
+
+- 症状：任务窗格已显示，点击“预览排版”“一键排版”后界面仍停留在“就绪”或原状态，本地服务健康，`current.json` 只出现 `main_script_loaded`，没有 `host_router_installed`。
+- 根因：WPS WebView 加载主脚本时 `Application` 对象尚未注入；旧代码只安装一次 HostCommandRouter，遇到 `WPS_APPLICATION_UNAVAILABLE` 后不再重试。任务窗格按钮只把请求写入 `PluginStorage`，没有主上下文消费请求。
+- 禁止：遇到无反应就修改识别 wheel、命令服务或另写测试执行器；不得把按钮点击无反馈当成识别失败。
+- 正确方案：主上下文安装必须等待并重试，直到 `Application` 和 build info 均可用后再安装 HostCommandRouter；任务窗格发送命令后必须显示“命令已发送，等待 WPS 主上下文处理…”，不能被旧状态轮询覆盖成“就绪”。
+- 自动验证门槛：源码测试断言 `host-runtime.ts` 包含 `tryInstall` 重试安装和 `host_router_installed` 上报；真实 WPS 状态必须从 `main_script_loaded` 继续到 `host_router_installed` 后，按钮才可判定为可用。

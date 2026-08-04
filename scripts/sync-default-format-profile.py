@@ -2,10 +2,15 @@
 import argparse
 import hashlib
 import json
+from importlib import metadata
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "src" / "docxtool" / "resources" / "config" / "default-format.json"
+try:
+    from importlib.resources import files
+except ImportError:  # Python 3.8
+    from importlib_resources import files
+
+SOURCE = files("docxtool.resources").joinpath("config", "default-format.json")
 OUT = Path(__file__).resolve().parents[1] / "command-service" / "src" / "docxtool_command_service" / "profiles" / "docxtool-default.json"
 MANIFEST = OUT.with_suffix(".manifest.json")
 TASKPANE_PROFILE = Path(__file__).resolve().parents[1] / "apps" / "classified-offline" / "ui" / "default-format-profile.js"
@@ -40,7 +45,7 @@ def main():
     raw = SOURCE.read_bytes()
     profile = build(json.loads(raw.decode("utf-8")))
     rendered = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
-    manifest = json.dumps({"source_sha256":hashlib.sha256(raw).hexdigest(),"docxtool_version":"1.3","profile_version":"1.0"}, ensure_ascii=False, indent=2) + "\n"
+    manifest = json.dumps({"source_sha256":hashlib.sha256(raw).hexdigest(),"docxtool_version":metadata.version("docxtool"),"profile_version":"1.0"}, ensure_ascii=False, indent=2) + "\n"
     taskpane_profile = "window.DocxtoolDefaultProfile = " + json.dumps(profile, ensure_ascii=False, separators=(",", ":")) + ";\n"
     if args.check:
         if (not OUT.is_file() or not MANIFEST.is_file() or not TASKPANE_PROFILE.is_file()

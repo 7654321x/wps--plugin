@@ -32,6 +32,7 @@ import { CommandValidator } from "../dist/packages/security/src/index.js";
 import { FormatDocumentUseCase, PreviewDocumentUseCase } from "../dist/packages/application/src/format-document-usecase.js";
 import { HostCommandRouter, HostResultStore, TaskPaneManager } from "../dist/apps/classified-offline/src/host-runtime.js";
 import { ClassifiedHealthChecker } from "../dist/apps/classified-offline/src/health-check.js";
+import { errorMessage, errorText } from "../dist/apps/classified-offline/src/error-messages.js";
 import { DiagnosticRunner, classifyNetworkError } from "../dist/packages/diagnostics/src/index.js";
 
 const SHA = "a".repeat(64);
@@ -44,7 +45,12 @@ const wheelBlock = ({ physicalText, text = physicalText, physicalIndex = 0, occu
     range_start_utf16: start, range_end_utf16: start + text.length, offset_encoding: "utf16_code_unit", locator_verified: true,
     recognized_text: text, text_sha256: hashText(text), type_id: type, section, review_level: review, kind };
 };
-const commandTarget = (hash = SHA, length = 4, occurrence = 0) => ({ target_id: "doc-1:p:0:" + occurrence, source_paragraph_index: 0, text_sha256: hash, text_length: length, occurrence_index: occurrence });
+const commandTarget = (hash = SHA, length = 4, occurrence = 0) => ({
+  target_id: "doc-1:host:0:" + occurrence, source_paragraph_index: 0,
+  host_paragraph_index: 0, host_raw_start_utf16: 0, host_raw_end_utf16: length,
+  host_raw_text_sha256: hash, text_sha256: hash, text_length: length,
+  occurrence_index: occurrence,
+});
 const commandSet = (commands, requestId = "request-00000001") => ({ schema_version: FORMATTING_COMMAND_SET_VERSION, request_id: requestId, service_version: "1.0", profile_id: "default", profile_version: "1.0", warnings: [], commands });
 const snapshot = {
   documentId: "doc-1",
@@ -52,6 +58,54 @@ const snapshot = {
   sourceSha256: SHA,
   paragraphs: [{ sourceParagraphIndex: 0, text: "本地正文" }],
 };
+function withHostBinding(snapshotValue, plan) {
+  const byHash = new Map();
+  for (const host of snapshotValue.paragraphs) {
+    if (host.isInTable) continue;
+    const hash = hashText(host.text);
+    const values = byHash.get(hash) ?? [];
+    values.push(host); byHash.set(hash, values);
+  }
+  const blocks = plan.blocks.map((block) => {
+    const start = Number(block.raw_start_utf16 ?? block.range_start_utf16 ?? 0);
+    const end = Number(block.raw_end_utf16 ?? block.range_end_utf16 ?? 0);
+    const text = block.recognized_text ?? "";
+    return {
+      ...block, raw_start_utf16: start, raw_end_utf16: end,
+      canonical_start_utf16: start, canonical_end_utf16: end,
+      source_locator_status: block.locator_verified === false ? "unresolved" : "confirmed",
+      segment_count_total: block.segment_count_total ?? 1,
+      segment_count_located: block.segment_count_located ?? 1,
+      segment_count_confirmed: block.segment_count_confirmed ?? 1,
+      raw_fragment_sha256: block.raw_fragment_sha256 ?? hashText(text),
+      canonical_fragment_sha256: block.canonical_fragment_sha256 ?? hashText(text),
+    };
+  });
+  const bindingBlocks = blocks.map((block) => {
+    const candidates = byHash.get(block.physical_text_sha256) ?? [];
+    const host = candidates[Number(block.physical_occurrence_index ?? 0)];
+    return host ? {
+      block_index: Number(block.block_index ?? 0), physical_paragraph_index: block.physical_paragraph_index,
+      host_paragraph_index: host.sourceParagraphIndex, binding_status: "confirmed", binding_confidence: 1,
+      host_raw_start_utf16: block.raw_start_utf16, host_raw_end_utf16: block.raw_end_utf16,
+      host_canonical_start_utf16: block.canonical_start_utf16, host_canonical_end_utf16: block.canonical_end_utf16,
+    } : { block_index: Number(block.block_index ?? 0), physical_paragraph_index: block.physical_paragraph_index, host_paragraph_index: null, binding_status: "unresolved", binding_confidence: 0 };
+  });
+  return { ...plan, host_text_contract_version: "host-text-v1", blocks, binding: { host_text_contract_version: "host-text-v1", blocks: bindingBlocks } };
+}
+function boundTransport(factory) {
+  return { async recognize(value) { return withHostBinding(value, await factory.recognize(value)); } };
+}
+function hostFields(rawText, start = 0, end = rawText.length, index = 0) {
+  return {
+    host_paragraph_index: index, host_raw_start_utf16: start,
+    host_raw_end_utf16: end, host_raw_text_sha256: hashText(rawText),
+    host_text_contract_version: "host-text-v1",
+    host_canonical_start_utf16: start, host_canonical_end_utf16: end,
+    binding_status: "confirmed", binding_confidence: 1,
+    segment_count_total: 1, segment_count_located: 1, segment_count_confirmed: 1,
+  };
+}
 const transport = {
   async recognize() {
     return {
@@ -62,7 +116,7 @@ const transport = {
 };
 
 test("local wheel adapter preserves the decision but emits only full hash anchors", async () => {
-  const result = await new LocalWheelRecognitionProvider(transport).recognize(snapshot);
+  const result = await new LocalWheelRecognitionProvider(boundTransport(transport)).recognize(snapshot);
   assert.equal(result.paragraphs[0].recognized_type, "body");
   assert.match(result.paragraphs[0].text_sha256, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(result).includes("本地正文"), false);
@@ -70,32 +124,32 @@ test("local wheel adapter preserves the decision but emits only full hash anchor
 
 test("local wheel adapter translates aliases and never invents uncovered paragraph roles", async () => {
   const source = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 4, text: "标题" }, { sourceParagraphIndex: 99, text: "最后段落" }] };
-  const provider = new LocalWheelRecognitionProvider({ async recognize() {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() {
     return { schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1,
       blocks: [wheelBlock({ physicalText: "标题", physicalIndex: 4, type: "title", section: "header" })] };
-  } });
+  } }));
   const result = await provider.recognize(source);
   assert.equal(result.paragraphs.find((item) => item.source_paragraph_index === 4).recognized_type, "main_title");
   assert.equal(result.paragraphs.find((item) => item.source_paragraph_index === 99), undefined);
 });
 
 test("local wheel adapter maps object captions to the frozen caption role", async () => {
-  const provider = new LocalWheelRecognitionProvider({ async recognize() {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() {
     return { schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1,
       blocks: [wheelBlock({ physicalText: "本地正文", type: "__object_caption__", kind: "caption" })] };
-  } });
+  } }));
   const result = await provider.recognize(snapshot);
   assert.equal(result.paragraphs[0].recognized_type, "caption");
 });
 
 test("local wheel adapter leaves an unproved locator unresolved and never guesses a target", async () => {
-  const provider = new LocalWheelRecognitionProvider({ async recognize() {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() {
     return { schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [{
       block_index: 7, source_paragraph_index: 0, physical_paragraph_index: 0,
       type_id: "body", section: "body", review_level: "review", kind: "paragraph",
       locator_verified: false,
     }] };
-  } });
+  } }));
   const result = await provider.recognize(snapshot);
   assert.deepEqual(result.paragraphs, []);
   assert.deepEqual(result.unresolved_blocks, [{ block_index: 7, recognized_type: "body", review_level: "review", reason: "RECOGNITION_LOCATOR_UNVERIFIED" }]);
@@ -105,12 +159,12 @@ test("local wheel adapter leaves an unproved locator unresolved and never guesse
 test("local wheel adapter uses physical occurrence to distinguish duplicate paragraphs", async () => {
   const duplicate = "重复正文";
   const source = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 3, text: duplicate }, { sourceParagraphIndex: 8, text: duplicate }] };
-  const provider = new LocalWheelRecognitionProvider({ async recognize() {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() {
     return { schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [
       wheelBlock({ physicalText: duplicate, physicalIndex: 0, occurrence: 0, blockIndex: 0 }),
       wheelBlock({ physicalText: duplicate, physicalIndex: 1, occurrence: 1, blockIndex: 1 }),
     ] };
-  } });
+  } }));
   const result = await provider.recognize(source);
   assert.deepEqual(result.paragraphs.map((item) => item.source_paragraph_index), [3, 8]);
   assert.equal(result.unresolved_blocks, undefined);
@@ -138,14 +192,14 @@ test("local wheel adapter resolves UTF-16 sub-ranges and skips table cells witho
     { sourceParagraphIndex: 1, text: "表格测试文字", isInTable: true },
     { sourceParagraphIndex: 2, text: "正文段落" },
   ] };
-  const provider = new LocalWheelRecognitionProvider({ async recognize() {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() {
     return { schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [
       wheelBlock({ physicalText: mixed, text: "主标题", type: "title", section: "header", blockIndex: 0 }),
       wheelBlock({ physicalText: mixed, text: "主标题续行", type: "title_cont", section: "header", blockIndex: 1 }),
       { block_index: 2, source_paragraph_index: null, type_id: "__table__", section: "body", review_level: "confirmed", kind: "table" },
       wheelBlock({ physicalText: "正文段落", physicalIndex: 2, type: "body", blockIndex: 3 }),
     ] };
-  } });
+  } }));
   const result = await provider.recognize(source);
   const mixedItems = result.paragraphs.filter((item) => item.source_paragraph_index === 0);
   assert.deepEqual(mixedItems.map((item) => item.recognized_type), ["main_title", "title_continuation"]);
@@ -157,12 +211,12 @@ test("local wheel adapter resolves UTF-16 sub-ranges and skips table cells witho
 test("formal formatting blocks mixed physical paragraphs before command generation or transaction", async () => {
   const physicalText = "一、标题。正文内容";
   const localSnapshot = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 0, text: physicalText }] };
-  const recognitionProvider = new LocalWheelRecognitionProvider({ async recognize() { return {
+  const recognitionProvider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() { return {
     schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [
       wheelBlock({ physicalText, text: "一、标题。", type: "heading1", blockIndex: 0 }),
       wheelBlock({ physicalText, text: "正文内容", type: "body", blockIndex: 1 }),
     ],
-  }; } });
+  }; } }));
   let commandCalls = 0; let transactionCalls = 0;
   const useCase = new FormatDocumentUseCase(
     new MockDocumentReader(localSnapshot), recognitionProvider,
@@ -171,20 +225,22 @@ test("formal formatting blocks mixed physical paragraphs before command generati
     { capabilities() { return { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: [] }; } },
     { authorizationScope() { return "classified-offline"; } },
   );
-  await assert.rejects(() => useCase.execute("request-00000001"), /MIXED_PARAGRAPH_REQUIRES_SPLIT/);
+  const result = await useCase.execute("request-00000001");
+  assert.equal(result.executed_command_ids.length, 0);
+  assert.deepEqual(result.warnings, ["SKIPPED_REVIEW_OR_UNRESOLVED=2"]);
   assert.equal(commandCalls, 0); assert.equal(transactionCalls, 0);
 });
 
 test("preview summary reports unresolved blocks and unique mixed physical paragraphs", async () => {
   const physicalText = "一、标题。正文内容";
   const localSnapshot = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 0, text: physicalText }, { sourceParagraphIndex: 1, text: "无法定位" }] };
-  const provider = new LocalWheelRecognitionProvider({ async recognize() { return {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() { return {
     schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [
       wheelBlock({ physicalText, text: "一、标题。", type: "heading1", blockIndex: 0 }),
       wheelBlock({ physicalText, text: "正文内容", type: "body", blockIndex: 1 }),
       { block_index: 2, source_paragraph_index: 1, physical_paragraph_index: 1, type_id: "body", section: "body", review_level: "review", kind: "paragraph", locator_verified: false },
     ],
-  }; } });
+  }; } }));
   const useCase = new PreviewDocumentUseCase(
     new MockDocumentReader(localSnapshot), provider,
     { async requestCommands(request) { return commandSet([], request.request_id); } }, new CommandValidator(),
@@ -213,7 +269,7 @@ test("outbound requests reject plaintext, code and local paths", () => {
 });
 
 test("application flow rolls back the complete mock transaction on command failure", async () => {
-  const recognitionProvider = new LocalWheelRecognitionProvider(transport);
+  const recognitionProvider = new LocalWheelRecognitionProvider(boundTransport(transport));
   const response = {
     schema_version: FORMATTING_COMMAND_SET_VERSION, request_id: "request-00000001", service_version: "1.0", profile_id: "default", profile_version: "1.0", warnings: [],
     commands: [{
@@ -245,9 +301,9 @@ test("classified composition does not reference cloud-only dependencies", async 
 function fakeWps(text = "测试段落\r") {
   const format = { Alignment: 0, CharacterUnitFirstLineIndent: 0, CharacterUnitLeftIndent: 0, CharacterUnitRightIndent: 0, LineUnitBefore: 0, LineUnitAfter: 0, LineSpacingRule: 0, LineSpacing: 0, PageBreakBefore: 0, OutlineLevel: 10, SnapToGrid: true };
   const pageSetup = { PageWidth: 600, PageHeight: 800, TopMargin: 70, BottomMargin: 70, LeftMargin: 70, RightMargin: 70, LinesPage: 22, CharsLine: 28, LayoutMode: 1, ShowGrid: true };
-  const paragraph = { Range: { Text: text, Font: { Name: "宋体", NameAscii: "宋体", NameOther: "宋体", NameFarEast: "宋体", Size: 12, Bold: 0, Spacing: 2, Scaling: 90, DisableCharacterSpaceGrid: false }, ParagraphFormat: format, PageSetup: pageSetup } };
+  const paragraph = { Range: { Start: 0, End: text.length, Text: text, Font: { Name: "宋体", NameAscii: "宋体", NameOther: "宋体", NameFarEast: "宋体", Size: 12, Bold: 0, Spacing: 2, Scaling: 90, DisableCharacterSpaceGrid: false }, ParagraphFormat: format, PageSetup: pageSetup } };
   const paragraphs = { Count: 1, Item(index) { assert.equal(index, 1); return paragraph; } };
-  globalThis.Application = { ActiveDocument: { FullName: "C:\\redacted.docx", Saved: true, Paragraphs: paragraphs, PageSetup: pageSetup } };
+  globalThis.Application = { ActiveDocument: { FullName: "C:\\redacted.docx", Saved: true, Paragraphs: paragraphs, PageSetup: pageSetup, Range(start, end) { return { ...paragraph.Range, Start: start, End: end, Text: text.slice(start, end) }; } } };
   return { paragraph, format };
 }
 
@@ -403,8 +459,8 @@ test("preview comments use a paragraph Range and remove only their session marke
   globalThis.Application = { Selection: selection, ActiveDocument: { Comments: commentCollection, Paragraphs: { Item() { return paragraph; } }, Range(start, end) { return { Start: start, End: end, Text: text }; } } };
   const service = new WpsPreviewCommentService();
   const snapshot = { documentId: "doc-1", revision: "rev", sourceSha256: hash, documentFullNameHash: "document-path-hash", paragraphs: [{ sourceParagraphIndex: 0, text }] };
-  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev", source_sha256: hash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "main_title", section_kind: "body", text_sha256: hash, physical_text_sha256: hash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 0.5, review_level: "review", needs_review: true }] };
-  const target = commandTarget(hash, text.length);
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev", source_sha256: hash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "main_title", section_kind: "body", text_sha256: hash, physical_text_sha256: hash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 0.5, review_level: "review", needs_review: true, ...hostFields(text) }] };
+  const target = { ...commandTarget(hash, text.length), target_id: "doc-1:p:0:0" };
   const commands = commandSet([
     { command_id: "cmd-000001", kind: "paragraph.set_font", target, arguments: { east_asia_font_name: "方正小标宋简体", latin_font_name: "Times New Roman", font_size_pt: 22, bold: false }, required_capability: "paragraph.font", on_unsupported: "fail" },
     { command_id: "cmd-000002", kind: "paragraph.set_alignment", target, arguments: { alignment: "center" }, required_capability: "paragraph.alignment", on_unsupported: "fail" },
@@ -434,7 +490,7 @@ test("preview comments anchor each mixed role to its verified UTF-16 sub-range",
   const collection = { get Count() { return comments.length; }, Item(index) { return comments[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() {} }; comments.push(item); return item; } };
   globalThis.Application = { ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item() { return { Range: { Text: text + "\r", Start: 100, End: 100 + text.length + 1 } }; } }, Range(start, end) { return { Start: start, End: end, Text: text.slice(start - 100, end - 100) }; } } };
   const physicalHash = hashText(text);
-  const makeItem = (value, type, blockIndex) => ({ target_id: `doc-mixed:p:0:r:${text.indexOf(value)}:${text.indexOf(value) + value.length}:${blockIndex}`, source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: type, section_kind: "body", text_sha256: hashText(value), physical_text_sha256: physicalHash, range_start_utf16: text.indexOf(value), range_end_utf16: text.indexOf(value) + value.length, locator_verified: true, mixed_structure: true, formatting_disposition: "review_only", text_length: value.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: true });
+  const makeItem = (value, type, blockIndex) => ({ target_id: `doc-mixed:p:0:r:${text.indexOf(value)}:${text.indexOf(value) + value.length}:${blockIndex}`, source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: type, section_kind: "body", text_sha256: hashText(value), physical_text_sha256: physicalHash, range_start_utf16: text.indexOf(value), range_end_utf16: text.indexOf(value) + value.length, locator_verified: true, mixed_structure: true, formatting_disposition: "review_only", text_length: value.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: true, ...hostFields(text, text.indexOf(value), text.indexOf(value) + value.length) });
   const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-mixed", document_revision: "rev", source_sha256: physicalHash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [makeItem(title, "heading1", 0), makeItem(body, "body", 1)] };
   const result = await new WpsPreviewCommentService().addPreviewComments({ snapshot: { documentId: "doc-mixed", revision: "rev", sourceSha256: physicalHash, documentFullNameHash: "path", paragraphs: [{ sourceParagraphIndex: 0, text }] }, recognition, commands: commandSet([]), mode: "all" });
   assert.equal(result.comment_count, 2);
@@ -446,18 +502,18 @@ test("preview comments anchor each mixed role to its verified UTF-16 sub-range",
 test("preview flow never creates a comment inside a table cell", async () => {
   const tableText = "表格内容"; const bodyText = "表外正文";
   const localSnapshot = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 0, text: tableText, isInTable: true }, { sourceParagraphIndex: 1, text: bodyText }] };
-  const provider = new LocalWheelRecognitionProvider({ async recognize() { return {
+  const provider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() { return {
     schema_version: "1.0", engine_version: "3.0", document_mode: "normal", document_mode_confidence: 1, blocks: [
       wheelBlock({ physicalText: tableText, physicalIndex: 0, blockIndex: 0 }),
       wheelBlock({ physicalText: bodyText, physicalIndex: 1, blockIndex: 1 }),
     ],
-  }; } });
+  }; } }));
   const recognition = await provider.recognize(localSnapshot);
   assert.deepEqual(recognition.paragraphs.map((item) => item.source_paragraph_index), [1]);
   const comments = [];
   const collection = { get Count() { return comments.length; }, Item(index) { return comments[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() {} }; comments.push(item); return item; } };
   const ranges = [{ Text: tableText + "\r", Start: 10, End: 10 + tableText.length + 1 }, { Text: bodyText + "\r", Start: 30, End: 30 + bodyText.length + 1 }];
-  globalThis.Application = { ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item(index) { return { Range: ranges[index - 1] }; } }, Range(start, end) { return { Start: start, End: end }; } } };
+  globalThis.Application = { ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item(index) { return { Range: ranges[index - 1] }; } }, Range(start, end) { const range = ranges.find((item) => start >= item.Start && end <= item.End); return { Start: start, End: end, Text: range ? String(range.Text).slice(start - range.Start, end - range.Start) : "" }; } } };
   const result = await new WpsPreviewCommentService().addPreviewComments({ snapshot: localSnapshot, recognition, commands: commandSet([]), mode: "all" });
   assert.equal(result.comment_count, 1);
   assert.deepEqual([comments[0].Reference.Start, comments[0].Reference.End], [30, 30 + bodyText.length]);
@@ -467,10 +523,10 @@ test("preview skips empty paragraphs and marks unknown paragraphs for review", a
   const texts = ["", "未知类型测试"];
   const comments = [];
   const collection = { get Count() { return comments.filter((item) => !item.deleted).length; }, Item(index) { return comments.filter((item) => !item.deleted)[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() { this.deleted = true; } }; comments.push(item); return item; } };
-  globalThis.Application = { Selection: { Start: 3, End: 3 }, ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item(index) { const text = texts[index - 1]; return { Range: { Text: text + "\r", Start: index * 10, End: index * 10 + text.length + 1 } }; } }, Range(start, end) { return { Start: start, End: end }; } } };
+  globalThis.Application = { Selection: { Start: 3, End: 3 }, ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item(index) { const text = texts[index - 1]; return { Range: { Text: text + "\r", Start: index * 10, End: index * 10 + text.length + 1 } }; } }, Range(start, end) { const index = Math.floor(start / 10) - 1; const text = texts[index] ?? ""; return { Start: start, End: end, Text: text.slice(start - (index + 1) * 10, end - (index + 1) * 10) }; } } };
   const hashes = await Promise.all(texts.map((text) => import("node:crypto").then(({ createHash }) => createHash("sha256").update(text).digest("hex"))));
   const localSnapshot = { documentId: "doc-unknown", revision: "rev", sourceSha256: SHA, documentFullNameHash: "path", paragraphs: texts.map((text, index) => ({ sourceParagraphIndex: index, text })) };
-  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-unknown", document_revision: "rev", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: texts.map((text, index) => ({ target_id: `doc-unknown:p:${index}:0`, source_paragraph_index: index, physical_paragraph_index: index, recognized_type: "unknown", section_kind: "body", text_sha256: hashes[index], physical_text_sha256: hashes[index], range_start_utf16: 0, range_end_utf16: Math.max(1, text.length), locator_verified: true, mixed_structure: false, formatting_disposition: "review_only", text_length: text.length, occurrence_index: 0, confidence: 0.4, review_level: "review", needs_review: true })) };
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-unknown", document_revision: "rev", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: texts.map((text, index) => ({ target_id: `doc-unknown:p:${index}:0`, source_paragraph_index: index, physical_paragraph_index: index, recognized_type: "unknown", section_kind: "body", text_sha256: hashes[index], physical_text_sha256: hashes[index], range_start_utf16: 0, range_end_utf16: Math.max(1, text.length), locator_verified: true, mixed_structure: false, formatting_disposition: "review_only", text_length: text.length, occurrence_index: 0, confidence: 0.4, review_level: "review", needs_review: true, ...hostFields(text || " ", 0, Math.max(1, text.length), index) })) };
   const result = await new WpsPreviewCommentService().addPreviewComments({ snapshot: localSnapshot, recognition, commands: commandSet([]), mode: "all" });
   assert.equal(result.comment_count, 1); assert.equal(comments.length, 1); assert.match(comments[0].Range.Text, /识别结果：未知/); assert.match(comments[0].Range.Text, /可应用格式：暂无/); assert.match(comments[0].Range.Text, /识别状态：需要复核/); assert.match(comments[0].Range.Text, /识别置信度：40%/);
   assert.deepEqual(globalThis.Application.Selection, { Start: 3, End: 3 });
@@ -520,9 +576,12 @@ test("taskpane delegates formatting to the formal use case instead of writing WP
 test("add-in main context loads the host router independently from the taskpane", async () => {
   const main = await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8");
   const taskpane = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
+  const hostRuntime = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
   assert.match(main, /dist\/host-runtime\.js/); assert.equal(main.includes("type='module'"), false);
   assert.equal(taskpane.includes("createClassifiedProductionComposition"), false);
   assert.equal(taskpane.includes("FormatDocumentUseCase"), false);
+  assert.match(hostRuntime, /setInterval\(tryInstall,\s*250\)/);
+  assert.match(hostRuntime, /host_router_installed/);
 });
 
 function hostMocks() {
@@ -626,7 +685,7 @@ test("one-click formatting removes the tracked preview then re-recognizes the cu
   const baseline = { ...snapshot, paragraphOrderHash: "order", formattingRevision: "format", sectionCount: 1, documentFullNameHash: "path-hash" };
   const trackerValue = { preview_session_id: "preview", document_id: baseline.documentId, document_full_name_hash: "path-hash", baseline_revision: baseline.revision, baseline_text_hash: baseline.sourceSha256, baseline_paragraph_count: 1, baseline_paragraph_order_hash: "order", baseline_formatting_revision: "format", baseline_section_count: 1, baseline_saved_state: false, user_comment_fingerprint: "user", created_comment_markers: [], paragraph_anchors: [], created_at: "now" };
   let tracker = trackerValue; let recognitionCalls = 0;
-  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: SHA, text_length: 4, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false }] };
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: SHA, physical_text_sha256: SHA, range_start_utf16: 0, range_end_utf16: 4, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: 4, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields("xxxx") }] };
   const commands = commandSet([{ command_id: "cmd-000001", kind: "paragraph.set_alignment", target: commandTarget(), arguments: { alignment: "justify" }, required_capability: "paragraph.alignment", on_unsupported: "fail" }]);
   const useCase = new FormatDocumentUseCase(
     { async readSnapshot() { events.push("snapshot"); return baseline; } },
@@ -647,7 +706,7 @@ test("repeated preview removes the previous session before adding a fresh previe
   const baseline = { ...snapshot, paragraphOrderHash: "order", formattingRevision: "format", sectionCount: 1, documentFullNameHash: "path-hash" };
   const oldTracker = { preview_session_id: "old", document_id: baseline.documentId, document_full_name_hash: "path-hash", baseline_revision: baseline.revision, baseline_text_hash: baseline.sourceSha256, baseline_paragraph_count: 1, baseline_paragraph_order_hash: "order", baseline_formatting_revision: "format", baseline_section_count: 1, baseline_saved_state: false, user_comment_fingerprint: "", created_comment_markers: [], paragraph_anchors: [], created_at: "now" };
   const newTracker = { ...oldTracker, preview_session_id: "new" }; let current = oldTracker; const events = [];
-  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: SHA, text_length: 4, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false }] };
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: SHA, physical_text_sha256: SHA, range_start_utf16: 0, range_end_utf16: 4, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: 4, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields("xxxx") }] };
   const commands = commandSet([{ command_id: "cmd-000001", kind: "paragraph.set_alignment", target: commandTarget(), arguments: { alignment: "justify" }, required_capability: "paragraph.alignment", on_unsupported: "fail" }]);
   const preview = new PreviewDocumentUseCase({ async readSnapshot() { events.push("snapshot"); return baseline; } }, { async recognize() { events.push("recognize"); return recognition; } }, { async requestCommands() { return commands; } }, new CommandValidator(), { capabilities() { return { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: ["paragraph.alignment"] }; } }, { authorizationScope() { return "classified-offline"; } }, undefined, { async removePreviewComments() { events.push("remove"); }, async addPreviewComments() { events.push("add"); return { tracker: newTracker, comment_count: 1, unsupported: false, warnings: [] }; }, async verifyPreviewComments() { return { comment_count: 0, user_comment_integrity: true }; } }, { current() { return current; }, set(value) { current = value; }, clear() { current = null; } });
   const result = await preview.execute("request-00000001");
@@ -667,7 +726,7 @@ test("classified health check is read-only and returns concrete PASS items", asy
   const comments = { Count: 0, Item() { throw new Error("none"); }, Add() {} };
   const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏测试\r", Font: font, ParagraphFormat: format, PageSetup: page } }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 2, Item(index) { return { Name: index === 1 ? "仿宋_GB2312" : "Times New Roman" }; } } };
   const before = JSON.stringify({ saved: application.ActiveDocument.Saved, comments: comments.Count, font, format, page });
-  const fetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx" } : { ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  const fetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx", package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" } : { ok: true, package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" }), { status: 200, headers: { "Content-Type": "application/json" } });
   const profile = { page_setup: { normal_east_asia_font_name: "仿宋_GB2312", normal_latin_font_name: "Times New Roman" }, styles: {} };
   const report = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, { build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, profile, true, fetcher).run();
   assert.equal(report.overall, "PASS"); assert.equal(report.items.every((item) => item.status === "PASS"), true); assert.match(report.text, /总体结果：PASS/);
@@ -678,11 +737,19 @@ test("classified health check reports missing fonts as WARN and unreachable serv
   const range = { Text: "fixture\r", Font: {}, ParagraphFormat: {}, PageSetup: {} }; const comments = { Count: 0, Item() {}, Add() {} };
   const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: range }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} } };
   const base = [{ build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, { page_setup: { normal_east_asia_font_name: "方正小标宋简体" }, styles: {} }];
-  const warnFetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx" } : { ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  const warnFetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx", package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" } : { ok: true, package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" }), { status: 200, headers: { "Content-Type": "application/json" } });
   const warn = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, ...base, true, warnFetcher).run();
   assert.equal(warn.overall, "WARN"); assert.deepEqual(warn.missing_fonts, ["方正小标宋简体"]); assert.equal(warn.first_error_code, "REQUIRED_FONT_MISSING");
   const failed = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, ...base, true, async () => { throw new TypeError("offline"); }).run();
   assert.equal(failed.overall, "FAIL"); assert.equal(failed.items.find((item) => item.check_id === "recognition_service").error_code, "LOCAL_AGENT_UNAVAILABLE"); assert.equal(failed.items.find((item) => item.check_id === "command_service").error_code, "COMMAND_SERVICE_UNAVAILABLE");
+  assert.match(failed.text, /本地识别服务不可达/);
+  assert.match(failed.text, /错误码：LOCAL_AGENT_UNAVAILABLE/);
+});
+
+test("classified UI error messages localize stable WPS error codes", () => {
+  assert.match(errorMessage("DOCUMENT_MUST_BE_SAVED"), /当前文档尚未保存/);
+  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先在 WPS 中保存为本地 DOCX 文件/);
+  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /错误码：DOCUMENT_MUST_BE_SAVED/);
 });
 
 test("diagnostic runner blocks dependent checks and identifies the first root cause", async () => {

@@ -1,10 +1,10 @@
 {
   "$schema":"https://json-schema.org/draft/2020-12/schema",
-  "$id":"https://docxtool.local/schemas/formatting-command-set-1.1.schema.json",
-  "title":"FormattingCommandSet 1.1",
+  "$id":"https://docxtool.local/schemas/formatting-command-set-1.2.schema.json",
+  "title":"FormattingCommandSet 1.2",
   "type":"object","additionalProperties":false,
   "required":["schema_version","request_id","service_version","profile_id","profile_version","commands","warnings"],
-  "properties":{"schema_version":{"const":"1.1"},"request_id":{"type":"string","pattern":"^[A-Za-z0-9-]{16,64}$"},"service_version":{"type":"string"},"profile_id":{"type":"string"},"profile_version":{"type":"string"},"warnings":{"type":"array","items":{"type":"string"}},"commands":{"type":"array","items":{"oneOf":[{"$ref":"#/$defs/setFont"},{"$ref":"#/$defs/setAlignment"},{"$ref":"#/$defs/setIndent"},{"$ref":"#/$defs/setSpacing"},{"$ref":"#/$defs/setPageSetup"}]}}},
+  "properties":{"schema_version":{"const":"1.2"},"request_id":{"type":"string","pattern":"^[A-Za-z0-9-]{16,64}$"},"service_version":{"type":"string"},"profile_id":{"type":"string"},"profile_version":{"type":"string"},"warnings":{"type":"array","items":{"type":"string"}},"commands":{"type":"array","items":{"oneOf":[{"$ref":"#/$defs/setFont"},{"$ref":"#/$defs/setAlignment"},{"$ref":"#/$defs/setIndent"},{"$ref":"#/$defs/setSpacing"},{"$ref":"#/$defs/setPageSetup"}]}}},
   "$defs":{
     "target":{"type":"object","additionalProperties":false,"required":["target_id","source_paragraph_index","host_paragraph_index","host_raw_start_utf16","host_raw_end_utf16","host_raw_text_sha256","text_sha256","text_length","occurrence_index"],"properties":{"target_id":{"type":"string","minLength":1,"maxLength":160},"source_paragraph_index":{"type":"integer","minimum":0},"host_paragraph_index":{"type":"integer","minimum":0},"host_raw_start_utf16":{"type":"integer","minimum":0},"host_raw_end_utf16":{"type":"integer","minimum":1},"host_raw_text_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"},"text_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"},"text_length":{"type":"integer","minimum":0},"occurrence_index":{"type":"integer","minimum":0}}},
     "base":{"type":"object","additionalProperties":false,"required":["command_id","kind","target","arguments","required_capability","on_unsupported"],"properties":{"command_id":{"type":"string","pattern":"^cmd-[0-9]{6}$"},"kind":{"type":"string"},"target":{"$ref":"#/$defs/target"},"arguments":{"type":"object"},"required_capability":{"type":"string"},"on_unsupported":{"enum":["skip","fail"]}}},

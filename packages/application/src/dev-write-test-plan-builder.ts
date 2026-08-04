@@ -48,7 +48,15 @@ export class DevWriteTestPlanBuilder {
     return body ? { ...body, alignment: role.slice(5) as ProfileStyle["alignment"], first_line_indent_chars: 0, left_indent_chars: 0, right_indent_chars: 0 } : undefined;
   }
   private target(item: RecognitionParagraph): CommandTarget {
-    return { target_id: item.target_id, source_paragraph_index: item.source_paragraph_index, text_sha256: item.text_sha256, text_length: item.text_length, occurrence_index: item.occurrence_index };
+    return {
+      target_id: item.target_id, source_paragraph_index: item.source_paragraph_index,
+      host_paragraph_index: item.host_paragraph_index,
+      host_raw_start_utf16: item.host_raw_start_utf16,
+      host_raw_end_utf16: item.host_raw_end_utf16,
+      host_raw_text_sha256: item.host_raw_text_sha256,
+      text_sha256: item.text_sha256, text_length: item.text_length,
+      occurrence_index: item.occurrence_index,
+    };
   }
   private pageCommand(number: number, item: RecognitionParagraph): SetPageSetupCommandV11 {
     return { command_id: this.id(number), kind: "section.set_page_setup", target: this.target(item), arguments: { ...this.profile.page_setup, grid_mode: "line_only" }, required_capability: "section.page_setup", on_unsupported: "fail" };

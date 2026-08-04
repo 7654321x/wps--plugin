@@ -1,4 +1,4 @@
-import { COMMAND_REQUEST_VERSION, type CommandRequest, type ExecutionResult, type FormattingCommandSet, type RecognitionResult } from "../../contracts/src/index.js";
+import { COMMAND_REQUEST_VERSION, EXECUTION_RESULT_VERSION, type CommandRequest, type ExecutionResult, type FormattingCommandSet, type RecognitionResult } from "../../contracts/src/index.js";
 import type { CapabilityProvider, CommandServiceClient, CommandValidator, DocumentExecutor, DocumentReader, FontCapabilityProvider, LicenseProvider, PreviewCommentService, PreviewDisplayMode, PreviewMutationTracker, RecognitionProvider, TransactionManager } from "./ports.js";
 
 export type FormattingProgressStage = "preflight" | "snapshot" | "recognition" | "command_generation" | "command_validation" | "target_resolution" | "transaction_capture" | "format_application" | "readback" | "result_summary" | "rolling_back";
@@ -57,11 +57,24 @@ export class FormatDocumentUseCase {
     progress("snapshot", "保存原始文档状态");
     progress("recognition", "识别文档"); assertNotCancelled(options.signal);
     const recognition = await this.recognitionProvider.recognize(snapshot);
-    if ((recognition.unresolved_blocks?.length ?? 0) > 0) throw new Error(recognition.unresolved_blocks?.[0]?.reason ?? "RECOGNITION_LOCATOR_UNVERIFIED");
-    if (recognition.paragraphs.some((item) => item.mixed_structure || item.formatting_disposition === "review_only")) throw new Error("MIXED_PARAGRAPH_REQUIRES_SPLIT");
-    if (recognition.paragraphs.some((item) => item.review_level === "critical_review")) throw new Error("CRITICAL_REVIEW_REQUIRED");
+    const applicable = recognition.paragraphs.filter((item) => (
+      item.formatting_disposition === "apply"
+      && item.binding_status === "confirmed"
+      && item.segment_count_total === item.segment_count_confirmed
+      && item.segment_count_total === item.segment_count_located
+    ));
+    const skipped = recognition.paragraphs.length - applicable.length + (recognition.unresolved_blocks?.length ?? 0);
+    if (!applicable.length) {
+      progress("result_summary", "没有可安全应用的段落");
+      return {
+        schema_version: EXECUTION_RESULT_VERSION, transaction_id: "no-confirmed-targets",
+        executed_command_ids: [], skipped_command_ids: [], failed_command_id: null,
+        warnings: [`SKIPPED_REVIEW_OR_UNRESOLVED=${skipped}`], rolled_back: false,
+        document_revision: snapshot.revision,
+      };
+    }
     progress("command_generation", "生成排版计划"); assertNotCancelled(options.signal);
-    const request = requestFor(recognition, requestId, this.capabilities, this.license);
+    const request = requestFor({ ...recognition, paragraphs: applicable }, requestId, this.capabilities, this.license);
     const serviceResult = await this.commandService.requestCommands(request);
     progress("command_validation", "验证计划");
     const commandSet = this.validator.validate(serviceResult, requestId);
@@ -81,7 +94,7 @@ export class FormatDocumentUseCase {
         this.transactionManager.rollback(transactionId);
       } else this.transactionManager.commit(transactionId);
       progress("result_summary", "完成");
-      return result;
+      return skipped ? { ...result, warnings: [...result.warnings, `SKIPPED_REVIEW_OR_UNRESOLVED=${skipped}`] } : result;
     } catch (error) {
       progress("rolling_back", "正在回滚");
       this.transactionManager.rollback(transactionId);

@@ -35,6 +35,10 @@ def _paragraph_commands(command_number, paragraph, style):
     target = {
         "target_id": paragraph["target_id"],
         "source_paragraph_index": paragraph["source_paragraph_index"],
+        "host_paragraph_index": paragraph["host_paragraph_index"],
+        "host_raw_start_utf16": paragraph["host_raw_start_utf16"],
+        "host_raw_end_utf16": paragraph["host_raw_end_utf16"],
+        "host_raw_text_sha256": paragraph["host_raw_text_sha256"],
         "text_sha256": paragraph["text_sha256"],
         "text_length": paragraph["text_length"],
         "occurrence_index": paragraph["occurrence_index"],
@@ -76,6 +80,10 @@ def build_formatting_commands(request):
         page_target = {
             "target_id": "document:%s" % recognition["document_id"],
             "source_paragraph_index": paragraphs[0]["source_paragraph_index"],
+            "host_paragraph_index": paragraphs[0]["host_paragraph_index"],
+            "host_raw_start_utf16": paragraphs[0]["host_raw_start_utf16"],
+            "host_raw_end_utf16": paragraphs[0]["host_raw_end_utf16"],
+            "host_raw_text_sha256": paragraphs[0]["host_raw_text_sha256"],
             "text_sha256": paragraphs[0]["text_sha256"],
             "text_length": paragraphs[0]["text_length"],
             "occurrence_index": paragraphs[0]["occurrence_index"],

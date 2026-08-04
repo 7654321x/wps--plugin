@@ -2,6 +2,7 @@ import { getClassifiedProductionComposition, type ClassifiedRuntimeConfig } from
 import type { FormattingCommandSet, RecognitionResult } from "../../../packages/contracts/src/index.js";
 import { ClassifiedHealthChecker, type SafeHealthItem } from "./health-check.js";
 import { loadRealE2EPlan, runFormalRollbackProbe } from "./formal-e2e-usecase.js";
+import { errorMessage } from "./error-messages.js";
 
 type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
 type HostCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
@@ -63,7 +64,7 @@ export class HostResultStore {
   update(patch: Partial<HostState>): void { this.state = { ...this.state, ...patch, updated_at: now() }; this.save(); }
   begin(name: HostCommandName, commandId: string, view: HostState["active_view"]): CommandResult { const result: CommandResult = { command_id: commandId, command_name: name, status: "RUNNING", stage: "started", summary: "", error_code: "", started_at: now(), finished_at: "" }; this.update({ active_command: result, command_status: "RUNNING", active_view: view, latest_error: "" }); return result; }
   finish(result: CommandResult, summary: string): CommandResult { const done = { ...result, status: "PASS" as const, stage: "completed", summary, finished_at: now() }; this.update({ active_command: done, command_status: "PASS", formatting_progress: summary }); return done; }
-  fail(result: CommandResult, code: string): CommandResult { const done = { ...result, status: "FAIL" as const, stage: "failed", error_code: code, finished_at: now() }; this.update({ active_command: done, command_status: "FAIL", active_view: "issues", latest_error: code, formatting_progress: `失败：${code}` }); return done; }
+  fail(result: CommandResult, code: string): CommandResult { const done = { ...result, status: "FAIL" as const, stage: "failed", error_code: code, finished_at: now() }; this.update({ active_command: done, command_status: "FAIL", active_view: "issues", latest_error: code, formatting_progress: `失败：${errorMessage(code)}` }); return done; }
   callback(entry: CallbackLog): void { this.update({ callback_log: [...this.state.callback_log, entry].slice(-20) }); }
   private save(): void { this.storage.setItem(RESULT_KEY, JSON.stringify(this.state)); }
 }
@@ -175,4 +176,29 @@ function install(): void {
   hostWindow.setInterval(() => { void router.reconcileActiveDocument().catch(() => { /* no active document is normal during WPS transitions */ }); }, 750);
   void runAutomaticHostAcceptance(application, router, build);
 }
-try { install(); } catch (error) { const code = stableError(error); void reportHostAcceptance("host_install", "FAIL", code); const application = hostWindow.Application; const build = hostWindow.DocxtoolBuildInfo; if (application && build) new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" }); }
+let installAttempted = false;
+let installDone = false;
+let installTimer: number | undefined;
+function tryInstall(): void {
+  if (installDone) return;
+  const application = hostWindow.Application; const build = hostWindow.DocxtoolBuildInfo;
+  if (!application || !build) {
+    if (!installAttempted) {
+      installAttempted = true;
+      void reportHostAcceptance("host_module_loaded", "PASS");
+    }
+    return;
+  }
+  try {
+    installDone = true;
+    if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
+    install();
+  } catch (error) {
+    const code = stableError(error);
+    void reportHostAcceptance("host_install", "FAIL", code);
+    new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" });
+  }
+}
+tryInstall();
+installTimer = hostWindow.setInterval(tryInstall, 250);
+(installTimer as unknown as { unref?: () => void }).unref?.();

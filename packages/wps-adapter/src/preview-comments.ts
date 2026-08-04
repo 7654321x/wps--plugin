@@ -1,6 +1,7 @@
 import type { FormattingCommandSet, RecognitionResult } from "../../contracts/src/index.js";
 import type { PreviewCommentResult, PreviewCommentService, PreviewDisplayMode, PreviewMutationTracker } from "../../application/src/ports.js";
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
+import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
 
 type WpsObject = Record<string, any>;
 const LEGACY_MARKER = "[DOCXTOOL_PREVIEW]";
@@ -8,7 +9,11 @@ const PREVIEW_AUTHOR_PREFIX = "DocxTool·";
 const SPECIAL = new Set(["main_title", "title_continuation", "heading1", "heading2", "heading3", "heading4", "recipient", "attachment_note", "attachment_title", "signature_org", "signature_date"]);
 const ROLE_NAMES: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期" };
 function app(): WpsObject { const value = (globalThis as { Application?: unknown }).Application; if (!value || typeof value !== "object") throw new Error("WPS_API_UNSUPPORTED"); return value as WpsObject; }
-function normalize(value: unknown): string { return String(value ?? "").replace(/[\r\n\v\f]+$/g, ""); }
+function normalize(value: unknown): string { return stripWpsImplicitParagraphTerminator(value); }
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
+}
 function collection(document: WpsObject): WpsObject { const comments = document.Comments as WpsObject | undefined; if (!comments || typeof comments.Item !== "function" || typeof comments.Add !== "function") throw new Error("COMMENT_PREVIEW_UNSUPPORTED"); return comments; }
 function paragraph(document: WpsObject, index: number): WpsObject { const value = document.Paragraphs?.Item(index + 1) as WpsObject | undefined; if (!value?.Range) throw new Error("TARGET_NOT_FOUND"); return value; }
 function content(comment: WpsObject): string {
@@ -109,17 +114,23 @@ export class WpsPreviewCommentService implements PreviewCommentService {
     try {
       for (const item of input.recognition.paragraphs) {
         if (!shouldAdd(item, input.mode)) continue;
-        const source = input.snapshot.paragraphs.find((value) => value.sourceParagraphIndex === item.source_paragraph_index);
+        const source = input.snapshot.paragraphs.find((value) => value.sourceParagraphIndex === item.host_paragraph_index);
         if (!source || !normalize(source.text)) continue;
-        const paragraphRange = paragraph(document, item.source_paragraph_index).Range as WpsObject;
+        const hostParagraph = paragraph(document, item.host_paragraph_index);
+        const paragraphRange = hostParagraph.Range as WpsObject;
+        const hostRaw = normalize(paragraphRange.Text);
+        if (await sha256(hostRaw) !== item.host_raw_text_sha256) throw new Error("PARAGRAPH_CHANGED");
+        const expected = rawSliceUtf16(hostRaw, item.host_raw_start_utf16, item.host_raw_end_utf16);
+        if (expected === null || await sha256(expected) !== item.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
         const paragraphStart = Number(paragraphRange.Start);
-        const start = paragraphStart + item.range_start_utf16; const end = paragraphStart + item.range_end_utf16;
-        if (!item.locator_verified || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || item.range_end_utf16 > source.text.length) continue;
+        const start = paragraphStart + item.host_raw_start_utf16; const end = paragraphStart + item.host_raw_end_utf16;
+        if (!item.locator_verified || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || item.host_raw_end_utf16 > hostRaw.length) continue;
         // The locator was validated against the host snapshot. Obtain exactly
         // that UTF-16 sub-range without changing Selection.
         const bodyRange = document.Range(start, end) as WpsObject;
+        if (await sha256(normalize(bodyRange.Text)) !== item.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
         const value = display(item, commandsByTarget.get(item.target_id) ?? []);
-        created.push(markerRecord(item.source_paragraph_index, item.range_start_utf16, item.range_end_utf16, value));
+        created.push(markerRecord(item.host_paragraph_index, item.host_raw_start_utf16, item.host_raw_end_utf16, value));
         const countBefore = Number(comments.Count ?? 0); const returned = comments.Add(bodyRange, value) as WpsObject | undefined;
         let comment = returned && typeof returned === "object" ? returned : undefined;
         for (let attempt = 0; !comment && attempt < 10; attempt += 1) {

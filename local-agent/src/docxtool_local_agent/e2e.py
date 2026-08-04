@@ -4,8 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 from docx import Document
-from docxtool.sdk import recognize_docx
+from docxtool.sdk import bind_recognition_plan, recognize_docx
 from docxtool_command_service.core.command_builder import build_formatting_commands
+from .snapshot import build_host_snapshot
 
 
 RESULT_STATUSES = {"PASS", "FAIL", "UNSUPPORTED", "NOT_RUN"}
@@ -165,51 +166,118 @@ def run_readonly_chain(runtime_root, session_id, include_plan=False):
         # used by the existing docxtool formatting engine.  It remains the
         # same local SDK entry point, but avoids an authoritative-mode
         # reclassification of deliberately plain E2E fixture paragraphs.
-        plan = recognize_docx(source, recognition_mode="legacy", include_text=True).to_dict()
+        plan_model = recognize_docx(source, recognition_mode="legacy", include_text=True)
+        host_snapshot = build_host_snapshot(
+            "docxtool-e2e",
+            [
+                {
+                    "host_paragraph_index": index,
+                    "raw_text": text,
+                    "story_type": "main",
+                    "is_in_table": False,
+                }
+                for index, text in enumerate(paragraphs)
+            ],
+            document_identity="e2e-" + before[:16],
+            document_revision=before,
+        )
+        plan = plan_model.to_dict()
+        binding = bind_recognition_plan(plan_model, host_snapshot).to_dict()
         after = hashlib.sha256(source.read_bytes()).hexdigest()
         if before != after:
             return {"ok": False, "error_code": "INPUT_FILE_CHANGED"}
-        blocks = {item["source_paragraph_index"]: item for item in plan.get("blocks", [])}
+        blocks = {item["block_index"]: item for item in plan.get("blocks", [])}
+        bindings = {item["block_index"]: item for item in binding.get("blocks", [])}
+        grouped = {}
+        for block in plan.get("blocks", []):
+            physical = block.get("physical_paragraph_index")
+            if isinstance(physical, int):
+                grouped.setdefault(physical, []).append(block)
+        group_complete = {}
+        for physical, members in grouped.items():
+            expected = max(int(member.get("segment_count_total", 1)) for member in members)
+            confirmed = sum(
+                1 for member in members
+                if bindings.get(member["block_index"], {}).get("binding_status") == "confirmed"
+            )
+            group_complete[physical] = len(members) == expected and confirmed == expected
         occurrences = {}
         recognition_paragraphs = []
         anchors = []
-        for index, paragraph in enumerate(paragraphs):
-            block = blocks.get(index)
-            if block is None:
+        for block_index, block in sorted(blocks.items()):
+            host_binding = bindings.get(block_index, {})
+            binding_status = host_binding.get("binding_status")
+            physical = block.get("physical_paragraph_index")
+            source_start = block.get("raw_start_utf16")
+            source_end = block.get("raw_end_utf16")
+            host_index = host_binding.get("host_paragraph_index")
+            host_start = host_binding.get("host_raw_start_utf16")
+            host_end = host_binding.get("host_raw_end_utf16")
+            group_is_complete = group_complete.get(physical) is True
+            whole_physical_paragraph = (
+                block.get("segment_count_total", 1) == 1
+                and source_start == 0
+                and source_end == block.get("physical_text_length_utf16")
+            )
+            applicable = (
+                block.get("source_locator_status") == "confirmed"
+                and block.get("locator_verified") is True
+                and binding_status == "confirmed"
+                and group_is_complete
+                and whole_physical_paragraph
+                and isinstance(host_index, int)
+                and isinstance(host_start, int)
+                and isinstance(host_end, int)
+                and host_end > host_start
+            )
+            anchors.append({
+                "block_index": block_index,
+                "physical_paragraph_index": physical,
+                "host_paragraph_index": host_index,
+                "binding_status": binding_status or "unresolved",
+                "group_complete": group_is_complete,
+                "formatting_disposition": "apply" if applicable else "skip",
+            })
+            if not applicable:
                 continue
-            text_hash = hashlib.sha256(paragraph.encode("utf-8")).hexdigest()
+            text_hash = block["raw_fragment_sha256"]
             occurrence = occurrences.get(text_hash, 0)
             occurrences[text_hash] = occurrence + 1
-            target_id = "e2e:%s:%d:%d" % (before[:16], index, occurrence)
+            target_id = "e2e:%s:%d:%d" % (before[:16], host_index, occurrence)
             recognized_type = contract_type(block["type_id"])
             recognition_paragraphs.append({
-                "target_id": target_id, "source_paragraph_index": index,
+                "target_id": target_id, "source_paragraph_index": host_index,
                 "recognized_type": recognized_type if recognized_type in RECOGNIZED_TYPES else "unknown",
                 "section_kind": block["section"] if block["section"] in SECTION_KINDS else "body",
-                "text_sha256": text_hash, "text_length": len(paragraph),
+                "text_sha256": text_hash, "text_length": block["text_length_utf16"],
                 "occurrence_index": occurrence,
-                "confidence": 1 if block["review_level"] == "confirmed" else 0.5,
-                "review_level": block["review_level"],
-                "needs_review": block["review_level"] in ("review", "critical_review"),
-                "physical_paragraph_index": block.get("physical_paragraph_index", index),
-                "physical_text_sha256": block.get("physical_text_sha256", text_hash),
-                "range_start_utf16": block.get("range_start_utf16", 0),
-                "range_end_utf16": block.get("range_end_utf16", len(paragraph)),
-                "locator_verified": bool(block.get("locator_verified", False)),
+                "confidence": 1,
+                "review_level": "confirmed",
+                "needs_review": False,
+                "physical_paragraph_index": physical,
+                "physical_text_sha256": block["physical_text_sha256"],
+                "range_start_utf16": source_start,
+                "range_end_utf16": source_end,
+                "locator_verified": True,
                 "mixed_structure": False,
                 "formatting_disposition": "apply",
-            })
-            anchors.append({
-                "source_paragraph_index": index, "text_sha256": text_hash,
-                "occurrence_index": occurrence,
-                # A structural role is safe to return to the local taskpane and
-                # lets it display the matching normative format without exposing text.
-                "recognized_type": recognized_type if recognized_type in RECOGNIZED_TYPES else "unknown",
+                "host_paragraph_index": host_index,
+                "host_raw_start_utf16": host_start,
+                "host_raw_end_utf16": host_end,
+                "host_raw_text_sha256": hashlib.sha256(paragraphs[host_index].encode("utf-8")).hexdigest(),
+                "host_text_contract_version": "host-text-v1",
+                "host_canonical_start_utf16": host_binding["host_canonical_start_utf16"],
+                "host_canonical_end_utf16": host_binding["host_canonical_end_utf16"],
+                "binding_status": "confirmed",
+                "binding_confidence": host_binding["binding_confidence"],
+                "segment_count_total": 1,
+                "segment_count_located": 1,
+                "segment_count_confirmed": 1,
             })
         request_payload = {
             "schema_version": "1.0", "request_id": "e2e-" + session_id,
             "recognition_result": {
-                "schema_version": "1.1", "recognition_engine_version": plan["engine_version"],
+                "schema_version": "1.2", "recognition_engine_version": plan["engine_version"],
                 "document_id": "e2e-" + before[:16], "document_revision": before,
                 "source_sha256": before, "document_mode": plan["document_mode"],
                 "document_mode_confidence": plan["document_mode_confidence"], "paragraphs": recognition_paragraphs,

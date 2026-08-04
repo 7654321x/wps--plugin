@@ -3,14 +3,16 @@ import type { CapabilityProvider, DocumentExecutor, DocumentReader, FontCapabili
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
 import { WpsUnitConverter } from "./format-validation.js";
 import { DEFAULT_GRID_MODE, DocumentGridCapabilityProvider, GridReadbackValidator, type GridCapability, type GridMode } from "./grid.js";
+import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
 
 type WpsObject = Record<string, any>;
 const SHA256 = /^[a-f0-9]{64}$/;
 
 function normalizeText(value: unknown): string {
-  // WPS appends paragraph, manual-line-break and section/page-break control
-  // characters to Range.Text. python-docx paragraph.text excludes them.
-  return String(value ?? "").replace(/\r\n/g, "\n").replace(/[\r\v]/g, "\n").replace(/[\n\f]+$/g, "");
+  // WPS appends an implicit paragraph/cell terminator.  Preserve all other
+  // raw display characters for host-text-v1; canonicalization happens only
+  // in the explicit binding/Range verification path.
+  return stripWpsImplicitParagraphTerminator(value);
 }
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -220,24 +222,23 @@ export class WpsTransactionManager implements TransactionManager {
 }
 
 export class WpsTargetLocator {
-  async locate(target: FormattingCommand["target"]): Promise<WpsObject> {
-    if (!SHA256.test(target.text_sha256)) throw new Error("TARGET_HASH_MISMATCH");
+  async locate(target: FormattingCommand["target"]): Promise<{ paragraph: WpsObject; range: WpsObject }> {
+    if (!SHA256.test(target.text_sha256) || !SHA256.test(target.host_raw_text_sha256)) throw new Error("HOST_RANGE_HASH_MISMATCH");
     const document = app().ActiveDocument as WpsObject;
-    const direct = paragraphAt(document, target.source_paragraph_index);
-    const directText = normalizeText(direct.Range.Text);
-    if (directText.length === target.text_length && await sha256(directText) === target.text_sha256) return direct;
-    const count = Number(document.Paragraphs?.Count ?? 0);
-    // Revision protection rejects broad document changes before this point.
-    // Once an anchor moved, occurrence_index deterministically selects among
-    // duplicate and empty paragraphs rather than guessing or reporting ambiguity.
-    const matches: WpsObject[] = [];
-    for (let index = 0; index < count; index += 1) {
-      const candidate = paragraphAt(document, index);
-      const text = normalizeText(candidate.Range.Text);
-      if (text.length === target.text_length && await sha256(text) === target.text_sha256) matches.push(candidate);
-    }
-    if (target.occurrence_index >= matches.length) throw new Error("TARGET_NOT_FOUND");
-    return matches[target.occurrence_index];
+    const selected = paragraphAt(document, target.host_paragraph_index);
+    const rawText = normalizeText(selected.Range.Text);
+    if (await sha256(rawText) !== target.host_raw_text_sha256) throw new Error("PARAGRAPH_CHANGED");
+    const fragment = rawSliceUtf16(rawText, target.host_raw_start_utf16, target.host_raw_end_utf16);
+    if (fragment === null) throw new Error("HOST_RANGE_OUT_OF_BOUNDS");
+    if (await sha256(fragment) !== target.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
+    const paragraphStart = Number(selected.Range.Start);
+    const start = paragraphStart + target.host_raw_start_utf16;
+    const end = paragraphStart + target.host_raw_end_utf16;
+    if (!Number.isFinite(paragraphStart) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("HOST_RANGE_OUT_OF_BOUNDS");
+    const range = document.Range(start, end) as WpsObject;
+    const readback = normalizeText(range.Text);
+    if (await sha256(readback) !== target.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
+    return { paragraph: selected, range };
   }
 }
 
@@ -267,8 +268,8 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       for (const command of commandSet.commands.filter((item) => item.kind === "section.set_page_setup")) {
         const relatedKinds = new Set(commandSet.commands.filter((item) => item.target.source_paragraph_index === command.target.source_paragraph_index).map((item) => item.kind));
         if (!["paragraph.set_font", "paragraph.set_alignment", "paragraph.set_spacing"].every((kind) => relatedKinds.has(kind as FormattingCommand["kind"]))) continue;
-        const paragraph = await this.locator.locate(command.target);
-        this.validateGridReadback(paragraph, command.arguments);
+        const located = await this.locator.locate(command.target);
+        this.validateGridReadback(located.range, command.arguments);
       }
       return { schema_version: EXECUTION_RESULT_VERSION, transaction_id: transactionId, executed_command_ids: executed, skipped_command_ids: [], failed_command_id: null, warnings: [], rolled_back: false, document_revision: revision };
     } catch (error) {
@@ -277,10 +278,11 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
     }
   }
   private async apply(command: FormattingCommand): Promise<() => void> {
-    const paragraph = await this.locator.locate(command.target);
+    const located = await this.locator.locate(command.target);
+    const range = located.range;
     if (command.kind === "paragraph.set_font") {
       const args = command.arguments;
-      const font = paragraph!.Range.Font as WpsObject;
+      const font = range.Font as WpsObject;
       const before = { NameAscii: font.NameAscii, NameOther: font.NameOther, NameFarEast: font.NameFarEast, Size: font.Size, Bold: font.Bold, Spacing: font.Spacing, Scaling: font.Scaling, DisableCharacterSpaceGrid: font.DisableCharacterSpaceGrid };
       const latin = args.latin_font_name; const east = args.east_asia_font_name;
       font.NameAscii = latin; font.NameOther = latin; font.NameFarEast = east; font.Size = args.font_size_pt; font.Bold = args.bold ? 1 : 0;
@@ -293,13 +295,13 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       return () => { Object.assign(font, before); };
     } else if (command.kind === "paragraph.set_alignment") {
       const args = command.arguments;
-      const format = paragraph!.Range.ParagraphFormat as WpsObject; const before = format.Alignment;
+      const format = range.ParagraphFormat as WpsObject; const before = format.Alignment;
       format.Alignment = alignment[String(args.alignment)];
       if (format.Alignment !== alignment[String(args.alignment)]) throw new Error("WRITE_READBACK_MISMATCH");
       return () => { format.Alignment = before; };
     } else if (command.kind === "paragraph.set_indent") {
       const args = command.arguments;
-      const format = paragraph!.Range.ParagraphFormat as WpsObject;
+      const format = range.ParagraphFormat as WpsObject;
       const before = { CharacterUnitFirstLineIndent: format.CharacterUnitFirstLineIndent, CharacterUnitLeftIndent: format.CharacterUnitLeftIndent, CharacterUnitRightIndent: format.CharacterUnitRightIndent };
       format.CharacterUnitFirstLineIndent = args.first_line_indent_chars;
       format.CharacterUnitLeftIndent = args.left_indent_chars; format.CharacterUnitRightIndent = args.right_indent_chars;
@@ -307,7 +309,7 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       return () => { Object.assign(format, before); };
     } else if (command.kind === "paragraph.set_spacing") {
       const args = command.arguments;
-      const format = paragraph!.Range.ParagraphFormat as WpsObject;
+      const format = range.ParagraphFormat as WpsObject;
       const before = { LineUnitBefore: format.LineUnitBefore, LineUnitAfter: format.LineUnitAfter, LineSpacingRule: format.LineSpacingRule, LineSpacing: format.LineSpacing, PageBreakBefore: format.PageBreakBefore, OutlineLevel: format.OutlineLevel, SnapToGrid: format.SnapToGrid };
       const beforeLines = Number(args.space_before_lines); const afterLines = Number(args.space_after_lines); const outlineLevel = Number(args.outline_level ?? 10);
       format.LineSpacingRule = 4; format.LineSpacing = args.line_spacing_pt; format.LineUnitBefore = beforeLines; format.LineUnitAfter = afterLines; format.PageBreakBefore = args.page_break_before ? 1 : 0; format.OutlineLevel = outlineLevel; format.SnapToGrid = false;
@@ -316,7 +318,7 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
     } else if (command.kind === "section.set_page_setup") {
       const args = command.arguments;
       const document = app().ActiveDocument as WpsObject;
-      const setups = sectionPageSetups(document, paragraph!.Range.PageSetup as WpsObject);
+      const setups = sectionPageSetups(document, range.PageSetup as WpsObject);
       const before = setups.map((setup) => ({ setup, PageWidth: setup.PageWidth, PageHeight: setup.PageHeight, TopMargin: setup.TopMargin, BottomMargin: setup.BottomMargin, LeftMargin: setup.LeftMargin, RightMargin: setup.RightMargin, LinesPage: setup.LinesPage, CharsLine: setup.CharsLine, LayoutMode: setup.LayoutMode, ShowGrid: setup.ShowGrid }));
       const mode = args.grid_mode;
       if (mode === "strict_lines_and_chars") new GridReadbackValidator().assertStrictSupported();
@@ -342,8 +344,7 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
       return restoreAll;
     } else throw new Error("COMMAND_NOT_ALLOWED");
   }
-  private validateGridReadback(paragraph: WpsObject, args: SetPageSetupArguments): void {
-    const range = paragraph.Range as WpsObject;
+  private validateGridReadback(range: WpsObject, args: SetPageSetupArguments): void {
     const setup = range.PageSetup as WpsObject;
     const format = range.ParagraphFormat as WpsObject;
     const font = range.Font as WpsObject;

@@ -1,7 +1,8 @@
 /** Contract versions are independent.  Do not merge these into a global version. */
-export const RECOGNITION_RESULT_VERSION = "1.1" as const;
+export const RECOGNITION_RESULT_VERSION = "1.2" as const;
 export const COMMAND_REQUEST_VERSION = "1.0" as const;
-export const FORMATTING_COMMAND_SET_VERSION = "1.1" as const;
+/** 1.2 adds verified host paragraph and UTF-16 range anchors to every target. */
+export const FORMATTING_COMMAND_SET_VERSION = "1.2" as const;
 export const CLIENT_CAPABILITIES_VERSION = "1.0" as const;
 export const EXECUTION_RESULT_VERSION = "1.0" as const;
 
@@ -24,7 +25,12 @@ export type ReviewLevel = "confirmed" | "info" | "review" | "critical_review";
 
 export interface Target {
   target_id: string;
+  /** Deprecated compatibility name: this is the verified host paragraph id. */
   source_paragraph_index: number;
+  host_paragraph_index: number;
+  host_raw_start_utf16: number;
+  host_raw_end_utf16: number;
+  host_raw_text_sha256: string;
   text_sha256: string;
 }
 export interface CommandTarget extends Target {
@@ -37,10 +43,15 @@ export interface RecognitionParagraph extends Target {
   physical_paragraph_index: number; physical_text_sha256: string;
   range_start_utf16: number; range_end_utf16: number; locator_verified: boolean;
   mixed_structure: boolean; formatting_disposition: "apply" | "review_only";
+  host_text_contract_version: "host-text-v1";
+  host_canonical_start_utf16: number; host_canonical_end_utf16: number;
+  binding_status: "confirmed" | "review";
+  binding_confidence: number;
+  segment_count_total: number; segment_count_located: number; segment_count_confirmed: number;
 }
 export interface UnresolvedRecognitionBlock {
   block_index: number; recognized_type: string; review_level: ReviewLevel;
-  reason: "RECOGNITION_LOCATOR_UNVERIFIED" | "RECOGNITION_LOCATOR_AMBIGUOUS";
+  reason: "RECOGNITION_LOCATOR_UNVERIFIED" | "RECOGNITION_LOCATOR_AMBIGUOUS" | "BINDING_NOT_CONFIRMED" | "SEGMENT_GROUP_INCOMPLETE";
 }
 export interface RecognitionResult {
   schema_version: typeof RECOGNITION_RESULT_VERSION; recognition_engine_version: string; document_id: string;
@@ -121,7 +132,13 @@ export function assertCommandRequest(request: CommandRequest): void {
   request.recognition_result.paragraphs.forEach((paragraph) => {
     if (!SHA256.test(paragraph.text_sha256)) throw new Error("INVALID_TEXT_SHA256");
     if (!SHA256.test(paragraph.physical_text_sha256)) throw new Error("INVALID_PHYSICAL_TEXT_SHA256");
+    if (!SHA256.test(paragraph.host_raw_text_sha256)) throw new Error("INVALID_HOST_TEXT_SHA256");
     if (paragraph.text_length < 0 || paragraph.occurrence_index < 0) throw new Error("INVALID_ANCHOR");
+    if (!Number.isInteger(paragraph.host_paragraph_index) || paragraph.host_paragraph_index < 0) throw new Error("INVALID_HOST_PARAGRAPH");
+    if (!Number.isInteger(paragraph.host_raw_start_utf16) || !Number.isInteger(paragraph.host_raw_end_utf16) || paragraph.host_raw_start_utf16 < 0 || paragraph.host_raw_end_utf16 <= paragraph.host_raw_start_utf16) throw new Error("INVALID_HOST_RANGE");
+    if (!Number.isInteger(paragraph.host_canonical_start_utf16) || !Number.isInteger(paragraph.host_canonical_end_utf16) || paragraph.host_canonical_start_utf16 < 0 || paragraph.host_canonical_end_utf16 <= paragraph.host_canonical_start_utf16) throw new Error("INVALID_HOST_CANONICAL_RANGE");
+    if (paragraph.host_text_contract_version !== "host-text-v1" || !["confirmed", "review"].includes(paragraph.binding_status) || !numeric(paragraph.binding_confidence, 0, 1)) throw new Error("INVALID_HOST_BINDING");
+    if (![paragraph.segment_count_total, paragraph.segment_count_located, paragraph.segment_count_confirmed].every((value) => Number.isInteger(value) && value >= 1) || paragraph.segment_count_confirmed > paragraph.segment_count_located || paragraph.segment_count_located > paragraph.segment_count_total) throw new Error("INVALID_SEGMENT_GROUP");
     if (!paragraph.locator_verified || paragraph.range_start_utf16 < 0 || paragraph.range_end_utf16 <= paragraph.range_start_utf16) throw new Error("INVALID_RANGE_LOCATOR");
   });
 }
@@ -130,7 +147,7 @@ export function assertFormattingCommandSet(result: FormattingCommandSet, expecte
   if (result.request_id !== expectedRequestId) throw new Error("REQUEST_ID_MISMATCH");
   for (const command of result.commands) {
     if (!ALLOWED_COMMANDS.has(command.kind)) throw new Error("UNKNOWN_COMMAND");
-    if (!SHA256.test(command.target.text_sha256) || command.target.text_length < 0 || command.target.occurrence_index < 0) throw new Error("INVALID_TARGET_HASH");
+    if (!SHA256.test(command.target.text_sha256) || !SHA256.test(command.target.host_raw_text_sha256) || command.target.text_length < 0 || command.target.occurrence_index < 0) throw new Error("INVALID_TARGET_HASH");
     validateCommandArguments(command);
   }
 }

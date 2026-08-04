@@ -1,9 +1,12 @@
 var DOCXTOOL_RIBBON_COMMANDS = Object.freeze({ preview: "preview_document", apply: "format_document", health: "health_check" });
 function OnAddinLoad(ribbonUI) { window.Application.ribbonUI = ribbonUI; return true; }
+function DocxtoolErrorMessage(errorCode) {
+  return ({ HOST_COMMAND_ROUTER_NOT_READY: "插件命令路由尚未就绪。请关闭任务窗格后重新打开，或重启 WPS。", HOST_COMMAND_FAILED: "WPS 执行命令失败。请查看功能检测结果定位原因。", RIBBON_CALLBACK_NOT_FOUND: "功能区按钮回调未找到。请关闭全部 WPS 窗口后重新打开。" })[errorCode] || ("未知错误：" + errorCode);
+}
 function DocxtoolPersistHostError(callbackName, errorCode) {
   try {
     var build = window.DocxtoolBuildInfo || { build_id: "unknown", asset_hash: "" };
-    var value = { schema_version: 1, build_id: build.build_id, asset_hash: build.asset_hash, host_context_id: "ribbon-bootstrap", document_identity_hash: "", active_command: null, command_status: "FAIL", active_view: "issues", recognition_summary: "", paragraph_recognition_models: [], formatting_preview_models: [], preview_comment_status: "", formatting_progress: "失败：" + errorCode, formatting_result: "", latest_error: errorCode, callback_log: [{ callback_name: callbackName, build_id: build.build_id, host_context: "ribbon-bootstrap", started_at: new Date().toISOString(), completed_at: new Date().toISOString(), status: "FAIL", stable_error_code: errorCode }], updated_at: new Date().toISOString() };
+    var value = { schema_version: 1, build_id: build.build_id, asset_hash: build.asset_hash, host_context_id: "ribbon-bootstrap", document_identity_hash: "", active_command: null, command_status: "FAIL", active_view: "issues", recognition_summary: "", paragraph_recognition_models: [], formatting_preview_models: [], preview_comment_status: "", formatting_progress: "失败：" + DocxtoolErrorMessage(errorCode), formatting_result: "", latest_error: errorCode, callback_log: [{ callback_name: callbackName, build_id: build.build_id, host_context: "ribbon-bootstrap", started_at: new Date().toISOString(), completed_at: new Date().toISOString(), status: "FAIL", stable_error_code: errorCode }], updated_at: new Date().toISOString() };
     window.Application.PluginStorage.setItem("docxtool_classified_host_result_v1", JSON.stringify(value));
   } catch (ignore) {}
 }

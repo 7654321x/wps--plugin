@@ -19,7 +19,7 @@ function Get-CurrentSession {
   return $null
 }
 function Get-DocumentStats([string]$Path) {
-  $python = Join-Path $root "..\.venv\Scripts\python.exe"
+  $python = Join-Path $root ".venv\Scripts\python.exe"
   $script = @'
 import hashlib,json,os,sys,zipfile,xml.etree.ElementTree as ET
 p=sys.argv[1]

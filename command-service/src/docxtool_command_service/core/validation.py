@@ -73,7 +73,11 @@ def _number(value, name, minimum, maximum):
 
 def _target(value, command_target=False):
     item = _require_object(value, "target")
-    required = {"target_id", "source_paragraph_index", "text_sha256"}
+    required = {
+        "target_id", "source_paragraph_index", "host_paragraph_index",
+        "host_raw_start_utf16", "host_raw_end_utf16", "host_raw_text_sha256",
+        "text_sha256",
+    }
     if command_target:
         required.update({"text_length", "occurrence_index"})
     if set(item) != required:
@@ -85,6 +89,15 @@ def _target(value, command_target=False):
         _fail("INVALID_SCHEMA", "invalid source_paragraph_index")
     if not _SHA256.match(str(item.get("text_sha256", ""))):
         _fail("INVALID_SCHEMA", "invalid text_sha256")
+    if not _SHA256.match(str(item.get("host_raw_text_sha256", ""))):
+        _fail("INVALID_SCHEMA", "invalid host_raw_text_sha256")
+    if not isinstance(item.get("host_paragraph_index"), int) or item["host_paragraph_index"] < 0:
+        _fail("INVALID_SCHEMA", "invalid host_paragraph_index")
+    if (not isinstance(item.get("host_raw_start_utf16"), int)
+            or not isinstance(item.get("host_raw_end_utf16"), int)
+            or item["host_raw_start_utf16"] < 0
+            or item["host_raw_end_utf16"] <= item["host_raw_start_utf16"]):
+        _fail("INVALID_SCHEMA", "invalid host raw range")
     if command_target:
         for name in ("text_length", "occurrence_index"):
             if not isinstance(item.get(name), int) or isinstance(item[name], bool) or item[name] < 0:
@@ -127,7 +140,9 @@ def validate_recognition_result(value):
             _fail("INVALID_SCHEMA", "invalid unresolved block index")
         if value["review_level"] not in ("confirmed", "info", "review", "critical_review"):
             _fail("INVALID_SCHEMA", "invalid unresolved review level")
-        if value["reason"] not in ("RECOGNITION_LOCATOR_UNVERIFIED", "RECOGNITION_LOCATOR_AMBIGUOUS"):
+        if value["reason"] not in (
+                "RECOGNITION_LOCATOR_UNVERIFIED", "RECOGNITION_LOCATOR_AMBIGUOUS",
+                "BINDING_NOT_CONFIRMED", "SEGMENT_GROUP_INCOMPLETE"):
             _fail("INVALID_SCHEMA", "invalid unresolved reason")
 
 
@@ -139,13 +154,21 @@ def _validate_paragraph(value):
         "review_level", "needs_review",
         "physical_paragraph_index", "physical_text_sha256", "range_start_utf16",
         "range_end_utf16", "locator_verified", "mixed_structure",
-        "formatting_disposition",
+        "formatting_disposition", "host_text_contract_version",
+        "host_paragraph_index", "host_raw_start_utf16", "host_raw_end_utf16",
+        "host_raw_text_sha256", "host_canonical_start_utf16",
+        "host_canonical_end_utf16", "binding_status", "binding_confidence",
+        "segment_count_total", "segment_count_located", "segment_count_confirmed",
     }
     if set(item) != required:
         _fail("INVALID_SCHEMA", "invalid paragraph fields")
     _target({
         "target_id": item["target_id"],
         "source_paragraph_index": item["source_paragraph_index"],
+        "host_paragraph_index": item["host_paragraph_index"],
+        "host_raw_start_utf16": item["host_raw_start_utf16"],
+        "host_raw_end_utf16": item["host_raw_end_utf16"],
+        "host_raw_text_sha256": item["host_raw_text_sha256"],
         "text_sha256": item["text_sha256"],
     })
     if item["recognized_type"] not in _RECOGNIZED_TYPES:
@@ -169,6 +192,21 @@ def _validate_paragraph(value):
         _fail("INVALID_SCHEMA", "invalid range locator")
     if item["locator_verified"] is not True:
         _fail("INVALID_SCHEMA", "locator must be verified")
+    if item["host_text_contract_version"] != "host-text-v1":
+        _fail("INVALID_SCHEMA", "unsupported host text contract")
+    if item["binding_status"] not in ("confirmed", "review"):
+        _fail("INVALID_SCHEMA", "invalid binding status")
+    _number(item["binding_confidence"], "binding_confidence", 0, 1)
+    for name in ("host_canonical_start_utf16", "host_canonical_end_utf16"):
+        if not isinstance(item[name], int) or item[name] < 0:
+            _fail("INVALID_SCHEMA", "invalid " + name)
+    if item["host_canonical_end_utf16"] <= item["host_canonical_start_utf16"]:
+        _fail("INVALID_SCHEMA", "invalid canonical range")
+    for name in ("segment_count_total", "segment_count_located", "segment_count_confirmed"):
+        if not isinstance(item[name], int) or item[name] < 1:
+            _fail("INVALID_SCHEMA", "invalid " + name)
+    if item["segment_count_confirmed"] > item["segment_count_located"] or item["segment_count_located"] > item["segment_count_total"]:
+        _fail("INVALID_SCHEMA", "invalid segment group")
     if not isinstance(item["mixed_structure"], bool):
         _fail("INVALID_SCHEMA", "mixed_structure must be boolean")
     if item["formatting_disposition"] not in ("apply", "review_only"):

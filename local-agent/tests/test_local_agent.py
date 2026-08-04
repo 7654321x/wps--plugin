@@ -6,12 +6,17 @@ from pathlib import Path
 from wsgiref.util import setup_testing_defaults
 
 ROOT = Path(__file__).resolve().parents[1]
+WPS_ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT.parents[1] / "command-service" / "src"))
-sys.path.insert(0, str(ROOT.parents[1] / "src"))
+sys.path.insert(0, str(WPS_ROOT / "command-service" / "src"))
 
 from docxtool_local_agent.app import create_app  # noqa: E402
-from docxtool_local_agent.e2e import guard_test_document, record_diagnostics, record_result  # noqa: E402
+from docxtool_local_agent.e2e import (  # noqa: E402
+    guard_test_document,
+    record_diagnostics,
+    record_result,
+    run_readonly_chain,
+)
 
 
 def _call(app, method, path, body=None, token="test-token", origin=""):
@@ -38,6 +43,13 @@ def test_health_and_version_are_text_free():
     status, version, _ = _call(app, "GET", "/v1/version")
     assert status == "200 OK"
     assert "source_path" not in json.dumps(version)
+    status, handshake, _ = _call(app, "GET", "/v1/handshake")
+    assert status == "200 OK"
+    assert handshake["ok"] is True
+    assert handshake["host_text_contract_version"] == "host-text-v1"
+    serialized_handshake = json.dumps(handshake)
+    assert "DocxTool local handshake" not in serialized_handshake
+    assert "source_path" not in serialized_handshake
 
 
 def test_recognition_returns_a_redacted_sdk_plan_and_keeps_input_unchanged(tmp_path):
@@ -50,6 +62,10 @@ def test_recognition_returns_a_redacted_sdk_plan_and_keeps_input_unchanged(tmp_p
     original = source.read_bytes()
     status, payload, _ = _call(create_app("test-token"), "POST", "/v1/recognize", {
         "source_path": str(source),
+        "host_snapshot": {
+            "host_type": "wps-test",
+            "paragraphs": [{"host_paragraph_index": 0, "raw_text": "严禁进入响应的正文"}],
+        },
     })
     assert status == "200 OK"
     assert source.read_bytes() == original
@@ -58,13 +74,31 @@ def test_recognition_returns_a_redacted_sdk_plan_and_keeps_input_unchanged(tmp_p
     assert str(source) not in serialized
     assert payload["data"]["blocks"][0]["text_sha256"]
     assert payload["data"]["blocks"][0]["locator_verified"] is True
+    assert payload["binding"]["blocks"][0]["binding_status"] == "confirmed"
+    assert payload["binding"]["blocks"][0]["host_raw_start_utf16"] == 0
+
+
+def test_recognition_requires_a_local_host_snapshot(tmp_path):
+    from docx import Document
+
+    source = tmp_path / "sample.docx"
+    document = Document()
+    document.add_paragraph("脱敏文本")
+    document.save(source)
+
+    status, payload, _ = _call(create_app("test-token"), "POST", "/v1/recognize", {
+        "source_path": str(source),
+    })
+
+    assert status == "400 Bad Request"
+    assert payload["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_single_local_service_builds_commands_on_the_same_port():
     request = {
         "schema_version": "1.0", "request_id": "request-00000001",
         "recognition_result": {
-            "schema_version": "1.1", "recognition_engine_version": "3.0",
+            "schema_version": "1.2", "recognition_engine_version": "3.0",
             "document_id": "doc-1", "document_revision": "rev-1",
             "source_sha256": "a" * 64, "document_mode": "normal",
             "document_mode_confidence": 1, "paragraphs": [],
@@ -124,3 +158,38 @@ def test_e2e_result_is_redacted_and_test_guard_requires_the_session_copy(tmp_pat
             "session_id": session_id, "stage": "x", "status": "PASS", "error_code": "", "text": "forbidden",
         })
     assert "safe fixture" not in (runtime / "current.json").read_text(encoding="utf-8")
+
+
+def test_readonly_chain_uses_verified_host_bindings_and_excludes_text(tmp_path):
+    from docx import Document
+
+    runtime = tmp_path / "e2e"
+    session_id = "b" * 32
+    runtime.mkdir()
+    (runtime / "current.json").write_text(json.dumps({
+        "session_id": session_id, "plugin_version": "1.0", "test_results": {},
+        "overall_status": "REAL_WPS_E2E_NOT_RUN",
+    }), encoding="utf-8")
+    session_dir = runtime / session_id
+    session_dir.mkdir()
+    working = session_dir / "test-working-copy.docx"
+    document = Document()
+    document.add_paragraph("一、脱敏标题。")
+    document.add_paragraph("脱敏正文内容。")
+    document.save(working)
+    (session_dir / "test-document.json").write_text(json.dumps({
+        "working_file": working.name,
+        "working_sha256": hashlib.sha256(working.read_bytes()).hexdigest(),
+        "is_fixture_baseline": False,
+    }), encoding="utf-8")
+
+    result = run_readonly_chain(runtime, session_id, include_plan=True)
+
+    assert result["ok"] is True
+    assert result["command_count"] >= 1
+    assert result["anchors"]
+    assert all(item["formatting_disposition"] in {"apply", "skip"} for item in result["anchors"])
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "脱敏标题" not in serialized
+    assert "脱敏正文" not in serialized
+    assert working.read_bytes()

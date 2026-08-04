@@ -3,7 +3,7 @@ param([ValidateSet("prepare", "status", "stop", "report", "auto")][string]$Actio
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtime = Join-Path $root ".runtime\e2e"
-$python = Join-Path $root "..\.venv\Scripts\python.exe"
+$python = Join-Path $root ".venv\Scripts\python.exe"
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $staticPort = 3889; $agentPort = 9528; $remoteDebugPort = 9222
 
@@ -90,7 +90,7 @@ if ($Action -eq "prepare") {
   $metadata | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $sessionDirectory "test-document.json")
   $session = [ordered]@{ session_id=$sessionId; edition="classified-offline"; plugin_version="0.1.0"; wps_version=""; started_at=(Get-Date).ToUniversalTime().ToString("o"); completed_at=""; current_stage="bootstrap_started"; test_results=[ordered]@{}; stable_errors=@(); overall_status="REAL_WPS_E2E_NOT_RUN" }
   $session | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $runtime "current.json")
-  $env:PYTHONPATH = "$root\local-agent\src;$root\command-service\src;$root\..\src"
+  $env:PYTHONPATH = "$root\local-agent\src;$root\command-service\src"
   $tokenFile = Join-Path $runtime "session-token.txt"
   $token = if (Test-Path -LiteralPath $tokenFile) { (Get-Content -Raw -LiteralPath $tokenFile).Trim() } else { "" }
   if ($token -notmatch '^[a-f0-9]{32}$') { $token = [Guid]::NewGuid().ToString("N") }

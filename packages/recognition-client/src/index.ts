@@ -1,27 +1,67 @@
-import { RECOGNITION_RESULT_VERSION, type RecognitionParagraph, type RecognitionResult, type ReviewLevel } from "../../contracts/src/index.js";
+import {
+  RECOGNITION_RESULT_VERSION,
+  type RecognitionParagraph,
+  type RecognitionResult,
+  type ReviewLevel,
+} from "../../contracts/src/index.js";
+import {
+  HOST_TEXT_CONTRACT_VERSION,
+  createHostTextTape,
+  rawSliceUtf16,
+} from "../../wps-adapter/src/host-text.js";
 
+export interface LocalHostParagraph {
+  sourceParagraphIndex: number;
+  text: string;
+  isInTable?: boolean;
+  storyType?: "main" | "header" | "footer";
+}
 export interface LocalDocumentSnapshot {
   documentId: string; revision: string; sourceSha256: string;
   localDocxPath?: string;
-  paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable?: boolean }>;
-  /** Local-only revision data. It is never sent to the recognition service. */
+  paragraphs: LocalHostParagraph[];
+  /** Local-only revision data. It is never sent to the command service. */
   formattingRevision?: string; paragraphOrderHash?: string; sectionCount?: number; documentFullNameHash?: string;
 }
+export interface WheelBindingBlock {
+  block_index: number;
+  physical_paragraph_index?: number | null;
+  host_paragraph_index?: number | null;
+  binding_status: "confirmed" | "review" | "unresolved";
+  binding_confidence: number;
+  binding_evidence?: string[];
+  binding_warnings?: string[];
+  host_raw_start_utf16?: number | null;
+  host_raw_end_utf16?: number | null;
+  host_canonical_start_utf16?: number | null;
+  host_canonical_end_utf16?: number | null;
+}
 export interface WheelRecognitionPlan {
-  schema_version: string; engine_version: string; document_mode: RecognitionResult["document_mode"];
-  document_mode_confidence: number;
+  schema_version: string; engine_version: string; package_version?: string;
+  locator_version?: string; host_text_contract_version?: string;
+  document_mode: RecognitionResult["document_mode"]; document_mode_confidence: number;
   blocks: Array<{
     source_paragraph_index: number | null; type_id: string; section: string; review_level: ReviewLevel;
     kind?: string; physical_paragraph_index?: number | null; physical_occurrence_index?: number;
     physical_text_sha256?: string; physical_text_length_utf16?: number;
+    raw_start_utf16?: number | null; raw_end_utf16?: number | null;
+    canonical_start_utf16?: number | null; canonical_end_utf16?: number | null;
     range_start_utf16?: number | null; range_end_utf16?: number | null;
-    offset_encoding?: string; locator_verified?: boolean; recognized_text?: string;
+    offset_encoding?: string; locator_verified?: boolean; source_locator_status?: string;
+    segment_count_total?: number; segment_count_located?: number; segment_count_confirmed?: number;
+    raw_fragment_sha256?: string; canonical_fragment_sha256?: string;
+    text_length_utf16?: number; recognized_text?: string;
     /** Local wheel anchors. */
     text_sha256?: string; previous_text_sha256?: string; next_text_sha256?: string; block_index?: number;
   }>;
+  binding?: {
+    host_text_contract_version?: string;
+    blocks: WheelBindingBlock[];
+  };
 }
 export interface LocalRecognitionTransport { recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan>; }
 export interface RecognitionProvider { recognize(snapshot: LocalDocumentSnapshot): Promise<RecognitionResult>; }
+
 const CONTRACT_TYPE_BY_WHEEL_TYPE: Record<string, RecognitionParagraph["recognized_type"]> = {
   title: "main_title", title_cont: "title_continuation", addressing: "recipient",
   sign_org: "signature_org", sign_date: "signature_date", responsibility_line: "body", note: "source_note",
@@ -36,61 +76,115 @@ async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
 }
+function isHash(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value); }
+function asRangeStart(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null; }
+function asRangeEnd(value: unknown, start: number | null): number | null { return typeof value === "number" && Number.isInteger(value) && start !== null && value > start ? value : null; }
+
+function unresolved(block: WheelRecognitionPlan["blocks"][number], reason: RecognitionResult["unresolved_blocks"] extends Array<infer T> | undefined ? T extends { reason: infer R } ? R : never : never) {
+  return {
+    block_index: Number(block.block_index ?? 0), recognized_type: contractType(block.type_id),
+    review_level: block.review_level, reason,
+  };
+}
+
+/**
+ * The wheel plan and the host snapshot are coupled only through its returned
+ * ``binding``. This adapter never uses a block index, first text occurrence,
+ * or source offset as an editor position.
+ */
 export class LocalWheelRecognitionProvider implements RecognitionProvider {
   constructor(private readonly transport: LocalRecognitionTransport) {}
+
   async recognize(snapshot: LocalDocumentSnapshot): Promise<RecognitionResult> {
     const plan = await this.transport.recognize(snapshot);
-    const occurrences = new Map<string, number>();
-    const hostParagraphs = await Promise.all(snapshot.paragraphs.map(async (source, position) => ({ source, position, hash: await sha256(source.text) })));
-    const byPhysicalHash = new Map<string, typeof hostParagraphs>();
-    for (const item of hostParagraphs) {
-      if (item.source.isInTable) continue;
-      const values = byPhysicalHash.get(item.hash) ?? [];
-      values.push(item); byPhysicalHash.set(item.hash, values);
+    if (plan.host_text_contract_version !== HOST_TEXT_CONTRACT_VERSION || plan.binding?.host_text_contract_version !== HOST_TEXT_CONTRACT_VERSION) {
+      throw new Error("HOST_TEXT_CONTRACT_MISMATCH");
     }
+    const bindings = new Map<number, WheelBindingBlock>();
+    for (const binding of plan.binding.blocks) bindings.set(binding.block_index, binding);
+    const hosts = new Map(snapshot.paragraphs.map((item) => [item.sourceParagraphIndex, item]));
+    const grouped = new Map<number, WheelRecognitionPlan["blocks"]>();
+    for (const block of plan.blocks) {
+      if (typeof block.physical_paragraph_index === "number") {
+        const values = grouped.get(block.physical_paragraph_index) ?? [];
+        values.push(block); grouped.set(block.physical_paragraph_index, values);
+      }
+    }
+    const groupComplete = new Map<number, boolean>();
+    for (const [physical, blocks] of grouped) {
+      const expected = Math.max(...blocks.map((item) => Number(item.segment_count_total ?? 1)));
+      const confirmed = blocks.filter((item) => bindings.get(Number(item.block_index ?? 0))?.binding_status === "confirmed").length;
+      groupComplete.set(physical, blocks.length === expected && confirmed === expected);
+    }
+
+    const occurrences = new Map<string, number>();
     const resolved: RecognitionParagraph[] = [];
-    const unresolved: NonNullable<RecognitionResult["unresolved_blocks"]> = [];
+    const unresolvedBlocks: NonNullable<RecognitionResult["unresolved_blocks"]> = [];
     for (const block of plan.blocks) {
       if (["table", "image", "letterhead"].includes(String(block.kind ?? "")) || block.source_paragraph_index === null) continue;
       const blockIndex = Number(block.block_index ?? 0);
+      const binding = bindings.get(blockIndex);
+      const sourceStart = asRangeStart(block.raw_start_utf16 ?? block.range_start_utf16);
+      const sourceEnd = asRangeEnd(block.raw_end_utf16 ?? block.range_end_utf16, sourceStart);
+      const sourceConfirmed = block.locator_verified === true && block.source_locator_status === "confirmed" && sourceStart !== null && sourceEnd !== null;
+      if (!sourceConfirmed) { unresolvedBlocks.push(unresolved(block, "RECOGNITION_LOCATOR_UNVERIFIED")); continue; }
+      if (!binding || binding.binding_status === "unresolved" || binding.host_paragraph_index === null || binding.host_paragraph_index === undefined) {
+        unresolvedBlocks.push(unresolved(block, "BINDING_NOT_CONFIRMED")); continue;
+      }
+      const host = hosts.get(binding.host_paragraph_index);
+      const start = asRangeStart(binding.host_raw_start_utf16);
+      const end = asRangeEnd(binding.host_raw_end_utf16, start);
+      const canonicalStart = asRangeStart(binding.host_canonical_start_utf16);
+      const canonicalEnd = asRangeEnd(binding.host_canonical_end_utf16, canonicalStart);
+      if (!host || host.isInTable || (host.storyType && host.storyType !== "main") || start === null || end === null || canonicalStart === null || canonicalEnd === null) {
+        unresolvedBlocks.push(unresolved(block, "BINDING_NOT_CONFIRMED")); continue;
+      }
+      const fragment = rawSliceUtf16(host.text, start, end);
+      const tape = createHostTextTape(host.text);
+      const canonicalFragment = rawSliceUtf16(tape.canonicalText, canonicalStart, canonicalEnd);
+      const fragmentHash = fragment === null ? "" : await sha256(fragment);
+      const canonicalHash = canonicalFragment === null ? "" : await sha256(canonicalFragment);
+      const rawVerified = isHash(block.raw_fragment_sha256) && fragmentHash === block.raw_fragment_sha256;
+      const canonicalVerified = isHash(block.canonical_fragment_sha256) && canonicalHash === block.canonical_fragment_sha256;
+      if ((binding.binding_status === "confirmed" && !rawVerified) || (binding.binding_status === "review" && !canonicalVerified)) {
+        unresolvedBlocks.push(unresolved(block, "BINDING_NOT_CONFIRMED")); continue;
+      }
+      const physical = Number(block.physical_paragraph_index);
+      const total = Math.max(1, Number(block.segment_count_total ?? 1));
+      const complete = groupComplete.get(physical) === true;
+      const mixed = total > 1 || start !== 0 || end !== host.text.length;
+      const disposition = binding.binding_status === "confirmed" && complete && !mixed ? "apply" : "review_only";
       const type = contractType(block.type_id);
-      const physicalHash = String(block.physical_text_sha256 ?? "").toLowerCase();
-      const blockHash = String(block.text_sha256 ?? "").toLowerCase();
-      const start = Number(block.range_start_utf16); const end = Number(block.range_end_utf16);
-      const occurrenceInPhysical = Number(block.physical_occurrence_index ?? 0);
-      const locatorShapeValid = block.locator_verified === true && block.offset_encoding === "utf16_code_unit" && /^[a-f0-9]{64}$/.test(physicalHash) && /^[a-f0-9]{64}$/.test(blockHash) && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end > start && Number.isInteger(occurrenceInPhysical) && occurrenceInPhysical >= 0;
-      if (!locatorShapeValid) { unresolved.push({ block_index: blockIndex, recognized_type: type, review_level: block.review_level, reason: "RECOGNITION_LOCATOR_UNVERIFIED" }); continue; }
-      const candidates = byPhysicalHash.get(physicalHash) ?? [];
-      const selected = candidates[occurrenceInPhysical];
-      if (!selected) { unresolved.push({ block_index: blockIndex, recognized_type: type, review_level: block.review_level, reason: candidates.length > 0 ? "RECOGNITION_LOCATOR_AMBIGUOUS" : "RECOGNITION_LOCATOR_UNVERIFIED" }); continue; }
-      const selectedText = selected.source.text.slice(start, end);
-      const selectedHash = await sha256(selectedText);
-      if (selectedHash !== blockHash || (typeof block.recognized_text === "string" && selectedText !== block.recognized_text)) { unresolved.push({ block_index: blockIndex, recognized_type: type, review_level: block.review_level, reason: "RECOGNITION_LOCATOR_UNVERIFIED" }); continue; }
-      const occurrence = occurrences.get(blockHash) ?? 0; occurrences.set(blockHash, occurrence + 1);
+      const occurrence = occurrences.get(fragmentHash) ?? 0; occurrences.set(fragmentHash, occurrence + 1);
       resolved.push({
-        target_id: `${snapshot.documentId}:p:${selected.source.sourceParagraphIndex}:r:${start}:${end}:${blockIndex}`,
-        source_paragraph_index: selected.source.sourceParagraphIndex, physical_paragraph_index: Number(block.physical_paragraph_index ?? block.source_paragraph_index),
-        recognized_type: type, section_kind: contractSection(block.section), text_sha256: blockHash,
-        physical_text_sha256: physicalHash, range_start_utf16: start, range_end_utf16: end, locator_verified: true,
-        text_length: selectedText.length, occurrence_index: occurrence,
-        confidence: block.review_level === "confirmed" ? 1 : block.review_level === "info" ? 0.8 : 0.5,
-        review_level: block.review_level, needs_review: block.review_level === "review" || block.review_level === "critical_review",
-        mixed_structure: false, formatting_disposition: "apply",
+        target_id: `${snapshot.documentId}:host:${host.sourceParagraphIndex}:r:${start}:${end}:${blockIndex}`,
+        source_paragraph_index: host.sourceParagraphIndex,
+        physical_paragraph_index: physical,
+        host_paragraph_index: host.sourceParagraphIndex,
+        host_raw_start_utf16: start, host_raw_end_utf16: end,
+        host_raw_text_sha256: await sha256(host.text),
+        recognized_type: type, section_kind: contractSection(block.section),
+        text_sha256: fragmentHash, physical_text_sha256: String(block.physical_text_sha256 ?? ""),
+        range_start_utf16: sourceStart, range_end_utf16: sourceEnd, locator_verified: true,
+        text_length: fragment!.length, occurrence_index: occurrence,
+        confidence: binding.binding_status === "confirmed" ? 1 : 0.8,
+        review_level: binding.binding_status === "review" ? "review" : block.review_level,
+        needs_review: binding.binding_status !== "confirmed" || disposition !== "apply" || block.review_level === "review" || block.review_level === "critical_review",
+        mixed_structure: mixed, formatting_disposition: disposition,
+        host_text_contract_version: HOST_TEXT_CONTRACT_VERSION,
+        host_canonical_start_utf16: canonicalStart, host_canonical_end_utf16: canonicalEnd,
+        binding_status: binding.binding_status, binding_confidence: binding.binding_confidence,
+        segment_count_total: total,
+        segment_count_located: Math.max(1, Number(block.segment_count_located ?? total)),
+        segment_count_confirmed: Math.max(1, Number(block.segment_count_confirmed ?? (complete ? total : 1))),
       });
-    }
-    const byHostParagraph = new Map<number, RecognitionParagraph[]>();
-    for (const item of resolved) { const values = byHostParagraph.get(item.source_paragraph_index) ?? []; values.push(item); byHostParagraph.set(item.source_paragraph_index, values); }
-    for (const [sourceIndex, values] of byHostParagraph) {
-      const source = snapshot.paragraphs.find((item) => item.sourceParagraphIndex === sourceIndex);
-      const mixed = values.length > 1 || values.some((item) => item.range_start_utf16 !== 0 || item.range_end_utf16 !== (source?.text.length ?? -1));
-      if (mixed) for (const item of values) { item.mixed_structure = true; item.formatting_disposition = "review_only"; item.needs_review = true; }
     }
     return {
       schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: plan.engine_version,
       document_id: snapshot.documentId, document_revision: snapshot.revision,
       source_sha256: snapshot.sourceSha256, document_mode: plan.document_mode,
       document_mode_confidence: plan.document_mode_confidence, paragraphs: resolved,
-      ...(unresolved.length ? { unresolved_blocks: unresolved } : {}),
+      ...(unresolvedBlocks.length ? { unresolved_blocks: unresolvedBlocks } : {}),
     };
   }
 }
@@ -107,10 +201,24 @@ export class HttpLocalRecognitionTransport implements LocalRecognitionTransport 
     const response = await fetch(new URL("v1/recognize", this.endpoint.toString().replace(/\/?$/, "/")), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Docxtool-Session": this.sessionToken },
-      body: JSON.stringify({ source_path: snapshot.localDocxPath }),
+      body: JSON.stringify({
+        source_path: snapshot.localDocxPath,
+        host_snapshot: {
+          host_type: "wps",
+          document_identity: snapshot.documentId,
+          document_revision: snapshot.revision,
+          text_contract_version: HOST_TEXT_CONTRACT_VERSION,
+          paragraphs: snapshot.paragraphs.map((item) => ({
+            host_paragraph_index: item.sourceParagraphIndex,
+            raw_text: item.text,
+            story_type: item.storyType ?? "main",
+            is_in_table: Boolean(item.isInTable),
+          })),
+        },
+      }),
     });
-    const payload = await response.json() as { data?: WheelRecognitionPlan; error?: { code?: string } };
-    if (!response.ok || !payload.data) throw new Error(payload.error?.code || "RECOGNITION_FAILED");
-    return payload.data;
+    const payload = await response.json() as { data?: WheelRecognitionPlan; binding?: WheelRecognitionPlan["binding"]; error?: { code?: string } };
+    if (!response.ok || !payload.data || !payload.binding) throw new Error(payload.error?.code || "RECOGNITION_FAILED");
+    return { ...payload.data, binding: payload.binding };
   }
 }
