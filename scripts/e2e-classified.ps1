@@ -3,15 +3,49 @@ param([ValidateSet("prepare", "status", "stop", "report", "auto")][string]$Actio
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtime = Join-Path $root ".runtime\e2e"
+$diagnosticLog = Join-Path $root "wps-plugin-debug.log"
 $python = Join-Path $root ".venv\Scripts\python.exe"
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $staticPort = 3889; $agentPort = 9528; $remoteDebugPort = 9222
+$script:DiagnosticToken = ""
+$script:PendingDiagnosticEvents = @()
+
+function Flush-DiagnosticEvents {
+  if ([string]::IsNullOrWhiteSpace($script:DiagnosticToken) -or $script:PendingDiagnosticEvents.Count -eq 0) { return }
+  while ($script:PendingDiagnosticEvents.Count -gt 0) {
+    $batch = @($script:PendingDiagnosticEvents | Select-Object -First 100)
+    $payload = @{ schema_version=1; source="host"; events=$batch } | ConvertTo-Json -Compress -Depth 12
+    try {
+      $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Method Post -ContentType "application/json" -Headers @{ "X-Docxtool-Session"=$script:DiagnosticToken } -Body $payload "http://127.0.0.1:$agentPort/v1/diagnostics/logs"
+      $script:PendingDiagnosticEvents = @($script:PendingDiagnosticEvents | Select-Object -Skip $batch.Count)
+    } catch { return }
+  }
+}
+function Write-DiagnosticEvent {
+  param([string]$Level, [string]$Event, [string]$Message, [hashtable]$Data = @{})
+  $script:PendingDiagnosticEvents += [ordered]@{
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    level = $Level
+    component = "launcher"
+    event = $Event
+    message = $Message
+    data = $Data
+  }
+  if ($script:PendingDiagnosticEvents.Count -gt 500) { $script:PendingDiagnosticEvents = @($script:PendingDiagnosticEvents | Select-Object -Last 500) }
+  Flush-DiagnosticEvents
+}
 
 function Test-Health([int]$Port) {
   try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$Port/v1/health").StatusCode -eq 200 } catch { return $false }
 }
 function Test-Static {
   try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$staticPort/index.html").StatusCode -eq 200 } catch { return $false }
+}
+function Test-DiagnosticStatus {
+  try {
+    $value = Invoke-RestMethod -TimeoutSec 2 "http://127.0.0.1:$agentPort/v1/diagnostics/status"
+    return $value.ok -eq $true -and $value.file_name -eq "wps-plugin-debug.log"
+  } catch { return $false }
 }
 function Test-SessionToken([int]$Port, [string]$Path, [string]$Token) {
   if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
@@ -77,9 +111,12 @@ function Stop-ManagedPort([int]$Port) {
 }
 
 if ($Action -eq "prepare") {
+  Write-DiagnosticEvent "INFO" "launcher.prepare.start" "开始准备 WPS 本地验收环境"
   if (-not (Test-Path -LiteralPath $python)) { throw "E2E_PYTHON_NOT_FOUND" }
   & $python --version | Out-Null; & node --version | Out-Null; & $npm exec -- wpsjs --version | Out-Null
+  Write-DiagnosticEvent "INFO" "launcher.build.start" "开始构建并校验涉密版加载项"
   & $npm run build | Out-Null; & $npm run build:classified | Out-Null; & $npm run verify:addin -- classified-offline | Out-Null
+  Write-DiagnosticEvent "INFO" "launcher.build.success" "涉密版加载项构建与静态校验通过"
   New-Item -ItemType Directory -Force -Path $runtime | Out-Null
   & $python (Join-Path $root "scripts\generate-e2e-fixture.py")
   $sessionId = [Guid]::NewGuid().ToString("N")
@@ -94,29 +131,37 @@ if ($Action -eq "prepare") {
   $tokenFile = Join-Path $runtime "session-token.txt"
   $token = if (Test-Path -LiteralPath $tokenFile) { (Get-Content -Raw -LiteralPath $tokenFile).Trim() } else { "" }
   if ($token -notmatch '^[a-f0-9]{32}$') { $token = [Guid]::NewGuid().ToString("N") }
-  $servicesUseToken = (Test-Health $agentPort) -and (Test-SessionToken $agentPort "/v1/recognize" $token) -and (Test-SessionToken $agentPort "/v1/commands" $token)
+  $script:DiagnosticToken = $token
+  $servicesUseToken = (Test-Health $agentPort) -and (Test-SessionToken $agentPort "/v1/recognize" $token) -and (Test-SessionToken $agentPort "/v1/commands" $token) -and (Test-DiagnosticStatus)
   if (-not $servicesUseToken) {
     Stop-ManagedPort $agentPort
-    $null = Start-Managed "local-agent" $python @("-m", "docxtool_local_agent", "--port", "$agentPort", "--session-token", $token, "--e2e-runtime", $runtime)
+    $null = Start-Managed "local-agent" $python @("-m", "docxtool_local_agent", "--port", "$agentPort", "--session-token", $token, "--e2e-runtime", $runtime, "--diagnostic-log-file", $diagnosticLog)
   }
+  Write-DiagnosticEvent "INFO" "launcher.local_agent.start" "本地统一服务已启动或复用" @{ restarted=(-not $servicesUseToken); port=$agentPort }
   Set-Content -NoNewline -Encoding ascii -LiteralPath $tokenFile -Value $token
   $runtimeScript = Join-Path $root "apps\classified-offline\ui\e2e-session.js"
-  ('window.DocxtoolRuntimeConfig=' + (@{ recognitionEndpoint="http://127.0.0.1:$agentPort"; commandEndpoint="http://127.0.0.1:$agentPort"; sessionToken=$token } | ConvertTo-Json -Compress) + ';') | Set-Content -Encoding utf8 $runtimeScript
+  ('window.DocxtoolRuntimeConfig=' + (@{ recognitionEndpoint="http://127.0.0.1:$agentPort"; commandEndpoint="http://127.0.0.1:$agentPort"; sessionToken=$token } | ConvertTo-Json -Compress) + ';if(typeof window.DocxtoolEarlyLog==="function"){window.DocxtoolEarlyLog("DEBUG","main","bootstrap.script.loaded","运行时配置脚本已执行",{asset:"ui/e2e-session.js",endpoint_origin:"http://127.0.0.1:' + $agentPort + '"});}') | Set-Content -Encoding utf8 $runtimeScript
   $publish = Join-Path $env:APPDATA "kingsoft\wps\jsaddons\publish.xml"
   $registeredAtFixedPort = (Test-Path -LiteralPath $publish) -and ((Get-Content -Raw -LiteralPath $publish) -match 'name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:3889/')
-  if (-not ((Test-Static) -and $registeredAtFixedPort)) {
+  $restartWpsjs = -not ((Test-Static) -and $registeredAtFixedPort)
+  if ($restartWpsjs) {
     Stop-ManagedPort $staticPort
     $logs = Join-Path $runtime "logs"; New-Item -ItemType Directory -Force -Path $logs | Out-Null
     $debug = Start-Process -FilePath "npx.cmd" -ArgumentList @("--no-install", "wpsjs", "debug", "-p", "$staticPort", "-d", "-r", "$remoteDebugPort") -WorkingDirectory (Join-Path $root "apps\classified-offline") -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "wpsjs.out.log") -RedirectStandardError (Join-Path $logs "wpsjs.err.log") -PassThru
     $null = $debug
   }
-  for ($i = 0; $i -lt 30 -and (-not ((Test-Static) -and (Test-Health $agentPort))); $i++) { Start-Sleep -Milliseconds 500 }
+  Write-DiagnosticEvent "INFO" "launcher.wpsjs.start" "WPS 静态资源服务已启动或复用" @{ restarted=$restartWpsjs; port=$staticPort }
+  for ($i = 0; $i -lt 30 -and (-not ((Test-Static) -and (Test-Health $agentPort) -and (Test-DiagnosticStatus))); $i++) { Start-Sleep -Milliseconds 500 }
+  Flush-DiagnosticEvents
+  $registrationReady = (Test-Path -LiteralPath $publish) -and ((Get-Content -Raw -LiteralPath $publish) -match 'name="docxtool-classified-offline"[^>]+url="http://127\.0\.0\.1:3889/')
+  Write-DiagnosticEvent "INFO" "launcher.registration.checked" "WPS 加载项注册状态已检查" @{ registered=$registrationReady }
   $processes = @()
   foreach ($entry in @(@{name="local-service";port=$agentPort}, @{name="wpsjs";port=$staticPort})) {
     $processId = Get-NetTCPConnection -State Listen -LocalPort $entry.port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -First 1
     if ($processId) { $processes += [pscustomobject]@{ name=$entry.name; pid=$processId } }
   }
   $processes | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $runtime "processes.json")
+  Write-DiagnosticEvent "INFO" "launcher.prepare.ready" "WPS 本地验收环境已就绪" @{ static_port=$staticPort; agent_port=$agentPort; diagnostics_ready=(Test-DiagnosticStatus) }
   Show-Status
   Write-Output "E2E_SESSION_READY $sessionId"
   exit
@@ -174,6 +219,10 @@ if ($Action -eq "auto") {
   exit
 }
 if ($Action -eq "stop") {
+  $tokenFile = Join-Path $runtime "session-token.txt"
+  if (Test-Path -LiteralPath $tokenFile) { $script:DiagnosticToken = (Get-Content -Raw -LiteralPath $tokenFile).Trim() }
+  Write-DiagnosticEvent "INFO" "launcher.stop" "停止 WPS 本地验收托管进程"
+  Flush-DiagnosticEvents
   $path = Join-Path $runtime "processes.json"
   if (Test-Path -LiteralPath $path) {
     $items = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json

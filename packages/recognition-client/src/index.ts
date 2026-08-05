@@ -9,6 +9,7 @@ import {
   createHostTextTape,
   rawSliceUtf16,
 } from "../../wps-adapter/src/host-text.js";
+import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 
 export interface LocalHostParagraph {
   sourceParagraphIndex: number;
@@ -190,7 +191,7 @@ export class LocalWheelRecognitionProvider implements RecognitionProvider {
 }
 
 export class HttpLocalRecognitionTransport implements LocalRecognitionTransport {
-  constructor(private readonly endpoint: URL, private readonly sessionToken: string) {
+  constructor(private readonly endpoint: URL, private readonly sessionToken: string, private readonly diagnostics?: DiagnosticReporter) {
     if (endpoint.protocol !== "http:" || (endpoint.hostname !== "127.0.0.1" && endpoint.hostname !== "::1")) {
       throw new Error("RECOGNITION_ENDPOINT_MUST_BE_LOOPBACK");
     }
@@ -198,10 +199,8 @@ export class HttpLocalRecognitionTransport implements LocalRecognitionTransport 
 
   async recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan> {
     if (!snapshot.localDocxPath) throw new Error("DOCUMENT_MUST_BE_SAVED");
-    const response = await fetch(new URL("v1/recognize", this.endpoint.toString().replace(/\/?$/, "/")), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Docxtool-Session": this.sessionToken },
-      body: JSON.stringify({
+    const endpoint = new URL("v1/recognize", this.endpoint.toString().replace(/\/?$/, "/"));
+    const body = JSON.stringify({
         source_path: snapshot.localDocxPath,
         host_snapshot: {
           host_type: "wps",
@@ -215,10 +214,23 @@ export class HttpLocalRecognitionTransport implements LocalRecognitionTransport 
             is_in_table: Boolean(item.isInTable),
           })),
         },
-      }),
-    });
-    const payload = await response.json() as { data?: WheelRecognitionPlan; binding?: WheelRecognitionPlan["binding"]; error?: { code?: string } };
-    if (!response.ok || !payload.data || !payload.binding) throw new Error(payload.error?.code || "RECOGNITION_FAILED");
-    return { ...payload.data, binding: payload.binding };
+      });
+    const started = Date.now();
+    const base = { endpoint_origin: endpoint.origin, endpoint_path: endpoint.pathname, method: "POST", request_size_bytes: new TextEncoder().encode(body).byteLength, paragraph_count: snapshot.paragraphs.length };
+    this.diagnostics?.writeForComponent("recognition-client", "INFO", "recognition.request.start", "开始请求本地识别服务", base);
+    try {
+      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", "X-Docxtool-Session": this.sessionToken }, body });
+      const raw = await response.text();
+      const responseSize = new TextEncoder().encode(raw).byteLength;
+      this.diagnostics?.writeForComponent("recognition-client", response.ok ? "INFO" : "WARN", "recognition.request.response", "本地识别服务已响应", { ...base, response_size_bytes: responseSize, status_code: response.status, duration_ms: Date.now() - started });
+      let payload: { data?: WheelRecognitionPlan; binding?: WheelRecognitionPlan["binding"]; error?: { code?: string } };
+      try { payload = JSON.parse(raw) as typeof payload; }
+      catch { throw new Error(response.ok ? "RECOGNITION_INVALID_JSON" : `RECOGNITION_${response.status}`); }
+      if (!response.ok || !payload.data || !payload.binding) throw new Error(payload.error?.code || "RECOGNITION_FAILED");
+      return { ...payload.data, binding: payload.binding };
+    } catch (error) {
+      this.diagnostics?.writeForComponent("recognition-client", "ERROR", "recognition.request.failed", "本地识别请求失败", { ...base, duration_ms: Date.now() - started }, error);
+      throw error;
+    }
   }
 }

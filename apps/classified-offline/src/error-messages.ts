@@ -1,5 +1,5 @@
 const ERROR_MESSAGES: Record<string, string> = {
-  DOCUMENT_MUST_BE_SAVED: "当前文档尚未保存。请先在 WPS 中保存为本地 DOCX 文件，再点击预览排版或一键排版。",
+  DOCUMENT_MUST_BE_SAVED: "当前文档尚未保存。请先在 WPS 中保存为本地 .docx 文件，再点击预览排版或一键排版。",
   DOCUMENT_NOT_DOCX: "当前文档不是 DOCX 格式。请另存为 .docx 后再使用本插件。",
   NO_ACTIVE_DOCUMENT: "没有检测到当前活动文档。请先打开一个 DOCX 文档。",
   ACTIVE_DOCUMENT_NOT_FOUND: "没有检测到当前活动文档。请先打开一个 DOCX 文档。",

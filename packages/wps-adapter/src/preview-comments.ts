@@ -1,6 +1,7 @@
 import type { FormattingCommandSet, RecognitionResult } from "../../contracts/src/index.js";
 import type { PreviewCommentResult, PreviewCommentService, PreviewDisplayMode, PreviewMutationTracker } from "../../application/src/ports.js";
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
+import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
 
 type WpsObject = Record<string, any>;
@@ -105,7 +106,10 @@ export class CommentPreviewCapabilityProvider {
 }
 
 export class WpsPreviewCommentService implements PreviewCommentService {
+  constructor(private readonly diagnostics?: DiagnosticReporter) {}
   async addPreviewComments(input: { snapshot: LocalDocumentSnapshot; recognition: RecognitionResult; commands: FormattingCommandSet; mode: PreviewDisplayMode }): Promise<PreviewCommentResult> {
+    const started = Date.now();
+    this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.write.start", "开始写入 WPS 预览批注", { recognition_paragraph_count: input.recognition.paragraphs.length, formatting_command_count: input.commands.commands.length });
     const document = app().ActiveDocument as WpsObject; const comments = collection(document); const session = crypto.randomUUID().replace(/-/g, "");
     const userFingerprint = userCommentFingerprint(comments);
     const created: string[] = []; const commandsByTarget = new Map<string, FormattingCommandSet["commands"]>();
@@ -140,22 +144,42 @@ export class WpsPreviewCommentService implements PreviewCommentService {
         if (!comment) throw new Error("PREVIEW_COLOR_ASSIGNMENT_FAILED");
         comment.Author = previewAuthor(item.recognized_type); comment.Initial = previewInitial(item.recognized_type);
         if (String(comment.Author ?? "") !== previewAuthor(item.recognized_type)) throw new Error("PREVIEW_COLOR_ASSIGNMENT_FAILED");
+        this.diagnostics?.writeForComponent("wps-preview-comments", "DEBUG", "preview.comment.write.item", "单条 WPS 预览批注写入完成", { source_paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, command_count: (commandsByTarget.get(item.target_id) ?? []).length, write_result: "PASS" });
       }
     } catch (error) {
       if (created.length) await this.removePreviewComments(tracker()).catch(() => undefined);
+      this.diagnostics?.writeForComponent("wps-preview-comments", "ERROR", "preview.comment.write.failed", "WPS 预览批注写入失败", { preview_comment_count: created.length, duration_ms: Date.now() - started }, error);
       throw error;
     }
     const finalTracker = tracker();
+    this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.write.success", "WPS 预览批注写入完成", { preview_comment_count: created.length, duration_ms: Date.now() - started });
     return { tracker: finalTracker, comment_count: created.length, unsupported: false, warnings: [] };
   }
   async removePreviewComments(tracker: PreviewMutationTracker): Promise<void> {
-    const document = app().ActiveDocument as WpsObject; const comments = collection(document); const count = Number(comments.Count ?? 0);
-    for (let index = count; index >= 1; index -= 1) { const item = comments.Item(index) as WpsObject; if (ownsComment(document, item, tracker)) item.Delete(); }
-    const state = await this.verifyPreviewComments(tracker); if (state.comment_count !== 0 || !state.user_comment_integrity) throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED");
+    const started = Date.now();
+    this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.cleanup.start", "开始清理 Docxtool 预览批注", {});
+    try {
+      const document = app().ActiveDocument as WpsObject; const comments = collection(document); const count = Number(comments.Count ?? 0);
+      for (let index = count; index >= 1; index -= 1) { const item = comments.Item(index) as WpsObject; if (ownsComment(document, item, tracker)) item.Delete(); }
+      const state = await this.verifyPreviewComments(tracker); if (state.comment_count !== 0 || !state.user_comment_integrity) throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED");
+      this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.cleanup.success", "Docxtool 预览批注清理完成", { remaining_preview_comment_count: state.comment_count, user_comment_integrity: state.user_comment_integrity, duration_ms: Date.now() - started });
+    } catch (error) {
+      this.diagnostics?.writeForComponent("wps-preview-comments", "ERROR", "preview.comment.cleanup.failed", "Docxtool 预览批注清理失败", { duration_ms: Date.now() - started }, error);
+      throw error;
+    }
   }
   async verifyPreviewComments(tracker: PreviewMutationTracker): Promise<{ comment_count: number; user_comment_integrity: boolean }> {
-    const document = app().ActiveDocument as WpsObject; const comments = collection(document); let count = 0;
-    for (let index = 1; index <= Number(comments.Count ?? 0); index += 1) if (ownsComment(document, comments.Item(index) as WpsObject, tracker)) count += 1;
-    return { comment_count: count, user_comment_integrity: userCommentFingerprint(comments, (comment) => ownsComment(document, comment, tracker)) === tracker.user_comment_fingerprint };
+    const started = Date.now();
+    this.diagnostics?.writeForComponent("wps-preview-comments", "DEBUG", "preview.comment.readback.start", "开始读回 WPS 预览批注", {});
+    try {
+      const document = app().ActiveDocument as WpsObject; const comments = collection(document); let count = 0;
+      for (let index = 1; index <= Number(comments.Count ?? 0); index += 1) if (ownsComment(document, comments.Item(index) as WpsObject, tracker)) count += 1;
+      const result = { comment_count: count, user_comment_integrity: userCommentFingerprint(comments, (comment) => ownsComment(document, comment, tracker)) === tracker.user_comment_fingerprint };
+      this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.readback.success", "WPS 预览批注读回完成", { preview_comment_count: result.comment_count, user_comment_integrity: result.user_comment_integrity, duration_ms: Date.now() - started });
+      return result;
+    } catch (error) {
+      this.diagnostics?.writeForComponent("wps-preview-comments", "ERROR", "preview.comment.readback.failed", "WPS 预览批注读回失败", { duration_ms: Date.now() - started }, error);
+      throw error;
+    }
   }
 }

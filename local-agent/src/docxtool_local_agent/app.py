@@ -3,8 +3,12 @@
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import time
+import traceback
+import uuid
 
 from docx import Document
 
@@ -21,11 +25,13 @@ from docxtool.sdk import (
 from docxtool_command_service.core.command_builder import build_formatting_commands
 from docxtool_command_service.core.validation import CommandServiceError
 from .snapshot import build_host_snapshot
+from .diagnostics import DiagnosticLogWriter, validate_batch
 
 
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_RECOGNITION_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_COMMAND_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_DIAGNOSTIC_REQUEST_BYTES = 512 * 1024
 DEVELOPMENT_ORIGIN = "http://127.0.0.1:3889"
 
 
@@ -135,9 +141,15 @@ def _host_snapshot(value):
     )
 
 
-def create_app(session_token, e2e_runtime=None):
+def create_app(session_token, e2e_runtime=None, diagnostic_log_file=None):
     """Return the single loopback API used by the classified WPS add-in."""
-    def app(environ, start_response):
+    diagnostic_writer = (
+        DiagnosticLogWriter(diagnostic_log_file)
+        if diagnostic_log_file
+        else None
+    )
+
+    def _handle_request(environ, start_response):
         method = environ.get("REQUEST_METHOD", "")
         path = environ.get("PATH_INFO", "")
         origin = environ.get("HTTP_ORIGIN", "")
@@ -153,6 +165,48 @@ def create_app(session_token, e2e_runtime=None):
                 "locator_version": SOURCE_LOCATOR_VERSION,
                 "host_text_contract_version": HOST_TEXT_CONTRACT_VERSION,
             }, origin)
+        if method == "GET" and path == "/v1/diagnostics/status":
+            if not diagnostic_writer:
+                return _response(start_response, "503 Service Unavailable", {
+                    "ok": False,
+                    "error_code": "DIAGNOSTIC_LOG_NOT_CONFIGURED",
+                }, origin)
+            return _response(start_response, "200 OK", {
+                "ok": True,
+                **diagnostic_writer.path_info(),
+            }, origin)
+        if method == "POST" and path == "/v1/diagnostics/logs":
+            if not diagnostic_writer:
+                return _response(start_response, "503 Service Unavailable", {
+                    "ok": False,
+                    "error_code": "DIAGNOSTIC_LOG_NOT_CONFIGURED",
+                }, origin)
+            if environ.get("HTTP_X_DOCXTOOL_SESSION", "") != session_token:
+                return _response(start_response, "401 Unauthorized", {
+                    "ok": False,
+                    "error_code": "UNAUTHORIZED",
+                }, origin)
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+                if length <= 0 or length > MAX_DIAGNOSTIC_REQUEST_BYTES:
+                    raise ValueError("DIAGNOSTIC_BATCH_TOO_LARGE")
+                payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+                events = validate_batch(payload)
+                diagnostic_writer.append(events)
+                return _response(start_response, "200 OK", {
+                    "ok": True,
+                    "accepted": len(events),
+                }, origin)
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+                TypeError,
+            ) as exc:
+                return _response(start_response, "400 Bad Request", {
+                    "ok": False,
+                    "error_code": str(exc),
+                }, origin)
         if method == "GET" and path == "/v1/handshake":
             try:
                 return _response(start_response, "200 OK", _recognition_handshake(), origin)
@@ -262,4 +316,75 @@ def create_app(session_token, e2e_runtime=None):
             return _response(start_response, "400 Bad Request", {
                 "error": {"code": "INVALID_REQUEST"},
             }, origin)
+    def app(environ, start_response):
+        started = time.monotonic()
+        request_id = "local-{}".format(uuid.uuid4().hex[:12])
+        method = str(environ.get("REQUEST_METHOD", ""))
+        path = str(environ.get("PATH_INFO", ""))
+        origin = str(environ.get("HTTP_ORIGIN", ""))
+        content_length = str(environ.get("CONTENT_LENGTH", "0") or "0")
+        safe_length = int(content_length) if content_length.isdigit() else 0
+        base_data = {
+            "request_id": request_id,
+            "method": method,
+            "endpoint_path": path,
+            "content_length": safe_length,
+            "origin_allowed": not origin or origin == DEVELOPMENT_ORIGIN,
+        }
+        quiet = method == "OPTIONS" or path == "/v1/health"
+        if diagnostic_writer:
+            diagnostic_writer.append([{
+                "timestamp": datetime_now(),
+                "level": "TRACE" if quiet else "DEBUG",
+                "component": "local-agent",
+                "event": "local_agent.request.received",
+                "message": "本地请求已接收",
+                "request_id": request_id,
+                "data": base_data,
+            }])
+        captured = {"status": "500 Internal Server Error"}
+
+        def capture_start(status, headers, exc_info=None):
+            captured["status"] = status
+            return start_response(status, headers, exc_info) if exc_info else start_response(status, headers)
+
+        try:
+            response = _handle_request(environ, capture_start)
+            if diagnostic_writer:
+                status_code = int(str(captured["status"]).split(" ", 1)[0])
+                level = "TRACE" if quiet else "WARN" if status_code == 401 else "ERROR" if status_code >= 500 else "DEBUG"
+                diagnostic_writer.append([{
+                    "timestamp": datetime_now(),
+                    "level": level,
+                    "component": "local-agent",
+                    "event": "local_agent.request.completed",
+                    "message": "本地请求已完成",
+                    "request_id": request_id,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    "data": {**base_data, "status": status_code},
+                }])
+            return response
+        except Exception as exc:
+            if diagnostic_writer:
+                diagnostic_writer.append([{
+                    "timestamp": datetime_now(),
+                    "level": "ERROR",
+                    "component": "local-agent",
+                    "event": "local_agent.request.failed",
+                    "message": "本地请求发生未处理异常",
+                    "request_id": request_id,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    "error": {
+                        "name": type(exc).__name__,
+                        "message": str(exc),
+                        "stack": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    },
+                    "data": base_data,
+                }])
+            raise
+
     return app
+
+
+def datetime_now():
+    return datetime.now(timezone.utc).isoformat()

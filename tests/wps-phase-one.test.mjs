@@ -577,7 +577,8 @@ test("add-in main context loads the host router independently from the taskpane"
   const main = await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8");
   const taskpane = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
   const hostRuntime = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
-  assert.match(main, /dist\/host-runtime\.js/); assert.equal(main.includes("type='module'"), false);
+  assert.match(main, /<script type='module' src='/);
+  assert.match(main, /DocxtoolVersionedAsset\("dist\/host-runtime\.js"\)/);
   assert.equal(taskpane.includes("createClassifiedProductionComposition"), false);
   assert.equal(taskpane.includes("FormatDocumentUseCase"), false);
   assert.match(hostRuntime, /setInterval\(tryInstall,\s*250\)/);
@@ -616,6 +617,31 @@ test("HostCommandRouter toggles a pane without a taskpane window and rejects unk
   await assert.rejects(() => router.dispatch("not_registered"), /UNKNOWN_HOST_COMMAND/);
 });
 
+test("HostCommandRouter logs the original stack while HostState keeps only the stable error", async () => {
+  const mocks = hostMocks();
+  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
+  const store = new HostResultStore(mocks.storage, build, "host-a");
+  const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
+  const router = new HostCommandRouter(mocks.application, panes, store, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9528", sessionToken: "fixture" });
+  const events = [];
+  const previous = globalThis.DocxtoolDiagnosticLog;
+  globalThis.DocxtoolDiagnosticLog = (...values) => events.push(values);
+  try {
+    const result = await router.dispatch("toggle_taskpane", "taskpane", "request-error", "stale-build");
+    assert.equal(result.status, "FAIL");
+    assert.equal(result.error_code, "ADDIN_CONTEXT_STALE");
+    const failed = events.find((values) => values[2] === "host.router.dispatch.failed");
+    assert.ok(failed);
+    assert.match(failed[5].stack, /ADDIN_CONTEXT_STALE/);
+    const publicState = mocks.storage.getItem("docxtool_classified_host_result_v1");
+    assert.equal(publicState.includes("stack"), false);
+    assert.equal(JSON.parse(publicState).latest_error, "ADDIN_CONTEXT_STALE");
+  } finally {
+    if (previous) globalThis.DocxtoolDiagnosticLog = previous;
+    else delete globalThis.DocxtoolDiagnosticLog;
+  }
+});
+
 test("HostCommandRouter isolates stored results after an active-document switch", async () => {
   const mocks = hostMocks(); mocks.application.ActiveDocument = { FullName: "C:\\one.docx", Paragraphs: { Count: 2 } };
   const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" }; const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane"); const router = new HostCommandRouter(mocks.application, panes, store, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "x" });
@@ -633,8 +659,12 @@ test("document switch clears the old preview tracker without deleting comments f
 
 test("taskpane close button uses the host bridge and CSS stays inside its webview", async () => {
   const html = await readFile(new URL("../apps/classified-offline/ui/taskpane-development.html", import.meta.url), "utf8");
+  const productionHtml = await readFile(new URL("../apps/classified-offline/ui/taskpane.html", import.meta.url), "utf8");
   const workflow = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
   assert.match(html, /id="close-taskpane"/); assert.match(html, /aria-label="关闭任务窗格"/); assert.match(workflow, /GetTaskPane\(Number\(saved\)\)/); assert.match(workflow, /pane\.Visible = false/);
+  assert.match(html, /import\("\/dist\/taskpane-workflow\.js\?v="/);
+  assert.match(productionHtml, /import\("\.\.\/taskpane-workflow\.js\?v="/);
+  assert.match(html, /DocxtoolTaskpaneBuild/); assert.match(productionHtml, /DocxtoolTaskpaneBuild/);
   assert.equal(/position\s*:\s*fixed|z-index|pointer-capture|focus-trap/i.test(html), false);
 });
 
@@ -652,6 +682,58 @@ test("classified Ribbon exposes exactly preview, apply and health in the require
   for (const removed of ["仅识别", "打开任务窗格", "关闭任务窗格", "关于"]) assert.equal(xml.includes(removed), false);
 });
 
+test("production ribbon dispatches preview directly to host router", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8");
+  assert.equal(source.includes("dispatchEvent"), false);
+  assert.equal(source.includes("CustomEvent"), false);
+  assert.equal(source.includes("DocxtoolHostDispatch"), true);
+  const calls = [];
+  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { Application: { PluginStorage: { getItem() { return null; }, setItem() {} } }, DocxtoolHostDispatch(name, sourceName) { calls.push([name, sourceName]); return Promise.resolve({ status: "PASS" }); } } };
+  vm.runInNewContext(source, context);
+  assert.equal(context.OnAction({ Id: "preview" }), true);
+  await Promise.resolve();
+  assert.deepEqual(calls, [["preview_document", "ribbon"]]);
+});
+
+test("production ribbon reports taskpane creation failure instead of swallowing it", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8");
+  const storage = new Map();
+  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { DocxtoolBuildInfo: { build_id: "build", asset_hash: "hash" }, Application: { PluginStorage: { getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) { storage.set(key, value); } }, CreateTaskPane() { return null; } } } };
+  vm.runInNewContext(source, context);
+  assert.equal(context.OnAction({ Id: "preview" }), true);
+  const state = JSON.parse(storage.get("docxtool_classified_host_result_v1"));
+  assert.equal(state.latest_error, "TASKPANE_CREATE_FAILED");
+  assert.match(state.formatting_progress, /WPS 未能创建任务窗格/);
+});
+
+test("taskpane exposes immediate pending feedback until host consumes request", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
+  assert.match(source, /pendingRequestId/);
+  assert.match(source, /命令已发送，等待 WPS 主上下文处理/);
+  assert.match(source, /REQUEST_KEY/);
+  assert.equal(source.includes("window.dispatchEvent"), false);
+  assert.equal(source.includes("CustomEvent"), false);
+});
+
+test("classified diagnostics cover bootstrap, Ribbon, Host, taskpane and preview stages", async () => {
+  const files = {
+    main: await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8"),
+    ribbon: await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8"),
+    host: await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8"),
+    taskpane: await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8"),
+    recognition: await readFile(new URL("../packages/recognition-client/src/index.ts", import.meta.url), "utf8"),
+    commands: await readFile(new URL("../packages/command-service-client/src/index.ts", import.meta.url), "utf8"),
+    comments: await readFile(new URL("../packages/wps-adapter/src/preview-comments.ts", import.meta.url), "utf8"),
+  };
+  for (const event of ["bootstrap.main.loaded", "bootstrap.script.requested"]) assert.match(files.main, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["ribbon.action.received", "ribbon.dispatch.start", "ribbon.dispatch.completed", "ribbon.dispatch.rejected"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["host.module.loaded", "host.install.attempt", "host.install.success", "host.router.dispatch.received", "host.router.dispatch.failed", "preview.use_case.start", "preview.comment.readback"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["taskpane.module.loaded", "taskpane.button.clicked", "taskpane.request.persisted", "taskpane.pending.timeout"]) assert.match(files.taskpane, new RegExp(event.replaceAll(".", "\\.")));
+  assert.match(files.recognition, /recognition\.request\.(start|response|failed)/);
+  assert.match(files.commands, /command_service\.request\.(start|response|failed)/);
+  for (const event of ["preview.comment.write.start", "preview.comment.write.failed", "preview.comment.readback.success"]) assert.match(files.comments, new RegExp(event.replaceAll(".", "\\.")));
+});
+
 test("hidden automatic workflow sends all formal actions through HostCommandRouter bridge", async () => {
   const source = await readFile(new URL("../apps/classified-offline/src/formal-e2e-driver.ts", import.meta.url), "utf8");
   for (const command of ["health_check", "preview_document", "format_document"]) assert.match(source, new RegExp(command));
@@ -663,6 +745,25 @@ test("production classified build excludes development E2E taskpane assets", asy
   assert.match(config, /DOCXTOOL_DEVELOPMENT_E2E/);
   const productionMain = await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8");
   assert.equal(productionMain.includes("development"), false);
+});
+
+test("production entry loads the runtime config and the ribbon file that the build actually emits", async () => {
+  const config = await readFile(new URL("../apps/classified-offline/vite.config.js", import.meta.url), "utf8");
+  const productionMain = await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8");
+  // The build always emits the production ribbon as js/ribbon.js, so the
+  // production entry must reference that name or the ribbon callbacks 404
+  // and WPS reports an invalid command for every button.
+  assert.match(productionMain, /DocxtoolVersionedAsset\("js\/ribbon\.js"\)/);
+  assert.equal(productionMain.includes("js/ribbon-production.js"), false);
+  // DocxtoolRuntimeConfig (recognition/command endpoints + session token) is
+  // written to ui/e2e-session.js by prepare and must reach the host runtime;
+  // without it install() fails with PRODUCTION_COMPOSITION_NOT_READY and no
+  // host command router is ever installed.
+  assert.match(productionMain, /DocxtoolVersionedAsset\("ui\/e2e-session\.js"\)/);
+  assert.match(config, /copyFile\(\{src:"ui\/e2e-session\.js",dest:"ui\/e2e-session\.js"\}\)/);
+  assert.match(productionMain, /<script type='module' src='/);
+  assert.match(productionMain, /DocxtoolVersionedAsset\("host-runtime\.js"\)/);
+  assert.match(productionMain, /ui\/build-info\.js\?v=/);
 });
 
 test("classified Ribbon preserves a safe error and opens the result pane when the host router is stale", async () => {
@@ -748,7 +849,7 @@ test("classified health check reports missing fonts as WARN and unreachable serv
 
 test("classified UI error messages localize stable WPS error codes", () => {
   assert.match(errorMessage("DOCUMENT_MUST_BE_SAVED"), /当前文档尚未保存/);
-  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先在 WPS 中保存为本地 DOCX 文件/);
+  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先在 WPS 中保存为本地 \.docx 文件/);
   assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /错误码：DOCUMENT_MUST_BE_SAVED/);
 });
 

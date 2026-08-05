@@ -6,6 +6,7 @@ dist/
 wps-addon-publish/
 *.whl
 *.log
+wps-plugin-debug.log*
 *.tsbuildinfo
 **/__pycache__/
 **/*.py[cod]

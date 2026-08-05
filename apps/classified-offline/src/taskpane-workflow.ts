@@ -1,4 +1,5 @@
 import { errorMessage, errorText } from "./error-messages.js";
+import { LoopbackDiagnosticLogger, safeError, type DiagnosticEvent, type DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
 
 type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
@@ -12,28 +13,82 @@ interface HostState {
   health_overall?: "PASS" | "WARN" | "FAIL" | ""; health_report?: string;
 }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; }
-type BridgeWindow = Window & { DocxtoolBuildInfo?: BuildInfo; Application?: { PluginStorage?: StorageLike; GetTaskPane?: (id: number) => { Visible: boolean } | undefined } };
+interface RuntimeConfig { recognitionEndpoint: string; commandEndpoint: string; sessionToken: string; }
+type BridgeWindow = Window & {
+  DocxtoolBuildInfo?: BuildInfo;
+  Application?: { PluginStorage?: StorageLike; GetTaskPane?: (id: number) => { Visible: boolean } | undefined };
+  DocxtoolEarlyLogQueue?: DiagnosticEvent[];
+  DocxtoolDiagnosticLogger?: LoopbackDiagnosticLogger;
+  DocxtoolDiagnosticLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
+};
 const bridgeWindow = window as BridgeWindow;
 
 const RESULT_KEY = "docxtool_classified_host_result_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
+const CONFIG_KEY = "docxtool_classified_runtime_config";
 const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 let pendingRequestId = "";
+let pendingStartedAt = 0;
+let lastObservedRequestState = "";
+let diagnosticLogger: LoopbackDiagnosticLogger | null = null;
+const taskpaneEarlyQueue: DiagnosticEvent[] = [];
+function taskpaneLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
+  try {
+    if (diagnosticLogger) { diagnosticLogger.writeForComponent("taskpane", level, event, message, data, error); return; }
+    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "taskpane", event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) };
+    taskpaneEarlyQueue.push(item);
+    if (taskpaneEarlyQueue.length > 500) taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length - 500);
+  } catch { /* diagnostics never changes taskpane behavior */ }
+}
+taskpaneLog("INFO", "taskpane.module.loaded", "任务窗格工作流模块开始执行", { ready_state: document.readyState });
 function node(id: string): HTMLElement { const value = document.getElementById(id); if (!value) throw new Error("TASKPANE_ELEMENT_MISSING"); return value; }
 function text(id: string, value: string): void { node(id).textContent = value; }
-function parse<T>(value: string | null): T | null { try { return value ? JSON.parse(value) as T : null; } catch { return null; } }
+function parse<T>(value: string | null, label = "storage"): T | null { try { return value ? JSON.parse(value) as T : null; } catch (error) { taskpaneLog("WARN", "taskpane.storage.parse.failed", "任务窗格无法解析宿主状态", { storage_label: label }, error); return null; } }
+function tryInstallTaskpaneLogger(): void {
+  if (diagnosticLogger) return;
+  const storage = bridgeWindow.Application?.PluginStorage;
+  const build = bridgeWindow.DocxtoolBuildInfo;
+  if (!storage || !build) return;
+  const config = parse<RuntimeConfig>(storage.getItem(CONFIG_KEY), "runtime_config");
+  if (!config) return;
+  try {
+    const hostContextId = new URLSearchParams(location.search).get("host_context") ?? "taskpane";
+    diagnosticLogger = new LoopbackDiagnosticLogger({ endpoint: config.recognitionEndpoint, sessionToken: config.sessionToken, source: "taskpane", component: "taskpane", buildId: build.build_id, pluginVersion: build.plugin_version, hostContextId, sessionId: `pane-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`, minimumLevel: "DEBUG" });
+    diagnosticLogger.adopt(taskpaneEarlyQueue);
+    taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length);
+    bridgeWindow.DocxtoolDiagnosticLogger = diagnosticLogger;
+    bridgeWindow.DocxtoolDiagnosticLog = (level, component, event, message, data, error) => diagnosticLogger?.writeForComponent(component, level, event, message, data, error);
+    taskpaneLog("INFO", "taskpane.logger.installed", "任务窗格诊断日志客户端已安装", {});
+    void diagnosticLogger.flush();
+  } catch (error) { taskpaneLog("ERROR", "taskpane.logger.install.failed", "任务窗格诊断日志客户端安装失败", {}, error); }
+}
 function request(commandName: HostCommandName): void {
+  const started = Date.now();
+  tryInstallTaskpaneLogger();
   const storage = bridgeWindow.Application?.PluginStorage; const build = bridgeWindow.DocxtoolBuildInfo;
-  if (!storage || !build) { text("issues", "TASKPANE_BRIDGE_NOT_READY：主上下文通信尚未就绪。"); return; }
+  if (!storage || !build) {
+    taskpaneLog("ERROR", "taskpane.request.persist.failed", "任务窗格桥接尚未就绪", { command_name: commandName, plugin_storage_available: Boolean(storage), build_info_available: Boolean(build), stable_error_code: "TASKPANE_BRIDGE_NOT_READY", duration_ms: Date.now() - started });
+    text("issues", "TASKPANE_BRIDGE_NOT_READY：主上下文通信尚未就绪。"); return;
+  }
   pendingRequestId = `pane-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
-  storage.setItem(REQUEST_KEY, JSON.stringify({ schema_version: 1, request_id: pendingRequestId, command_name: commandName, taskpane_build_id: build.build_id, created_at: new Date().toISOString() }));
-  text("workflow-status", "命令已发送，等待 WPS 主上下文处理…");
+  pendingStartedAt = Date.now();
+  lastObservedRequestState = "created";
+  taskpaneLog("INFO", "taskpane.request.created", "任务窗格命令请求已创建", { command_name: commandName, request_id: pendingRequestId, correlation_id: pendingRequestId, build_id: build.build_id, plugin_storage_available: true });
+  try {
+    storage.setItem(REQUEST_KEY, JSON.stringify({ schema_version: 1, request_id: pendingRequestId, command_name: commandName, taskpane_build_id: build.build_id, created_at: new Date().toISOString() }));
+    taskpaneLog("INFO", "taskpane.request.persisted", "任务窗格命令请求已写入 PluginStorage", { command_name: commandName, request_id: pendingRequestId, correlation_id: pendingRequestId, duration_ms: Date.now() - started });
+    text("workflow-status", "命令已发送，等待 WPS 主上下文处理…");
+  } catch (error) {
+    taskpaneLog("ERROR", "taskpane.request.persist.failed", "任务窗格命令请求写入失败", { command_name: commandName, request_id: pendingRequestId, correlation_id: pendingRequestId, stable_error_code: "TASKPANE_REQUEST_PERSIST_FAILED", duration_ms: Date.now() - started }, error);
+    text("issues", "TASKPANE_REQUEST_PERSIST_FAILED：命令未能发送到 WPS 主上下文。");
+    pendingRequestId = ""; pendingStartedAt = 0;
+  }
 }
 function closeTaskPane(): void {
   const application = bridgeWindow.Application; const storage = application?.PluginStorage;
-  if (!application?.GetTaskPane || !storage) { text("issues", "TASKPANE_BRIDGE_NOT_READY：无法取得 WPS 任务窗格 API。"); return; }
-  try { const saved = storage.getItem("docxtool_classified_taskpane"); if (!saved) return; const pane = application.GetTaskPane(Number(saved)); if (!pane) { storage.setItem("docxtool_classified_taskpane", ""); return; } pane.Visible = false; }
-  catch { text("issues", "TASKPANE_HIDE_FAILED：WPS 未能关闭任务窗格。"); }
+  if (!application?.GetTaskPane || !storage) { taskpaneLog("ERROR", "taskpane.hide.failed", "无法取得 WPS 任务窗格 API", { stable_error_code: "TASKPANE_BRIDGE_NOT_READY" }); text("issues", "TASKPANE_BRIDGE_NOT_READY：无法取得 WPS 任务窗格 API。"); return; }
+  try { const saved = storage.getItem("docxtool_classified_taskpane"); if (!saved) return; const pane = application.GetTaskPane(Number(saved)); if (!pane) { storage.setItem("docxtool_classified_taskpane", ""); return; } pane.Visible = false; taskpaneLog("INFO", "taskpane.hide.success", "任务窗格已隐藏", {}); }
+  catch (error) { taskpaneLog("ERROR", "taskpane.hide.failed", "WPS 未能关闭任务窗格", { stable_error_code: "TASKPANE_HIDE_FAILED" }, error); text("issues", "TASKPANE_HIDE_FAILED：WPS 未能关闭任务窗格。"); }
 }
 function rows(id: string, values: string[]): void { node(id).replaceChildren(...values.map((value) => { const row = document.createElement("div"); row.className = "row"; row.textContent = value; return row; })); }
 function issueText(state: HostState): string {
@@ -60,21 +115,36 @@ function render(state: HostState): void {
 }
 let lastUpdated = "";
 function poll(): void {
+  tryInstallTaskpaneLogger();
   const storage = bridgeWindow.Application?.PluginStorage; if (!storage) return;
-  const state = parse<HostState>(storage.getItem(RESULT_KEY));
+  const state = parse<HostState>(storage.getItem(RESULT_KEY), "host_result");
   if (state && state.updated_at !== lastUpdated) {
     lastUpdated = state.updated_at;
-    render(state);
+    taskpaneLog("DEBUG", "taskpane.host_state.changed", "任务窗格观察到 Host 状态变化", { build_id: state.build_id, command_status: state.command_status, active_view: state.active_view, stable_error_code: state.latest_error || "" });
+    taskpaneLog("DEBUG", "taskpane.render.start", "开始渲染任务窗格状态", { build_id: state.build_id, command_status: state.command_status, active_view: state.active_view });
+    try { render(state); taskpaneLog("DEBUG", "taskpane.render.success", "任务窗格状态渲染完成", { build_id: state.build_id, command_status: state.command_status, active_view: state.active_view }); }
+    catch (error) { taskpaneLog("ERROR", "taskpane.render.failed", "任务窗格状态渲染失败", { build_id: state.build_id, stable_error_code: "TASKPANE_RENDER_FAILED" }, error); }
   }
   if (pendingRequestId) {
-    const queued = parse<{ request_id?: string }>(storage.getItem(REQUEST_KEY));
+    const queued = parse<{ request_id?: string }>(storage.getItem(REQUEST_KEY), "host_request");
     const active = state?.active_command;
-    if (active?.command_id === pendingRequestId && active.status !== "RUNNING") pendingRequestId = "";
-    else if (queued?.request_id === pendingRequestId || active?.command_id === pendingRequestId) text("workflow-status", "命令已发送，等待 WPS 主上下文处理…");
-    else if (!queued) pendingRequestId = "";
+    const observed = queued?.request_id === pendingRequestId ? "queued" : active?.command_id === pendingRequestId ? `active:${active.status ?? "unknown"}` : "waiting";
+    if (observed !== lastObservedRequestState) { lastObservedRequestState = observed; taskpaneLog("DEBUG", "taskpane.request.observed", "任务窗格命令状态已变化", { request_id: pendingRequestId, correlation_id: pendingRequestId, observed_state: observed }); }
+    if (active?.command_id === pendingRequestId && active.status !== "RUNNING") { pendingRequestId = ""; pendingStartedAt = 0; }
+    else if (Date.now() - pendingStartedAt >= 30_000) {
+      taskpaneLog("ERROR", "taskpane.pending.timeout", "任务窗格命令等待 Host 消费超时", { request_id: pendingRequestId, correlation_id: pendingRequestId, stable_error_code: "HOST_COMMAND_TIMEOUT", duration_ms: Date.now() - pendingStartedAt });
+      text("workflow-status", "HOST_COMMAND_TIMEOUT：WPS 主上下文未在 30 秒内处理命令。"); pendingRequestId = ""; pendingStartedAt = 0;
+    } else text("workflow-status", "命令已发送，等待 WPS 主上下文处理…");
   }
 }
-for (const [id, command] of [["recognize-document", "recognize_document"], ["preview-document", "preview_document"], ["clear-preview", "clear_preview"], ["format-document", "format_document"], ["health-check", "health_check"]] as const) node(id).addEventListener("click", () => request(command));
-node("close-taskpane").addEventListener("click", closeTaskPane);
+taskpaneLog("INFO", "taskpane.dom.ready", "任务窗格 DOM 已可绑定", { ready_state: document.readyState });
+for (const [elementId, command] of [["recognize-document", "recognize_document"], ["preview-document", "preview_document"], ["clear-preview", "clear_preview"], ["format-document", "format_document"], ["health-check", "health_check"]] as const) {
+  node(elementId).addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "任务窗格按钮已点击", { control_id: elementId, command_name: command }); request(command); });
+  taskpaneLog("DEBUG", "taskpane.button.bound", "任务窗格按钮已绑定", { control_id: elementId, command_name: command });
+}
+node("close-taskpane").addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "关闭任务窗格按钮已点击", { control_id: "close-taskpane", command_name: "close_taskpane" }); closeTaskPane(); });
+taskpaneLog("DEBUG", "taskpane.button.bound", "关闭任务窗格按钮已绑定", { control_id: "close-taskpane", command_name: "close_taskpane" });
 const build = bridgeWindow.DocxtoolBuildInfo; text("plugin-version", build?.plugin_version ?? "未知"); text("build-id", build?.build_id?.slice(0, 20) ?? "未知");
+tryInstallTaskpaneLogger();
+taskpaneLog("DEBUG", "taskpane.poll.started", "任务窗格 Host 状态轮询已启动", { interval_ms: 250 });
 window.setInterval(poll, 250); poll();

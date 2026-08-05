@@ -3,6 +3,7 @@ import { ClearFormattingPreviewUseCase, FormatDocumentUseCase, PreviewDocumentUs
 import { HttpLocalRecognitionTransport, LocalWheelRecognitionProvider } from "../../../packages/recognition-client/src/index.js";
 import { CommandValidator } from "../../../packages/security/src/index.js";
 import { NoOpTelemetry } from "../../../packages/diagnostics/src/index.js";
+import type { DiagnosticReporter } from "../../../packages/diagnostics/src/index.js";
 import { WpsApiDocumentExecutor, WpsCapabilityProvider, WpsDocumentReader, WpsFontCapabilityProvider, WpsPreviewCommentService, WpsTransactionManager } from "../../../packages/wps-adapter/src/index.js";
 import type { PreviewMutationTracker } from "../../../packages/application/src/ports.js";
 
@@ -17,11 +18,11 @@ let productionConfigKey = "";
 class OfflineLicenseProvider { authorizationScope(): "classified-offline" { return "classified-offline"; } }
 
 /** The only production assembly used by the classified Ribbon and E2E driver. */
-export function createClassifiedProductionComposition(config: ClassifiedRuntimeConfig) {
+export function createClassifiedProductionComposition(config: ClassifiedRuntimeConfig, diagnostics?: DiagnosticReporter) {
   const telemetry = new NoOpTelemetry();
   const reader = new WpsDocumentReader();
-  const recognition = new LocalWheelRecognitionProvider(new HttpLocalRecognitionTransport(new URL(config.recognitionEndpoint), config.sessionToken));
-  const commands = new HttpCommandServiceClient(new LocalEndpointProvider(config.commandEndpoint, config.sessionToken));
+  const recognition = new LocalWheelRecognitionProvider(new HttpLocalRecognitionTransport(new URL(config.recognitionEndpoint), config.sessionToken, diagnostics));
+  const commands = new HttpCommandServiceClient(new LocalEndpointProvider(config.commandEndpoint, config.sessionToken), undefined, diagnostics);
   const validator = new CommandValidator();
   const transaction = new WpsTransactionManager();
   const executor = new WpsApiDocumentExecutor(undefined, new WpsCapabilityProvider(), undefined, transaction);
@@ -30,7 +31,7 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
   const license = new OfflineLicenseProvider();
   let preview: PreviewMutationTracker | null = null;
   const tracker = { current: () => preview, set: (value: PreviewMutationTracker) => { preview = value; }, clear: () => { preview = null; } };
-  const previewComments = new WpsPreviewCommentService();
+  const previewComments = new WpsPreviewCommentService(diagnostics);
   return {
     telemetry,
     previewTracker: tracker,
@@ -42,9 +43,9 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
 }
 
 /** One production composition per add-in host context. Task panes never call this. */
-export function getClassifiedProductionComposition(config: ClassifiedRuntimeConfig): ClassifiedProductionComposition {
+export function getClassifiedProductionComposition(config: ClassifiedRuntimeConfig, diagnostics?: DiagnosticReporter): ClassifiedProductionComposition {
   const key = JSON.stringify(config);
-  if (!productionComposition) { productionComposition = createClassifiedProductionComposition(config); productionConfigKey = key; }
+  if (!productionComposition) { productionComposition = createClassifiedProductionComposition(config, diagnostics); productionConfigKey = key; }
   else if (productionConfigKey !== key) throw new Error("PRODUCTION_COMPOSITION_CONFIG_MISMATCH");
   return productionComposition;
 }

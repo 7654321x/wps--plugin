@@ -33,8 +33,8 @@
 - 症状：新会话停在 bootstrap、回调超时，或 local-agent 返回 `UNAUTHORIZED`；代码和服务本身测试正常。
 - 根因：测试文档被交给仍在运行的旧 WPS WebView，旧页面继续使用旧 build id、端口或 session token。
 - 禁止：遇到超时就直接修改业务逻辑；不得在存在用户可见文档窗口时强制结束全部 WPS 进程。
-- 正确方案：先核对 build id、会话 ID、进程启动时间和窗口标题；只关闭脱敏测试窗口。若所有 WPS 进程均无可见文档，再完整重启 WPS 宿主。
-- 自动验证门槛：同一会话中 `main_script_loaded`、`host_router_installed`、`health_check`、`preview_document`、`one_click_format` 均有真实回报。
+- 正确方案：先核对 build id、会话 ID、进程启动时间和窗口标题；main 加载 build-info 时使用启动 nonce，其余 profile/runtime/Ribbon/Host 子资源使用 build id 查询参数，任务窗格按 `host_build` 动态导入对应 workflow，禁止固定 URL 命中旧 bundle。只关闭脱敏测试窗口；若所有 WPS 进程均无可见文档，再完整重启 WPS 宿主。
+- 自动验证门槛：源码和 production dist 检查子资源版本参数；同一会话中 `main_script_loaded`、`host_router_installed`、`health_check`、`preview_document`、`one_click_format` 均有真实回报。
 
 ## P005 预览证据复制与 WPS 异步保存竞争
 
@@ -199,5 +199,29 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 症状：任务窗格已显示，点击“预览排版”“一键排版”后界面仍停留在“就绪”或原状态，本地服务健康，`current.json` 只出现 `main_script_loaded`，没有 `host_router_installed`。
 - 根因：WPS WebView 加载主脚本时 `Application` 对象尚未注入；旧代码只安装一次 HostCommandRouter，遇到 `WPS_APPLICATION_UNAVAILABLE` 后不再重试。任务窗格按钮只把请求写入 `PluginStorage`，没有主上下文消费请求。
 - 禁止：遇到无反应就修改识别 wheel、命令服务或另写测试执行器；不得把按钮点击无反馈当成识别失败。
-- 正确方案：主上下文安装必须等待并重试，直到 `Application` 和 build info 均可用后再安装 HostCommandRouter；任务窗格发送命令后必须显示“命令已发送，等待 WPS 主上下文处理…”，不能被旧状态轮询覆盖成“就绪”。
-- 自动验证门槛：源码测试断言 `host-runtime.ts` 包含 `tryInstall` 重试安装和 `host_router_installed` 上报；真实 WPS 状态必须从 `main_script_loaded` 继续到 `host_router_installed` 后，按钮才可判定为可用。
+- 正确方案：主上下文安装必须等待并重试，直到 `Application` 和 build info 均可用后再安装 HostCommandRouter；任务窗格发送命令后必须显示“命令已发送，等待 WPS 主上下文处理…”，不能被旧状态轮询覆盖成“就绪”；Ribbon fallback 中 `CreateTaskPane()` 返回空值时必须写入 `TASKPANE_CREATE_FAILED`，不得继续访问 `pane.ID` 或静默吞错。
+- 自动验证门槛：源码测试断言 `host-runtime.ts` 包含 `tryInstall` 重试安装和 `host_router_installed` 上报；测试覆盖生产 Ribbon 直接调用 `DocxtoolHostDispatch`、不使用 `CustomEvent/dispatchEvent`、任务窗格即时等待状态、`CreateTaskPane()` 空返回写入稳定错误；真实 WPS 状态必须从 `main_script_loaded` 继续到 `host_router_installed` 后，按钮才可判定为可用。
+
+## P021 production 入口不注入 runtime config 且 ribbon 脚本文件名错位
+
+- 症状：WPS Ribbon 的“预览排版”“一键排版”“功能检测”按钮点击后无效；按 dist 发布时 WPS 对每个按钮报“无效命令/回调未找到”；`.runtime/e2e/current.json` 只有 `main_script_loaded`/`host_module_loaded`/`ribbon_onload`，始终没有 `host_router_installed`。
+- 根因：两个独立缺口叠加。(a) `main.production.js` 引用 `js/ribbon-production.js`，但 `vite.config.js` 的 production 构建把该文件输出为 `dist/js/ribbon.js`，导致发布 dist 后 ribbon 脚本 404、全局 `OnAction` 未定义，WPS 对每个按钮报无效命令（debug 模式下 3889 直接服务源码目录，`js/ribbon-production.js` 存在，故只影响 production 发布）。(b) `main.production.js` 未加载 `ui/e2e-session.js`，且 `vite.config.js` 未把该文件拷贝进 dist，导致 `window.DocxtoolRuntimeConfig`（recognition/command 端点与 session token）从未注入；`host-runtime.ts` 的 `runtimeConfig()` 因此抛 `PRODUCTION_COMPOSITION_NOT_READY`，`install()` 失败，HostCommandRouter 永不安装，所有按钮命令无人消费。
+- 禁止：在按钮回调中吞掉 `DocxtoolHostDispatch` 缺失；不得把 Ribbon 回调改回浏览器 `CustomEvent/dispatchEvent`；不得在 host-runtime 或 composition 中硬编码端点/token 默认值；不得把 `ui/e2e-session.js` 从生产入口删除（它由 prepare 生成、含 9528 统一入口与 session token，属 `.gitignore`）。
+- 正确方案：production 入口与构建输出文件名必须一致（统一引用 `js/ribbon.js`，构建时其内容为 production ribbon）；production 入口必须按“build-info → default-format-profile → e2e-session → ribbon → host-runtime”顺序加载 `ui/e2e-session.js`；`vite.config.js` 的 copyFile 必须把 `ui/e2e-session.js` 拷贝进 dist；`verify-addin` 必须把 `ui/build-info.js`、`ui/e2e-session.js`、`ui/default-format-profile.js` 列为 classified 生产产物。
+- 自动验证门槛：Node 测试断言 `main.production.js` 引用 `js/ribbon.js`（不含 `js/ribbon-production.js`）且加载 `ui/e2e-session.js`、`vite.config.js` 拷贝 e2e-session.js；`npm run build:classified` 后 `dist/js/ribbon.js` 存在且为 production ribbon、`dist/ui/e2e-session.js` 存在；`npm run verify:addin -- classified-offline` PASS；真实 WPS 重启后 `current.json` 出现 `host_router_installed` 且按钮可点击。当前 WPS 进程早于最新 build 启动时，必须关闭全部 WPS 窗口重新打开，不能只靠服务重启。
+
+## P022 WPS 宿主异常被吞掉，无法落盘定位
+
+- 症状：点击“预览排版”后没有界面变化，Console、PluginStorage 或 E2E 状态只留下最后一个稳定错误码，无法判断中断在 main、Ribbon、Host 安装、HTTP 请求还是 WPS 批注写入。
+- 根因：WPS WebView 的早期脚本、Ribbon Promise、Host 安装重试和任务窗格轮询分属不同上下文；旧实现存在空 `catch`，原始异常及 stack 没有统一关联 ID，也没有安全写入仓库根目录的通道。
+- 禁止：不得让 WebView 直接调用文件系统；不得把正文、完整路径、session token、Authorization、Cookie、请求体或响应体写入日志；不得因为加日志而改变识别、格式协议或正式执行顺序；日志失败不得阻断业务。
+- 正确方案：main 使用最多 500 条的内存早期队列；Host/任务窗格安装固定 loopback logger，经带 session header 的 `POST /v1/diagnostics/logs` 发送；local-agent 作为唯一运行时文件写入者，执行二次脱敏并以 UTF-8 JSONL 写入 `wps-plugin-debug.log`，按 5 MB × 5 轮转。Ribbon、Host router、识别/命令请求和 WPS 批注阶段沿用同一 correlation/request/command ID；公开 HostState 只保留稳定错误码，原始异常仅进入脱敏根日志。
+- 自动验证门槛：Node 测试覆盖队列 500、批次 50、失败回队首、ERROR 立即 flush、早期队列接管、脱敏和 dispose；Python 测试覆盖鉴权、事件/批次大小、二次脱敏、UTF-8、轮转和并发完整行；classified dist 必须包含 `bootstrap.main.loaded`、`ribbon.action.received`、`host.install.success`、`host.router.dispatch.received`；`verify-all.ps1` PASS。真实 WPS 只能在新 build 重启后、根日志出现完整宿主链并完成批注读回时写 PASS。
+
+## P023 Vite ES module 产物被 classic script 加载
+
+- 症状：E2E 已出现 `main_script_loaded`、`ribbon_onload`，静态资源请求也返回 200，但没有 `host_module_loaded`；任务窗格工作流同样不执行，按钮可能显示但没有正式桥接。
+- 根因：Vite 的多入口产物 `host-runtime.js`、`taskpane-workflow.js` 会静态 `import` 共享 chunk；main 和 taskpane HTML 却用没有 `type="module"` 的 classic script 标签加载。浏览器在模块正文第一行之前即因 `import` 语法失败，因此任何模块内日志都来不及执行。
+- 禁止：不得通过删除共享依赖、复制业务实现或把 bundle 文本拼接成假单文件规避；不得把 Ribbon 回调本身改为 module 后失去 WPS 所需的全局函数。
+- 正确方案：build-info、runtime config 和 Ribbon 继续使用 classic script；仅对 Vite ESM 产物 `host-runtime.js`、`taskpane-workflow.js` 使用 `type="module"`。Host 自带安装重试，允许 module 延后执行后再等待 `Application`、build 和 runtime config。
+- 自动验证门槛：源码测试断言开发/生产 main 的 host runtime 使用 module 标签，两个 taskpane workflow 通过 module 动态导入；classified build 后产物首部可含静态 `import`，但所有加载点必须采用 module 语义；`verify-addin` 强制检查 production main 和 build 版本参数；真实 WPS 重启后根日志必须出现 `host.module.loaded` 和 `host.install.success`。

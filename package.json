@@ -25,7 +25,11 @@
     "e2e:classified:auto": "pwsh -NoProfile -File scripts/e2e-classified.ps1 auto",
     "acceptance:real-doc:prepare": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 prepare",
     "acceptance:real-doc:status": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 status",
-    "acceptance:real-doc:report": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 report"
+    "acceptance:real-doc:report": "pwsh -NoProfile -File scripts/acceptance-real-doc.ps1 report",
+    "logs:wps:path": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 path",
+    "logs:wps:tail": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 tail",
+    "logs:wps:clear": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 clear",
+    "logs:wps:summary": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 summary"
   },
   "devDependencies": {
     "ajv": "8.17.1",

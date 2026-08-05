@@ -3,6 +3,7 @@ import type { FormattingCommandSet, RecognitionResult } from "../../../packages/
 import { ClassifiedHealthChecker, type SafeHealthItem } from "./health-check.js";
 import { loadRealE2EPlan, runFormalRollbackProbe } from "./formal-e2e-usecase.js";
 import { errorMessage } from "./error-messages.js";
+import { LoopbackDiagnosticLogger, type DiagnosticEvent, type DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
 
 type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
 type HostCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
@@ -31,8 +32,23 @@ type HostWindow = Window & {
   DocxtoolTaskPanePath?: string;
   DocxtoolHostDispatch?: (name: HostCommandName, source?: "ribbon" | "taskpane" | "e2e", requestId?: string, taskpaneBuildId?: string) => Promise<CommandResult>;
   DocxtoolHostRuntime?: { router: HostCommandRouter; panes: TaskPaneManager; store: HostResultStore; build: BuildInfo; };
+  DocxtoolEarlyLogQueue?: DiagnosticEvent[];
+  DocxtoolEarlyLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
+  DocxtoolDiagnosticLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
+  DocxtoolDiagnosticLogger?: LoopbackDiagnosticLogger;
 };
 const hostWindow = globalThis as unknown as HostWindow;
+function hostLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
+  try {
+    if (hostWindow.DocxtoolDiagnosticLog) { hostWindow.DocxtoolDiagnosticLog(level, "host", event, message, data, error); return; }
+    if (hostWindow.DocxtoolEarlyLog) { hostWindow.DocxtoolEarlyLog(level, "host", event, message, data, error); return; }
+    const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
+    queue.push({ timestamp: new Date().toISOString(), level, component: "host", event, message, data });
+    if (queue.length > 500) queue.splice(0, queue.length - 500);
+    hostWindow.DocxtoolEarlyLogQueue = queue;
+  } catch { /* diagnostics never changes WPS host behavior */ }
+}
+hostLog("INFO", "host.module.loaded", "Host runtime 模块开始执行", { application_available: Boolean(hostWindow.Application), build_info_available: Boolean(hostWindow.DocxtoolBuildInfo), runtime_config_available: Boolean(hostWindow.DocxtoolRuntimeConfig) });
 
 const RESULT_KEY = "docxtool_classified_host_result_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
@@ -55,7 +71,7 @@ function formattingPlan(commands: FormattingCommandSet["commands"]): string {
 
 export class HostResultStore {
   private state: HostState;
-  constructor(private readonly storage: StorageLike, private readonly build: BuildInfo, readonly hostContextId = crypto.randomUUID()) {
+  constructor(private readonly storage: StorageLike, private readonly build: BuildInfo, readonly hostContextId: string = crypto.randomUUID()) {
     const stored = parse<HostState>(storage.getItem(RESULT_KEY));
     this.state = stored?.build_id === build.build_id ? { ...stored, host_context_id: hostContextId, unresolved_block_count: stored.unresolved_block_count ?? 0, mixed_paragraph_count: stored.mixed_paragraph_count ?? 0, health_overall: stored.health_overall ?? "", health_report: stored.health_report ?? "", health_items: stored.health_items ?? [] } : { schema_version: 1, build_id: build.build_id, asset_hash: build.asset_hash, host_context_id: hostContextId, document_identity_hash: "", active_command: null, command_status: "IDLE", active_view: "execution", recognition_summary: "", paragraph_recognition_models: [], formatting_preview_models: [], preview_comment_status: "", formatting_progress: "就绪", formatting_result: "", latest_error: stored ? "ADDIN_CONTEXT_STALE" : "", unresolved_block_count: 0, mixed_paragraph_count: 0, health_overall: "", health_report: "", health_items: [], callback_log: [], updated_at: now() };
     this.save();
@@ -72,14 +88,39 @@ export class HostResultStore {
 export class TaskPaneManager {
   private pane: TaskPaneLike | null = null;
   constructor(private readonly application: ApplicationLike, private readonly storage: StorageLike, private readonly url: string) {}
-  get(): TaskPaneLike | null { if (this.pane) return this.pane; const saved = this.storage.getItem(PANE_KEY); if (!saved) return null; try { return this.pane = this.application.GetTaskPane(Number(saved)); } catch { this.storage.setItem(PANE_KEY, ""); return null; } }
-  create(): TaskPaneLike { const existing = this.get(); if (existing) return existing; try { const pane = this.application.CreateTaskPane(this.url, "Docxtool 涉密版"); pane.Width = 420; this.storage.setItem(PANE_KEY, String(pane.ID)); return this.pane = pane; } catch { throw new Error("TASKPANE_CREATE_FAILED"); } }
-  show(): TaskPaneLike { const pane = this.create(); try { pane.Visible = true; if (!pane.Visible) throw new Error(); return pane; } catch { this.pane = null; this.storage.setItem(PANE_KEY, ""); try { const replacement = this.create(); replacement.Visible = true; if (!replacement.Visible) throw new Error(); return replacement; } catch { throw new Error("TASKPANE_SHOW_FAILED"); } } }
-  hide(): void { const pane = this.get(); if (!pane) return; try { pane.Visible = false; } catch { throw new Error("TASKPANE_HIDE_FAILED"); } }
+  get(): TaskPaneLike | null {
+    if (this.pane) return this.pane;
+    const saved = this.storage.getItem(PANE_KEY);
+    if (!saved) return null;
+    try { return this.pane = this.application.GetTaskPane(Number(saved)); }
+    catch (error) { hostLog("WARN", "taskpane.lookup.failed", "Host runtime 读取已保存任务窗格失败", {}, error); this.storage.setItem(PANE_KEY, ""); return null; }
+  }
+  create(): TaskPaneLike {
+    const existing = this.get();
+    if (existing) return existing;
+    try {
+      const pane = this.application.CreateTaskPane(this.url, "Docxtool 涉密版");
+      if (!pane) throw new Error("TASKPANE_CREATE_RETURNED_EMPTY");
+      pane.Width = 420;
+      this.storage.setItem(PANE_KEY, String(pane.ID));
+      return this.pane = pane;
+    } catch (error) { hostLog("ERROR", "taskpane.create.failed", "Host runtime 创建任务窗格失败", { stable_error_code: "TASKPANE_CREATE_FAILED" }, error); throw new Error("TASKPANE_CREATE_FAILED"); }
+  }
+  show(): TaskPaneLike {
+    const pane = this.create();
+    try { pane.Visible = true; if (!pane.Visible) throw new Error("TASKPANE_VISIBLE_FALSE"); return pane; }
+    catch (error) {
+      hostLog("WARN", "taskpane.show.failed", "首次显示任务窗格失败，准备重建", {}, error);
+      this.pane = null; this.storage.setItem(PANE_KEY, "");
+      try { const replacement = this.create(); replacement.Visible = true; if (!replacement.Visible) throw new Error("TASKPANE_VISIBLE_FALSE"); return replacement; }
+      catch (replacementError) { hostLog("ERROR", "taskpane.show.failed", "重建后仍无法显示任务窗格", { stable_error_code: "TASKPANE_SHOW_FAILED" }, replacementError); throw new Error("TASKPANE_SHOW_FAILED"); }
+    }
+  }
+  hide(): void { const pane = this.get(); if (!pane) return; try { pane.Visible = false; } catch (error) { hostLog("ERROR", "taskpane.hide.failed", "隐藏任务窗格失败", { stable_error_code: "TASKPANE_HIDE_FAILED" }, error); throw new Error("TASKPANE_HIDE_FAILED"); } }
   toggle(): TaskPaneLike | null { const pane = this.get(); if (pane?.Visible) { this.hide(); return null; } return this.show(); }
   activate(): TaskPaneLike { return this.show(); }
-  refresh(): void { const pane = this.get(); if (!pane) return; try { pane.Navigate?.(this.url); } catch { /* state polling still refreshes the view */ } }
-  dispose(): void { const pane = this.get(); if (pane) { try { pane.Delete?.(); } catch { /* a disposed WPS pane may throw */ } } this.pane = null; this.storage.setItem(PANE_KEY, ""); }
+  refresh(): void { const pane = this.get(); if (!pane) return; try { pane.Navigate?.(this.url); } catch (error) { hostLog("WARN", "taskpane.navigate.failed", "任务窗格导航失败，状态轮询继续工作", {}, error); } }
+  dispose(): void { const pane = this.get(); if (pane) { try { pane.Delete?.(); } catch (error) { hostLog("DEBUG", "taskpane.dispose.failed", "WPS 已释放的任务窗格拒绝删除", {}, error); } } this.pane = null; this.storage.setItem(PANE_KEY, ""); }
 }
 
 export class HostCommandRouter {
@@ -88,13 +129,42 @@ export class HostCommandRouter {
     this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
   }
   async dispatch(name: HostCommandName, source: "ribbon" | "taskpane" | "e2e" = "ribbon", requestId = id("host"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
-    if (!Object.prototype.hasOwnProperty.call(this.registry, name)) throw new Error("UNKNOWN_HOST_COMMAND");
-    const started = now(); const view = name === "recognize_document" ? "recognition" : name === "preview_document" ? "preview" : name === "format_document" ? "execution" : name === "health_check" ? "issues" : this.store.read().active_view; const result = this.store.begin(name, requestId, view);
+    const started = now(); const startedMs = Date.now();
+    const context = { correlation_id: requestId, request_id: requestId, command_id: requestId, command_name: name, source };
+    hostLog("INFO", "host.router.dispatch.received", "HostCommandRouter 收到命令", context);
+    if (!Object.prototype.hasOwnProperty.call(this.registry, name)) {
+      const error = new Error("UNKNOWN_HOST_COMMAND");
+      hostLog("ERROR", "host.router.dispatch.failed", "HostCommandRouter 拒绝未知命令", { ...context, stable_error_code: "UNKNOWN_HOST_COMMAND", duration_ms: Date.now() - startedMs }, error);
+      throw error;
+    }
+    hostLog("DEBUG", "host.router.command.validated", "Host 命令名称验证通过", context);
+    const view = name === "recognize_document" ? "recognition" : name === "preview_document" ? "preview" : name === "format_document" ? "execution" : name === "health_check" ? "issues" : this.store.read().active_view;
+    const result = this.store.begin(name, requestId, view);
     try {
       if (taskpaneBuildId !== this.store.read().build_id) throw new Error("ADDIN_CONTEXT_STALE");
-      if (["recognize_document", "preview_document", "format_document", "health_check"].includes(name)) this.panes.show();
-      const summary = await this.registry[name](result); const done = this.store.finish(result, summary); this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "PASS", stable_error_code: "" }); return done;
-    } catch (error) { const code = stableError(error); const failed = this.store.fail(result, code); if (name !== "close_taskpane" && name !== "toggle_taskpane") { try { this.panes.show(); } catch { /* the persisted error remains visible after reopen */ } } this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "FAIL", stable_error_code: code }); return failed; }
+      hostLog("DEBUG", "host.router.build.checked", "任务窗格与 Host build 一致", { ...context, build_id: this.store.read().build_id });
+      if (["recognize_document", "preview_document", "format_document", "health_check"].includes(name)) {
+        hostLog("DEBUG", "host.router.taskpane.show.start", "命令执行前显示任务窗格", context);
+        this.panes.show();
+        hostLog("DEBUG", "host.router.taskpane.show.success", "命令任务窗格已显示", context);
+      }
+      hostLog("INFO", "host.router.handler.start", "开始执行正式应用用例", context);
+      const summary = await this.registry[name](result);
+      hostLog("INFO", "host.router.handler.success", "正式应用用例执行完成", { ...context, duration_ms: Date.now() - startedMs });
+      const done = this.store.finish(result, summary);
+      this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "PASS", stable_error_code: "" });
+      hostLog("INFO", "host.router.dispatch.success", "HostCommandRouter 命令完成", { ...context, duration_ms: Date.now() - startedMs });
+      return done;
+    } catch (error) {
+      const code = stableError(error); const failed = this.store.fail(result, code);
+      if (name !== "close_taskpane" && name !== "toggle_taskpane") {
+        try { this.panes.show(); }
+        catch (paneError) { hostLog("WARN", "host.router.taskpane.show.failed", "命令失败状态已保存，但任务窗格无法显示", { ...context, stable_error_code: "TASKPANE_SHOW_FAILED" }, paneError); }
+      }
+      this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "FAIL", stable_error_code: code });
+      hostLog("ERROR", "host.router.dispatch.failed", "HostCommandRouter 命令失败", { ...context, stable_error_code: code, duration_ms: Date.now() - startedMs }, error);
+      return failed;
+    }
   }
   supports(name: string): name is HostCommandName { return Object.prototype.hasOwnProperty.call(this.registry, name); }
   async reconcileActiveDocument(): Promise<void> {
@@ -107,10 +177,50 @@ export class HostCommandRouter {
       this.store.update({ document_identity_hash: current, active_command: null, command_status: "IDLE", active_view: "recognition", recognition_summary: "", paragraph_recognition_models: [], formatting_preview_models: [], preview_comment_status: "", formatting_progress: "已切换文档，等待操作", formatting_result: "", latest_error: "", unresolved_block_count: 0, mixed_paragraph_count: 0, health_overall: "", health_report: "", health_items: [] });
     }
   }
-  private composition() { return getClassifiedProductionComposition(this.config); }
+  private composition() { return getClassifiedProductionComposition(this.config, hostWindow.DocxtoolDiagnosticLogger); }
   private async documentIdentity(): Promise<string> { const document = this.app.ActiveDocument; if (!document) throw new Error("ACTIVE_DOCUMENT_NOT_FOUND"); return hash(`${document.FullName ?? "unsaved"}|${document.Paragraphs?.Count ?? 0}`); }
   private async recognize(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const recognition = await this.composition().recognizeUseCase.execute(); const models = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review })); const review = models.filter((item) => item.needs_review).length; this.store.update({ document_identity_hash: identity, paragraph_recognition_models: models, recognition_summary: `总段落 ${models.length}；需要复核 ${review}`, active_view: "recognition" }); return "识别完成"; }
-  private async preview(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const value = await this.composition().previewUseCase.execute(id("preview")); const count = value.summary.preview_comment_count ?? 0; if (count === 0) throw new Error(value.summary.preview_warnings?.[0] ?? "PREVIEW_COMMENT_READBACK_FAILED"); const grouped = new Map<number, FormattingCommandSet["commands"]>(); for (const command of value.commands.commands) { const list = grouped.get(command.target.source_paragraph_index) ?? []; list.push(command); grouped.set(command.target.source_paragraph_index, list); } const models = value.recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, plan: formattingPlan(grouped.get(item.source_paragraph_index) ?? []), needs_review: item.needs_review })); const mixed = value.summary.mixed_paragraph_count; const unresolved = value.summary.unresolved_block_count; const notices = [`已创建 ${count} 条临时批注`]; if (mixed) notices.push(`${mixed} 个物理段落包含多个角色，正式排版前需拆段`); if (unresolved) notices.push(`${unresolved} 个识别块无法证明位置，仅供复核`); this.store.update({ document_identity_hash: identity, formatting_preview_models: models, preview_comment_status: notices.join("；"), unresolved_block_count: unresolved, mixed_paragraph_count: mixed, active_view: "preview" }); return "预览排版完成"; }
+  private async preview(result: CommandResult): Promise<string> {
+    const started = Date.now();
+    const context = { correlation_id: result.command_id, request_id: result.command_id, command_id: result.command_id, command_name: result.command_name };
+    const document = this.app.ActiveDocument;
+    const fullName = String(document?.FullName ?? "");
+    const extension = fullName.match(/(\.[^./\\]+)$/)?.[1]?.toLowerCase() ?? "";
+    const base = { ...context, document_available: Boolean(document), document_saved: Boolean(document?.Saved), document_extension: extension, paragraph_count: Number(document?.Paragraphs?.Count ?? 0) };
+    hostLog("INFO", "preview.start", "预览排版流程开始", base);
+    try {
+      hostLog("DEBUG", "document.identity.start", "开始计算当前文档脱敏身份", base);
+      const identity = await this.documentIdentity();
+      hostLog("DEBUG", "document.identity.success", "当前文档脱敏身份计算完成", { ...base, document_identity_hash: identity });
+      const useCaseRequestId = id("preview");
+      hostLog("INFO", "preview.use_case.start", "开始调用 PreviewDocumentUseCase", { ...context, request_id: useCaseRequestId });
+      const value = await this.composition().previewUseCase.execute(useCaseRequestId);
+      hostLog("INFO", "preview.use_case.success", "PreviewDocumentUseCase 返回", { ...context, request_id: useCaseRequestId, recognition_paragraph_count: value.recognition.paragraphs.length, formatting_command_count: value.commands.commands.length, duration_ms: Date.now() - started });
+      const count = value.summary.preview_comment_count ?? 0;
+      const warningCount = value.summary.preview_warnings?.length ?? 0;
+      hostLog(count > 0 ? "INFO" : "ERROR", "preview.comment.readback", "预览批注即时读回完成", { ...context, preview_comment_count: count, preview_warning_count: warningCount });
+      if (count === 0) throw new Error(value.summary.preview_warnings?.[0] ?? "PREVIEW_COMMENT_READBACK_FAILED");
+      const grouped = new Map<number, FormattingCommandSet["commands"]>();
+      for (const command of value.commands.commands) {
+        const list = grouped.get(command.target.source_paragraph_index) ?? [];
+        list.push(command); grouped.set(command.target.source_paragraph_index, list);
+      }
+      hostLog("DEBUG", "preview.commands.grouped", "格式命令已按物理段落分组", { ...context, formatting_command_count: value.commands.commands.length, target_paragraph_count: grouped.size });
+      const models = value.recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, plan: formattingPlan(grouped.get(item.source_paragraph_index) ?? []), needs_review: item.needs_review }));
+      const mixed = value.summary.mixed_paragraph_count;
+      const unresolved = value.summary.unresolved_block_count;
+      const notices = [`已创建 ${count} 条临时批注`];
+      if (mixed) notices.push(`${mixed} 个物理段落包含多个角色，正式排版前需拆段`);
+      if (unresolved) notices.push(`${unresolved} 个识别块无法证明位置，仅供复核`);
+      this.store.update({ document_identity_hash: identity, formatting_preview_models: models, preview_comment_status: notices.join("；"), unresolved_block_count: unresolved, mixed_paragraph_count: mixed, active_view: "preview" });
+      hostLog("DEBUG", "preview.store.updated", "预览结果已写入任务窗格状态", { ...context, preview_comment_count: count, mixed_paragraph_count: mixed, unresolved_block_count: unresolved });
+      hostLog("INFO", "preview.success", "预览排版流程完成", { ...context, document_identity_hash: identity, recognition_paragraph_count: value.recognition.paragraphs.length, formatting_command_count: value.commands.commands.length, preview_comment_count: count, preview_warning_count: warningCount, mixed_paragraph_count: mixed, unresolved_block_count: unresolved, duration_ms: Date.now() - started });
+      return "预览排版完成";
+    } catch (error) {
+      hostLog("ERROR", "preview.failed", "预览排版流程失败", { ...context, stable_error_code: stableError(error), duration_ms: Date.now() - started }, error);
+      throw error;
+    }
+  }
   private async clearPreview(): Promise<string> { await this.composition().clearPreviewUseCase.execute(); this.store.update({ preview_comment_status: "预览批注已清除" }); return "预览批注已清除"; }
   private async format(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) }); const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`; this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "无 Docxtool 预览批注", active_view: "execution" }); return summary; }
   private async health(): Promise<string> {
@@ -128,7 +238,8 @@ export class HostCommandRouter {
 
 function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig { const stored = parse<ClassifiedRuntimeConfig>(application.PluginStorage.getItem(CONFIG_KEY)); const value = hostWindow.DocxtoolRuntimeConfig ?? stored; if (!value) throw new Error("PRODUCTION_COMPOSITION_NOT_READY"); application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(value)); return value; }
 async function reportHostAcceptance(stage: string, status: "PASS" | "FAIL", errorCode = ""): Promise<void> {
-  try { const session = await fetch("http://127.0.0.1:9528/v1/e2e/session").then((response) => response.ok ? response.json() as Promise<{ session_id?: string }> : Promise.reject()); if (session.session_id) await fetch("http://127.0.0.1:9528/v1/e2e/result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session.session_id, stage, status, error_code: errorCode }) }); } catch { /* acceptance reporting never changes a host command */ }
+  try { const session = await fetch("http://127.0.0.1:9528/v1/e2e/session").then((response) => response.ok ? response.json() as Promise<{ session_id?: string }> : Promise.reject(new Error("E2E_SESSION_UNAVAILABLE"))); if (session.session_id) await fetch("http://127.0.0.1:9528/v1/e2e/result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session.session_id, stage, status, error_code: errorCode }) }); }
+  catch (error) { hostLog("DEBUG", "host.acceptance.report.failed", "E2E 状态上报失败，Host 命令继续执行", { stage, stable_error_code: stableError(error) }, error); }
 }
 async function runAutomaticHostAcceptance(application: ApplicationLike, router: HostCommandRouter, build: BuildInfo): Promise<void> {
   const first = String(application.ActiveDocument?.Paragraphs?.Item?.(1)?.Range?.Text ?? ""); if (!first.startsWith("Docxtool 一键排版自动验收")) return;
@@ -165,38 +276,63 @@ async function runAutomaticHostAcceptance(application: ApplicationLike, router: 
   for (let attempt = 0; attempt < 30 && !document.Saved; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 100));
   await reportHostAcceptance("host_command_router", "PASS");
 }
-function install(): void {
-  const application = hostWindow.Application; const build = hostWindow.DocxtoolBuildInfo;
-  void reportHostAcceptance("host_module_loaded", "PASS");
-  if (!application || !build) { void reportHostAcceptance("host_install", "FAIL", !application ? "WPS_APPLICATION_UNAVAILABLE" : "BUILD_INFO_UNAVAILABLE"); return; }
-  const store = new HostResultStore(application.PluginStorage, build); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const router = new HostCommandRouter(application, panes, store, runtimeConfig(application));
+function installDiagnosticLogger(config: ClassifiedRuntimeConfig, build: BuildInfo, hostContextId: string): LoopbackDiagnosticLogger {
+  const diagnosticSessionId = `wps-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+  const logger = new LoopbackDiagnosticLogger({ endpoint: config.recognitionEndpoint, sessionToken: config.sessionToken, source: "host", component: "host", buildId: build.build_id, pluginVersion: build.plugin_version, hostContextId, sessionId: diagnosticSessionId, minimumLevel: "DEBUG" });
+  const early = hostWindow.DocxtoolEarlyLogQueue ?? [];
+  logger.adopt(early);
+  hostWindow.DocxtoolEarlyLogQueue = [];
+  hostWindow.DocxtoolDiagnosticLogger = logger;
+  hostWindow.DocxtoolDiagnosticLog = (level, component, event, message, data, error) => logger.writeForComponent(component, level, event, message, data, error);
+  hostLog("INFO", "host.logger.installed", "Host 根目录诊断日志客户端已安装", { early_event_count: early.length });
+  void logger.flush();
+  return logger;
+}
+function install(application: ApplicationLike, build: BuildInfo, config: ClassifiedRuntimeConfig, hostContextId: string): void {
+  installDiagnosticLogger(config, build, hostContextId);
+  const store = new HostResultStore(application.PluginStorage, build, hostContextId); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const router = new HostCommandRouter(application, panes, store, config);
   hostWindow.DocxtoolHostRuntime = { router, panes, store, build }; hostWindow.DocxtoolHostDispatch = (name, source, requestId, taskpaneBuildId) => router.dispatch(name, source, requestId, taskpaneBuildId);
   void reportHostAcceptance("host_router_installed", "PASS");
   hostWindow.setInterval(() => { const request = parse<BridgeRequest>(application.PluginStorage.getItem(REQUEST_KEY)); if (!request) return; application.PluginStorage.setItem(REQUEST_KEY, ""); if (request.schema_version !== 1 || !router.supports(request.command_name)) { store.update({ latest_error: "TASKPANE_MESSAGE_REJECTED", active_view: "issues" }); return; } void router.dispatch(request.command_name, "taskpane", request.request_id, request.taskpane_build_id); }, 200);
   hostWindow.setInterval(() => { void router.reconcileActiveDocument().catch(() => { /* no active document is normal during WPS transitions */ }); }, 750);
   void runAutomaticHostAcceptance(application, router, build);
 }
-let installAttempted = false;
 let installDone = false;
+let installAttempt = 0;
+let hostModuleReported = false;
 let installTimer: number | undefined;
 function tryInstall(): void {
   if (installDone) return;
+  installAttempt += 1;
   const application = hostWindow.Application; const build = hostWindow.DocxtoolBuildInfo;
-  if (!application || !build) {
-    if (!installAttempted) {
-      installAttempted = true;
-      void reportHostAcceptance("host_module_loaded", "PASS");
-    }
+  let config: ClassifiedRuntimeConfig | null = null;
+  if (application) {
+    try { config = runtimeConfig(application); }
+    catch (error) { if (stableError(error) !== "PRODUCTION_COMPOSITION_NOT_READY") hostLog("WARN", "host.install.config.failed", "读取 Host 运行时配置失败", { attempt: installAttempt, stable_error_code: stableError(error) }, error); }
+  }
+  const readiness = { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: Boolean(config), plugin_storage_available: Boolean(application?.PluginStorage), active_document_available: Boolean(application?.ActiveDocument), host_dispatch_before_install: typeof hostWindow.DocxtoolHostDispatch === "function" };
+  hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "host.install.attempt", "检查 Host runtime 安装条件", readiness);
+  if (!hostModuleReported) { hostModuleReported = true; void reportHostAcceptance("host_module_loaded", "PASS"); }
+  if (!application || !build || !config) {
+    if ([1, 20, 40, 60].includes(installAttempt)) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "host.install.waiting", "等待 WPS Application、构建信息和运行时配置", readiness);
     return;
   }
+  const started = Date.now();
   try {
+    hostLog("INFO", "host.install.start", "开始安装 HostCommandRouter", readiness);
+    const hostContextId = crypto.randomUUID();
+    install(application, build, config, hostContextId);
     installDone = true;
     if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
-    install();
+    hostLog("INFO", "host.install.success", "HostCommandRouter 安装成功", { ...readiness, host_context_id: hostContextId, duration_ms: Date.now() - started });
   } catch (error) {
     const code = stableError(error);
+    installDone = true;
+    if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
+    hostLog("ERROR", "host.install.failed", "HostCommandRouter 安装失败", { ...readiness, stable_error_code: code, duration_ms: Date.now() - started }, error);
     void reportHostAcceptance("host_install", "FAIL", code);
-    new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" });
+    try { new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" }); }
+    catch (storeError) { hostLog("ERROR", "host.install.state.failed", "Host 安装失败状态无法写入 PluginStorage", { stable_error_code: code }, storeError); }
   }
 }
 tryInstall();

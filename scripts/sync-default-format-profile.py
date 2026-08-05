@@ -46,7 +46,12 @@ def main():
     profile = build(json.loads(raw.decode("utf-8")))
     rendered = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
     manifest = json.dumps({"source_sha256":hashlib.sha256(raw).hexdigest(),"docxtool_version":metadata.version("docxtool"),"profile_version":"1.0"}, ensure_ascii=False, indent=2) + "\n"
-    taskpane_profile = "window.DocxtoolDefaultProfile = " + json.dumps(profile, ensure_ascii=False, separators=(",", ":")) + ";\n"
+    taskpane_profile = (
+        "window.DocxtoolDefaultProfile = "
+        + json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
+        + ";\n"
+        + 'if(typeof window.DocxtoolEarlyLog==="function"){window.DocxtoolEarlyLog("DEBUG","main","bootstrap.script.loaded","默认格式配置脚本已执行",{asset:"ui/default-format-profile.js"});}\n'
+    )
     if args.check:
         if (not OUT.is_file() or not MANIFEST.is_file() or not TASKPANE_PROFILE.is_file()
                 or OUT.read_text(encoding="utf-8") != rendered
