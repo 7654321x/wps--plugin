@@ -29,7 +29,14 @@
     "logs:wps:path": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 path",
     "logs:wps:tail": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 tail",
     "logs:wps:clear": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 clear",
-    "logs:wps:summary": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 summary"
+    "logs:wps:summary": "pwsh -NoProfile -File scripts/wps-diagnostic-log.ps1 summary",
+    "build:local-runtime": "pwsh -NoProfile -File scripts/build-local-recognition-runtime.ps1",
+    "install:local-runtime": "pwsh -NoProfile -File scripts/install-local-runtime.ps1",
+    "build:local-direct": "npm run build:local-runtime && npm run install:local-runtime && npm run build:classified",
+    "dev:local-direct:prepare": "pwsh -NoProfile -File scripts/local-direct.ps1 prepare",
+    "dev:local-direct:status": "pwsh -NoProfile -File scripts/local-direct.ps1 status",
+    "dev:local-direct:stop": "pwsh -NoProfile -File scripts/local-direct.ps1 stop",
+    "verify:local-direct": "pwsh -NoProfile -File scripts/verify-local-direct.ps1"
   },
   "devDependencies": {
     "ajv": "8.17.1",

@@ -18,8 +18,8 @@ document.write("<script src='ui/build-info.js?v=" + encodeURIComponent(DOCXTOOL_
 window.DocxtoolVersionedAsset = function (asset) { var build = window.DocxtoolBuildInfo && window.DocxtoolBuildInfo.build_id ? window.DocxtoolBuildInfo.build_id : DOCXTOOL_BOOTSTRAP_NONCE; return asset + "?v=" + encodeURIComponent(build); };
 window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/default-format-profile.js" });
 document.write("<script src='" + window.DocxtoolVersionedAsset("ui/default-format-profile.js") + "'></script>");
-window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/e2e-session.js" });
-document.write("<script src='" + window.DocxtoolVersionedAsset("ui/e2e-session.js") + "'></script>");
+window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/local-runtime-config.js" });
+document.write("<script src='" + window.DocxtoolVersionedAsset("ui/local-runtime-config.js") + "'></script>");
 window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "js/ribbon.js" });
 document.write("<script src='" + window.DocxtoolVersionedAsset("js/ribbon.js") + "'></script>");
 window.DocxtoolTaskPanePath = "ui/taskpane.html";

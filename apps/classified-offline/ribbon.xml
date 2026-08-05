@@ -1,9 +1,16 @@
 <customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
-  <ribbon><tabs><tab id="docxtoolClassifiedTab" label="Docxtool 涉密版">
-    <group id="docxtoolActions" label="公文排版">
-      <button id="preview" label="预览排版" onAction="OnAction" size="large"/>
-      <button id="apply" label="一键排版" onAction="OnAction" size="large"/>
-      <button id="health" label="功能检测" onAction="OnAction" size="large"/>
-    </group>
-  </tab></tabs></ribbon>
+  <ribbon>
+    <tabs>
+      <tab id="docxtoolLocalTab" label="Docxtool">
+        <group id="docxtoolLocalActions" label="本地排版">
+          <button id="preview" label="预览排版" onAction="OnAction" getEnabled="GetActionEnabled" size="large"/>
+          <button id="apply" label="一键排版" onAction="OnAction" getEnabled="GetActionEnabled" size="large"/>
+        </group>
+        <group id="docxtoolLocalTools" label="工具">
+          <button id="panel" label="状态面板" onAction="OnAction"/>
+          <button id="health" label="本机检测" onAction="OnAction" getEnabled="GetActionEnabled"/>
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
 </customUI>

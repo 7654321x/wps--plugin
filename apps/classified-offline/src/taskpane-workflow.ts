@@ -1,5 +1,5 @@
 import { errorMessage, errorText } from "./error-messages.js";
-import { LoopbackDiagnosticLogger, safeError, type DiagnosticEvent, type DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
+import { safeError, type DiagnosticEvent, type DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
 
 type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
@@ -13,24 +13,22 @@ interface HostState {
   health_overall?: "PASS" | "WARN" | "FAIL" | ""; health_report?: string;
 }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; }
-interface RuntimeConfig { recognitionEndpoint: string; commandEndpoint: string; sessionToken: string; }
 type BridgeWindow = Window & {
   DocxtoolBuildInfo?: BuildInfo;
-  Application?: { PluginStorage?: StorageLike; GetTaskPane?: (id: number) => { Visible: boolean } | undefined };
+  Application?: { PluginStorage?: StorageLike; GetTaskPane?: (id: number) => { Visible: boolean } | undefined; ActiveDocument?: { Activate?: () => void; ActiveWindow?: { Activate?: () => void } } };
   DocxtoolEarlyLogQueue?: DiagnosticEvent[];
-  DocxtoolDiagnosticLogger?: LoopbackDiagnosticLogger;
+  DocxtoolDiagnosticLogger?: { writeForComponent: (component: string, level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void };
   DocxtoolDiagnosticLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
 };
 const bridgeWindow = window as BridgeWindow;
 
 const RESULT_KEY = "docxtool_classified_host_result_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
-const CONFIG_KEY = "docxtool_classified_runtime_config";
 const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 let pendingRequestId = "";
 let pendingStartedAt = 0;
 let lastObservedRequestState = "";
-let diagnosticLogger: LoopbackDiagnosticLogger | null = null;
+let diagnosticLogger: BridgeWindow["DocxtoolDiagnosticLogger"] | null = null;
 const taskpaneEarlyQueue: DiagnosticEvent[] = [];
 function taskpaneLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
   try {
@@ -49,17 +47,16 @@ function tryInstallTaskpaneLogger(): void {
   const storage = bridgeWindow.Application?.PluginStorage;
   const build = bridgeWindow.DocxtoolBuildInfo;
   if (!storage || !build) return;
-  const config = parse<RuntimeConfig>(storage.getItem(CONFIG_KEY), "runtime_config");
-  if (!config) return;
   try {
-    const hostContextId = new URLSearchParams(location.search).get("host_context") ?? "taskpane";
-    diagnosticLogger = new LoopbackDiagnosticLogger({ endpoint: config.recognitionEndpoint, sessionToken: config.sessionToken, source: "taskpane", component: "taskpane", buildId: build.build_id, pluginVersion: build.plugin_version, hostContextId, sessionId: `pane-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`, minimumLevel: "DEBUG" });
-    diagnosticLogger.adopt(taskpaneEarlyQueue);
-    taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length);
+    diagnosticLogger = {
+      writeForComponent(component, level, event, message, data = {}, error) {
+        taskpaneEarlyQueue.push({ timestamp: new Date().toISOString(), level, component, event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) });
+        if (taskpaneEarlyQueue.length > 500) taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length - 500);
+      },
+    };
     bridgeWindow.DocxtoolDiagnosticLogger = diagnosticLogger;
     bridgeWindow.DocxtoolDiagnosticLog = (level, component, event, message, data, error) => diagnosticLogger?.writeForComponent(component, level, event, message, data, error);
     taskpaneLog("INFO", "taskpane.logger.installed", "任务窗格诊断日志客户端已安装", {});
-    void diagnosticLogger.flush();
   } catch (error) { taskpaneLog("ERROR", "taskpane.logger.install.failed", "任务窗格诊断日志客户端安装失败", {}, error); }
 }
 function request(commandName: HostCommandName): void {
@@ -89,6 +86,15 @@ function closeTaskPane(): void {
   if (!application?.GetTaskPane || !storage) { taskpaneLog("ERROR", "taskpane.hide.failed", "无法取得 WPS 任务窗格 API", { stable_error_code: "TASKPANE_BRIDGE_NOT_READY" }); text("issues", "TASKPANE_BRIDGE_NOT_READY：无法取得 WPS 任务窗格 API。"); return; }
   try { const saved = storage.getItem("docxtool_classified_taskpane"); if (!saved) return; const pane = application.GetTaskPane(Number(saved)); if (!pane) { storage.setItem("docxtool_classified_taskpane", ""); return; } pane.Visible = false; taskpaneLog("INFO", "taskpane.hide.success", "任务窗格已隐藏", {}); }
   catch (error) { taskpaneLog("ERROR", "taskpane.hide.failed", "WPS 未能关闭任务窗格", { stable_error_code: "TASKPANE_HIDE_FAILED" }, error); text("issues", "TASKPANE_HIDE_FAILED：WPS 未能关闭任务窗格。"); }
+}
+function focusDocument(): void {
+  try {
+    bridgeWindow.Application?.ActiveDocument?.Activate?.();
+    bridgeWindow.Application?.ActiveDocument?.ActiveWindow?.Activate?.();
+    taskpaneLog("INFO", "taskpane.focus.restore.success", "已请求恢复文档焦点", {});
+  } catch (error) {
+    taskpaneLog("WARN", "taskpane.focus.restore.failed", "恢复文档焦点失败", {}, error);
+  }
 }
 function rows(id: string, values: string[]): void { node(id).replaceChildren(...values.map((value) => { const row = document.createElement("div"); row.className = "row"; row.textContent = value; return row; })); }
 function issueText(state: HostState): string {
@@ -144,6 +150,7 @@ for (const [elementId, command] of [["recognize-document", "recognize_document"]
 }
 node("close-taskpane").addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "关闭任务窗格按钮已点击", { control_id: "close-taskpane", command_name: "close_taskpane" }); closeTaskPane(); });
 taskpaneLog("DEBUG", "taskpane.button.bound", "关闭任务窗格按钮已绑定", { control_id: "close-taskpane", command_name: "close_taskpane" });
+node("focus-document").addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "返回文档按钮已点击", { control_id: "focus-document" }); focusDocument(); });
 const build = bridgeWindow.DocxtoolBuildInfo; text("plugin-version", build?.plugin_version ?? "未知"); text("build-id", build?.build_id?.slice(0, 20) ?? "未知");
 tryInstallTaskpaneLogger();
 taskpaneLog("DEBUG", "taskpane.poll.started", "任务窗格 Host 状态轮询已启动", { interval_ms: 250 });

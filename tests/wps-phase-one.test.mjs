@@ -644,7 +644,7 @@ test("HostCommandRouter logs the original stack while HostState keeps only the s
 
 test("HostCommandRouter isolates stored results after an active-document switch", async () => {
   const mocks = hostMocks(); mocks.application.ActiveDocument = { FullName: "C:\\one.docx", Paragraphs: { Count: 2 } };
-  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" }; const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane"); const router = new HostCommandRouter(mocks.application, panes, store, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "x" });
+  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" }; const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane"); const router = new HostCommandRouter(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" });
   store.update({ document_identity_hash: "previous-document", recognition_summary: "旧文档结果", paragraph_recognition_models: [{ paragraph_index: 0, recognized_type: "body", confidence: 1, needs_review: false }], unresolved_block_count: 2, mixed_paragraph_count: 3 });
   await router.reconcileActiveDocument(); assert.equal(store.read().recognition_summary, ""); assert.deepEqual(store.read().paragraph_recognition_models, []);
   assert.equal(store.read().unresolved_block_count, 0); assert.equal(store.read().mixed_paragraph_count, 0);
@@ -668,30 +668,29 @@ test("taskpane close button uses the host bridge and CSS stays inside its webvie
   assert.equal(/position\s*:\s*fixed|z-index|pointer-capture|focus-trap/i.test(html), false);
 });
 
-test("Ribbon callbacks use the fixed HostCommandRouter registry", async () => {
+test("Ribbon callbacks enqueue local commands without touching the router directly", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8"); const calls = [];
-  const pane = { Visible: true }; const context = { Promise, JSON, Date, Number, String, Object, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3891/main.js"; } } }, window: { DocxtoolHostDispatch(name, source) { calls.push([name, source]); return Promise.resolve(); }, Application: { GetTaskPane() { return pane; }, PluginStorage: { getItem(key) { return key === "docxtool_classified_taskpane" ? "1" : null; }, setItem() {} } } } };
-  vm.runInNewContext(source, context); for (const id of ["preview", "apply", "health"]) context.OnAction({ Id: id });
-  assert.deepEqual(calls, [["preview_document", "ribbon"], ["format_document", "ribbon"], ["health_check", "ribbon"]]); assert.equal(pane.Visible, true);
+  const context = { Promise, JSON, Date, Number, String, Object, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3891/main.js"; } } }, window: { DocxtoolHostEnqueue(name, source) { calls.push([name, source]); return { accepted: true, command_id: "cmd", command_name: name }; }, Application: { PluginStorage: { getItem() { return null; }, setItem() {} } } } };
+  vm.runInNewContext(source, context); for (const id of ["preview", "apply", "health", "panel"]) context.OnAction({ Id: id });
+  assert.deepEqual(calls, [["preview_document", "ribbon"], ["format_document", "ribbon"], ["health_check", "ribbon"], ["toggle_taskpane", "ribbon"]]);
 });
 
-test("classified Ribbon exposes exactly preview, apply and health in the required order", async () => {
+test("classified Ribbon exposes the local-direct buttons in the required order", async () => {
   const xml = await readFile(new URL("../apps/classified-offline/ribbon.xml", import.meta.url), "utf8");
   const buttons = [...xml.matchAll(/<button\s+id="([^"]+)"\s+label="([^"]+)"\s+onAction="([^"]+)"/g)].map((match) => match.slice(1));
-  assert.deepEqual(buttons, [["preview", "预览排版", "OnAction"], ["apply", "一键排版", "OnAction"], ["health", "功能检测", "OnAction"]]);
-  for (const removed of ["仅识别", "打开任务窗格", "关闭任务窗格", "关于"]) assert.equal(xml.includes(removed), false);
+  assert.deepEqual(buttons, [["preview", "预览排版", "OnAction"], ["apply", "一键排版", "OnAction"], ["panel", "状态面板", "OnAction"], ["health", "本机检测", "OnAction"]]);
+  for (const removed of ["仅识别", "打开任务窗格", "关闭任务窗格", "关于", "功能检测"]) assert.equal(xml.includes(removed), false);
 });
 
-test("production ribbon dispatches preview directly to host router", async () => {
+test("production ribbon enqueues preview locally instead of dispatching directly", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8");
   assert.equal(source.includes("dispatchEvent"), false);
   assert.equal(source.includes("CustomEvent"), false);
-  assert.equal(source.includes("DocxtoolHostDispatch"), true);
+  assert.equal(source.includes("DocxtoolHostEnqueue"), true);
   const calls = [];
-  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { Application: { PluginStorage: { getItem() { return null; }, setItem() {} } }, DocxtoolHostDispatch(name, sourceName) { calls.push([name, sourceName]); return Promise.resolve({ status: "PASS" }); } } };
+  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { Application: { PluginStorage: { getItem() { return null; }, setItem() {} } }, DocxtoolHostEnqueue(name, sourceName) { calls.push([name, sourceName]); return { accepted: true, command_id: "cmd", command_name: name }; } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "preview" }), true);
-  await Promise.resolve();
   assert.deepEqual(calls, [["preview_document", "ribbon"]]);
 });
 
@@ -702,8 +701,8 @@ test("production ribbon reports taskpane creation failure instead of swallowing 
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "preview" }), true);
   const state = JSON.parse(storage.get("docxtool_classified_host_result_v1"));
-  assert.equal(state.latest_error, "TASKPANE_CREATE_FAILED");
-  assert.match(state.formatting_progress, /WPS 未能创建任务窗格/);
+  assert.equal(state.latest_error, "HOST_COMMAND_QUEUE_NOT_READY");
+  assert.match(state.formatting_progress, /本地命令队列尚未就绪/);
 });
 
 test("taskpane exposes immediate pending feedback until host consumes request", async () => {
@@ -726,11 +725,11 @@ test("classified diagnostics cover bootstrap, Ribbon, Host, taskpane and preview
     comments: await readFile(new URL("../packages/wps-adapter/src/preview-comments.ts", import.meta.url), "utf8"),
   };
   for (const event of ["bootstrap.main.loaded", "bootstrap.script.requested"]) assert.match(files.main, new RegExp(event.replaceAll(".", "\\.")));
-  for (const event of ["ribbon.action.received", "ribbon.dispatch.start", "ribbon.dispatch.completed", "ribbon.dispatch.rejected"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["ribbon.action.received", "ribbon.command.enqueued", "ribbon.command.enqueue.failed"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
   for (const event of ["host.module.loaded", "host.install.attempt", "host.install.success", "host.router.dispatch.received", "host.router.dispatch.failed", "preview.use_case.start", "preview.comment.readback"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
   for (const event of ["taskpane.module.loaded", "taskpane.button.clicked", "taskpane.request.persisted", "taskpane.pending.timeout"]) assert.match(files.taskpane, new RegExp(event.replaceAll(".", "\\.")));
-  assert.match(files.recognition, /recognition\.request\.(start|response|failed)/);
-  assert.match(files.commands, /command_service\.request\.(start|response|failed)/);
+  assert.match(files.recognition, /(recognition\.request\.(start|response|failed)|recognition\.local_process\.start)/);
+  assert.match(files.commands, /command_service\.request\.(start|response|failed)|local-format-engine/);
   for (const event of ["preview.comment.write.start", "preview.comment.write.failed", "preview.comment.readback.success"]) assert.match(files.comments, new RegExp(event.replaceAll(".", "\\.")));
 });
 
@@ -755,30 +754,23 @@ test("production entry loads the runtime config and the ribbon file that the bui
   // and WPS reports an invalid command for every button.
   assert.match(productionMain, /DocxtoolVersionedAsset\("js\/ribbon\.js"\)/);
   assert.equal(productionMain.includes("js/ribbon-production.js"), false);
-  // DocxtoolRuntimeConfig (recognition/command endpoints + session token) is
-  // written to ui/e2e-session.js by prepare and must reach the host runtime;
-  // without it install() fails with PRODUCTION_COMPOSITION_NOT_READY and no
-  // host command router is ever installed.
-  assert.match(productionMain, /DocxtoolVersionedAsset\("ui\/e2e-session\.js"\)/);
-  assert.match(config, /copyFile\(\{src:"ui\/e2e-session\.js",dest:"ui\/e2e-session\.js"\}\)/);
+  assert.match(productionMain, /DocxtoolVersionedAsset\("ui\/local-runtime-config\.js"\)/);
+  assert.match(config, /copyFile\(\{src:"ui\/local-runtime-config\.js",dest:"ui\/local-runtime-config\.js"\}\)/);
   assert.match(productionMain, /<script type='module' src='/);
   assert.match(productionMain, /DocxtoolVersionedAsset\("host-runtime\.js"\)/);
   assert.match(productionMain, /ui\/build-info\.js\?v=/);
 });
 
-test("classified Ribbon preserves a safe error and opens the result pane when the host router is stale", async () => {
+test("classified Ribbon preserves a safe error when the host queue is stale", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
-  let created = 0;
   const storage = new Map([["docxtool_classified_taskpane", "stale-pane"]]);
   const context = { decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.js"; } } }, window: { Application: {
     PluginStorage: { getItem(key) { return storage.get(key); }, setItem(key, value) { storage.set(key, value); } },
     GetTaskPane() { throw new Error("disposed"); },
-    CreateTaskPane() { created += 1; return { ID: "fresh-pane", Visible: false }; },
   } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "unknown" }), true);
-  assert.equal(created, 1);
-  assert.equal(storage.get("docxtool_classified_taskpane"), "fresh-pane");
+  assert.equal(storage.get("docxtool_classified_host_result_v1") !== undefined, true);
 });
 
 test("one-click formatting removes the tracked preview then re-recognizes the current document", async () => {
@@ -825,26 +817,25 @@ test("preview document identity mismatch refuses cleanup and formatting", async 
 test("classified health check is read-only and returns concrete PASS items", async () => {
   const font = { Name: "仿宋_GB2312" }; const format = { Alignment: 0 }; const page = { PageWidth: 1 };
   const comments = { Count: 0, Item() { throw new Error("none"); }, Add() {} };
-  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏测试\r", Font: font, ParagraphFormat: format, PageSetup: page } }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 2, Item(index) { return { Name: index === 1 ? "仿宋_GB2312" : "Times New Roman" }; } } };
+  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏测试\r", Font: font, ParagraphFormat: format, PageSetup: page } }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 2, Item(index) { return { Name: index === 1 ? "仿宋_GB2312" : "Times New Roman" }; } }, FileSystem: { Exists() { return true; }, ReadFileString() { return JSON.stringify({ executable_path: "C:\\runtime\\docxtool-recognize.exe" }); } }, OAAssist: { ShellExecute() {} } };
   const before = JSON.stringify({ saved: application.ActiveDocument.Saved, comments: comments.Count, font, format, page });
-  const fetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx", package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" } : { ok: true, package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" }), { status: 200, headers: { "Content-Type": "application/json" } });
   const profile = { page_setup: { normal_east_asia_font_name: "仿宋_GB2312", normal_latin_font_name: "Times New Roman" }, styles: {} };
-  const report = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, { build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, profile, true, fetcher).run();
+  const report = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" }, { build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, profile, true).run();
   assert.equal(report.overall, "PASS"); assert.equal(report.items.every((item) => item.status === "PASS"), true); assert.match(report.text, /总体结果：PASS/);
   assert.equal(JSON.stringify({ saved: application.ActiveDocument.Saved, comments: comments.Count, font, format, page }), before);
 });
 
 test("classified health check reports missing fonts as WARN and unreachable services with stable codes", async () => {
   const range = { Text: "fixture\r", Font: {}, ParagraphFormat: {}, PageSetup: {} }; const comments = { Count: 0, Item() {}, Add() {} };
-  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: range }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} } };
+  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: range }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} }, FileSystem: { Exists(path) { return path.includes("docxtool-recognize.exe"); }, ReadFileString() { return "{}"; } }, OAAssist: { ShellExecute() {} } };
   const base = [{ build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, { page_setup: { normal_east_asia_font_name: "方正小标宋简体" }, styles: {} }];
-  const warnFetcher = async (input) => new Response(JSON.stringify(String(input).endsWith("/v1/version") ? { recognition_sdk: "docxtool.sdk.recognize_docx", package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" } : { ok: true, package_version: "1.7", locator_version: "source-locator-v2", host_text_contract_version: "host-text-v1" }), { status: 200, headers: { "Content-Type": "application/json" } });
-  const warn = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, ...base, true, warnFetcher).run();
+  const warn = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" }, ...base, true).run();
   assert.equal(warn.overall, "WARN"); assert.deepEqual(warn.missing_fonts, ["方正小标宋简体"]); assert.equal(warn.first_error_code, "REQUIRED_FONT_MISSING");
-  const failed = await new ClassifiedHealthChecker(application, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "token" }, ...base, true, async () => { throw new TypeError("offline"); }).run();
-  assert.equal(failed.overall, "FAIL"); assert.equal(failed.items.find((item) => item.check_id === "recognition_service").error_code, "LOCAL_AGENT_UNAVAILABLE"); assert.equal(failed.items.find((item) => item.check_id === "command_service").error_code, "COMMAND_SERVICE_UNAVAILABLE");
-  assert.match(failed.text, /本地识别服务不可达/);
-  assert.match(failed.text, /错误码：LOCAL_AGENT_UNAVAILABLE/);
+  const failed = await new ClassifiedHealthChecker({ ActiveDocument: application.ActiveDocument, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} }, FileSystem: undefined }, { recognitionExecutablePath: "", runtimeVersion: "1", runtimeSha256: "a" }, ...base, true).run();
+  assert.equal(failed.overall, "FAIL");
+  assert.equal(failed.items.find((item) => item.check_id === "filesystem_api").error_code, "WPS_FILESYSTEM_UNAVAILABLE");
+  assert.equal(failed.items.find((item) => item.check_id === "local_runtime").error_code, "LOCAL_RUNTIME_CONFIGURATION_REQUIRED");
+  assert.equal(failed.items.find((item) => item.check_id === "local_process_api").error_code, "LOCAL_PROCESS_EXECUTION_BLOCKED");
 });
 
 test("classified UI error messages localize stable WPS error codes", () => {

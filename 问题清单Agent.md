@@ -122,13 +122,13 @@
 - 正确方案：每个外部命令执行后立即检查 `$LASTEXITCODE`，非零时立刻 `throw`；优先使用项目锁定的 `.venv`，避免系统 Python 缺少依赖导致伪代码故障。
 - 自动验证门槛：发布记录分别列出 pytest、Node、Ruff、构建和 WPS `verify:all` 的独立成功结果；任何一步失败都不得进入 commit/push。
 
-## P015 WPS 本级虚拟环境与 wheel 安装被上级源码绕过
+## P015 WPS 本级虚拟环境与 wheel 安装被其他源码目录绕过
 
-- 症状：用户要求恢复或重装 wheel 后，`pip show docxtool` 在 WPS 本级 `.venv` 中为空，或 9528 服务仍能运行但实际从上级 `..\src` 加载 `docxtool`，导致 wheel 重装不生效。
-- 根因：WPS 脚本曾指向 `D:\PycharmProjects\docxtool\.venv`，并把 `D:\PycharmProjects\docxtool\src` 放入 `PYTHONPATH`；这会绕过 `D:\PycharmProjects\docxtool\wps\.venv` 中安装的 wheel。
-- 禁止：WPS 插件运行、验证或服务启动时依赖上级 `.venv` 或上级 `src`；不得用“接口能通”证明 wheel 已恢复。
-- 正确方案：WPS 项目固定使用 `D:\PycharmProjects\docxtool\wps\.venv`；local-agent 与 command-service 通过本仓库源码路径加载，`docxtool` 只能来自本级 `.venv` 已安装的 wheel；`local-agent` 依赖版本必须与当前 wheel 版本一致。
-- 自动验证门槛：`wps\.venv\Scripts\python.exe -m pip show docxtool` 显示当前 wheel 版本；Python 直接导入路径位于 `wps\.venv\Lib\site-packages\docxtool`；9528 重启后真实识别返回 78 个段落 locator verified 和 1 个跳过的 table block；`scripts\verify-all.ps1` PASS。
+- 症状：用户要求恢复或重装 wheel 后，`pip show docxtool` 在 WPS 本级 `.venv` 中为空，或服务/脚本仍能运行但实际从其他仓库源码目录加载 `docxtool`，导致 wheel 重装不生效。
+- 根因：WPS 脚本曾指向旧仓库 `.venv` 或把旧仓库 `src` 放入 `PYTHONPATH`；这会绕过 `D:\PycharmProjects\wps\.venv` 中安装的 wheel。
+- 禁止：WPS 插件运行、验证或服务启动时依赖其他仓库 `.venv` 或源码目录；不得用“接口能通”证明 wheel 已恢复。
+- 正确方案：WPS 项目固定使用 `D:\PycharmProjects\wps\.venv`；local-agent 与 command-service 只通过本仓库源码路径加载，`docxtool` 只能来自本级 `.venv` 已安装的 wheel；`local-agent` 依赖版本必须与当前 wheel 版本一致。
+- 自动验证门槛：`D:\PycharmProjects\wps\.venv\Scripts\python.exe -m pip show docxtool` 显示当前 wheel 版本；Python 直接导入路径位于 `D:\PycharmProjects\wps\.venv\Lib\site-packages\docxtool`；`scripts\verify-all.ps1` PASS。
 
 ## 本轮固定批注模板
 
@@ -225,3 +225,19 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：不得通过删除共享依赖、复制业务实现或把 bundle 文本拼接成假单文件规避；不得把 Ribbon 回调本身改为 module 后失去 WPS 所需的全局函数。
 - 正确方案：build-info、runtime config 和 Ribbon 继续使用 classic script；仅对 Vite ESM 产物 `host-runtime.js`、`taskpane-workflow.js` 使用 `type="module"`。Host 自带安装重试，允许 module 延后执行后再等待 `Application`、build 和 runtime config。
 - 自动验证门槛：源码测试断言开发/生产 main 的 host runtime 使用 module 标签，两个 taskpane workflow 通过 module 动态导入；classified build 后产物首部可含静态 `import`，但所有加载点必须采用 module 语义；`verify-addin` 强制检查 production main 和 build 版本参数；真实 WPS 重启后根日志必须出现 `host.module.loaded` 和 `host.install.success`。
+
+## P024 Ribbon 直接驱动业务与本地直连 runtime 未收口
+
+- 症状：Ribbon 点击后需要等 HostDispatch/任务窗格/旧 9528 链路，或者 TaskPane 自动弹出抢占焦点；健康检查仍围着识别服务、命令服务和 session token 打转。
+- 根因：入口层、Host 路由、TaskPane 和 E2E 预览状态仍混在一起；生产入口继续依赖 `ui/e2e-session.js`、HTTP 端点和旧 `DocxtoolHostDispatch`，导致界面与业务耦合。
+- 禁止：Ribbon 直接调长任务；任务窗格自动开/关业务面板；生产代码重新引入 9528、HttpCommandServiceClient、HttpLocalRecognitionTransport、LocalEndpointProvider 或 session token；把没有 exe 的本地直连伪装成可用。
+- 正确方案：Ribbon 只调用 `DocxtoolHostEnqueue`；Host 统一串行队列消费命令；TaskPane 只展示状态并可返回文档；健康检查只看本机 FileSystem、ShellExecute、runtime current.json 和 exe 存在性；本地 runtime 缺失时必须明确报 `LOCAL_RECOGNITION_RUNTIME_BUILD_NOT_CONFIGURED` / `LOCAL_RECOGNITION_RUNTIME_NOT_FOUND`，不能偷偷回退 HTTP。
+- 自动验证门槛：`npm run typecheck`、`npm test`、`npm run verify:local-direct`、`npm run build:classified`、`npm run verify:addin -- classified-offline` 全部通过；生产扫描不得命中 `HttpLocalRecognitionTransport`、`HttpCommandServiceClient`、`LocalEndpointProvider`、`recognitionEndpoint`、`commandEndpoint`、`sessionToken`、`127.0.0.1:9528`、`/v1/recognize`、`/v1/commands` 或 `DocxtoolHostDispatch`；真实 WPS 中按钮点击后应先显示入队状态，再由同一队列异步完成。
+
+## P025 WPS 仓库路径误判为旧嵌套目录
+
+- 症状：代码或文档被写入 `D:\PycharmProjects\docxtool\wps` 或上级 `D:\PycharmProjects\docxtool`，而不是当前真实仓库 `D:\PycharmProjects\wps`。
+- 根因：历史交接文档保留旧嵌套仓库路径，自动工具的当前工作目录也可能仍指向旧路径。
+- 禁止：凭默认工作目录直接修改文件；不得在未核对 `git rev-parse --show-toplevel` 的情况下新增入口、脚本或发布文件。
+- 正确方案：每轮涉及本项目文件前先确认仓库根为 `D:\PycharmProjects\wps`；所有相对路径均以该目录为根。只有用户明确要求时才跨目录，且跨目录前必须说明目标和原因。
+- 自动验证门槛：`git -C D:\PycharmProjects\wps rev-parse --show-toplevel` 返回 `D:/PycharmProjects/wps`；本轮 `git status` 只检查该仓库；规范扫描不得在现行规则中继续把 `D:\PycharmProjects\docxtool\wps` 写作事实源。

@@ -11,17 +11,14 @@ interface DefaultProfile {
   page_setup?: { normal_east_asia_font_name?: string; normal_latin_font_name?: string };
   styles?: Record<string, { east_asia_font_name?: string; latin_font_name?: string }>;
 }
-type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-
 const checks = [
   { check_id: "plugin_host", group: "wps", title: "插件宿主", dependencies: [], retryable: false },
   { check_id: "current_document", group: "wps", title: "当前文档", dependencies: [], retryable: false },
   { check_id: "document_api", group: "wps", title: "WPS 文档 API", dependencies: [], retryable: false },
   { check_id: "comment_api", group: "wps", title: "批注 API", dependencies: [], retryable: false },
-  { check_id: "recognition_service", group: "service", title: "识别服务", dependencies: [], retryable: true },
-  { check_id: "recognition_wheel", group: "service", title: "识别引擎", dependencies: [], retryable: true },
-  { check_id: "command_service", group: "service", title: "命令服务", dependencies: [], retryable: true },
-  { check_id: "session_token", group: "runtime", title: "本机会话", dependencies: [], retryable: false },
+  { check_id: "filesystem_api", group: "wps", title: "文件系统 API", dependencies: [], retryable: false },
+  { check_id: "local_runtime", group: "runtime", title: "本地识别运行时", dependencies: [], retryable: false },
+  { check_id: "local_process_api", group: "wps", title: "本地进程调用", dependencies: [], retryable: false },
   { check_id: "required_fonts", group: "wps", title: "必需字体", dependencies: [], retryable: false },
   { check_id: "taskpane_api", group: "wps", title: "任务窗格 API", dependencies: [], retryable: false },
   { check_id: "build_identity", group: "runtime", title: "构建一致性", dependencies: [], retryable: false },
@@ -39,14 +36,6 @@ function requiredFonts(profile?: DefaultProfile): string[] {
   for (const style of Object.values(profile.styles ?? {})) names.push(style.east_asia_font_name, style.latin_font_name);
   return [...new Set(names.filter((value): value is string => Boolean(value)))];
 }
-async function getJson(fetcher: Fetcher, base: string, path: string): Promise<Record<string, unknown>> {
-  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 3000);
-  try {
-    const response = await fetcher(new URL(path, base.replace(/\/?$/, "/")), { method: "GET", cache: "no-store", signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP_${response.status}`);
-    return await response.json() as Record<string, unknown>;
-  } finally { clearTimeout(timer); }
-}
 function reportText(overall: HealthStatus, items: SafeHealthItem[], missingFonts: string[]): string {
   const lines = ["DocxTool 功能检测", "", ...items.map((item) => `${item.title}：${item.status}${item.error_code ? `（${errorMessage(item.error_code)}；错误码：${item.error_code}）` : ""}`), "", `总体结果：${overall}`];
   if (missingFonts.length) lines.push("", "缺少字体：", ...missingFonts);
@@ -59,7 +48,6 @@ export class ClassifiedHealthChecker {
     private readonly application: Record<string, any>, private readonly config: ClassifiedRuntimeConfig,
     private readonly currentBuild: BuildIdentity | undefined, private readonly storedBuild: BuildIdentity,
     private readonly profile: DefaultProfile | undefined, private readonly routerInstalled: boolean,
-    private readonly fetcher: Fetcher = fetch,
   ) {}
 
   async run(): Promise<SafeHealthReport> {
@@ -86,34 +74,18 @@ export class ClassifiedHealthChecker {
       comment_api: async () => api("Document.Comments")?.supported && api("Comments.Add")?.supported && comments.COMMENT_COLLECTION_READABLE && comments.COMMENT_ADD_WRITABLE
         ? { status: "PASS", summary: "批注集合可读且 Comments.Add 已暴露" }
         : { status: "FAIL", error_code: "COMMENT_PREVIEW_UNSUPPORTED", summary: "批注 API 不完整" },
-      recognition_service: async () => {
-        try { const value = await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/health"); return value.ok === true ? { status: "PASS", summary: "本地识别服务可达" } : { status: "FAIL", error_code: "LOCAL_AGENT_UNHEALTHY", summary: "识别服务健康响应异常" }; }
-        catch { return { status: "FAIL", error_code: "LOCAL_AGENT_UNAVAILABLE", summary: "本地识别服务不可达" }; }
+      filesystem_api: async () => typeof this.application.FileSystem?.Exists === "function" && (typeof this.application.FileSystem?.ReadFileString === "function" || typeof this.application.FileSystem?.readFileString === "function")
+        ? { status: "PASS", summary: "Application.FileSystem 可用" }
+        : { status: "FAIL", error_code: "WPS_FILESYSTEM_UNAVAILABLE", summary: "WPS 文件系统 API 不完整" },
+      local_runtime: async () => {
+        const exe = this.config.recognitionExecutablePath;
+        if (!exe) return { status: "FAIL", error_code: "LOCAL_RUNTIME_CONFIGURATION_REQUIRED", summary: "未配置本地识别运行时" };
+        try { return this.application.FileSystem?.Exists?.(exe) ? { status: "PASS", summary: "本地识别 exe 存在" } : { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "本地识别 exe 不存在" }; }
+        catch { return { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "无法访问本地识别 exe" }; }
       },
-      recognition_wheel: async () => {
-        try {
-          const value = await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/version");
-          const ready = typeof value.recognition_sdk === "string"
-            && value.recognition_sdk.includes("recognize_docx")
-            && typeof value.package_version === "string"
-            && typeof value.locator_version === "string"
-            && value.host_text_contract_version === "host-text-v1";
-          const handshake = ready ? await getJson(this.fetcher, this.config.recognitionEndpoint, "v1/handshake") : {};
-          const handshakeReady = handshake.ok === true
-            && handshake.package_version === value.package_version
-            && handshake.locator_version === value.locator_version
-            && handshake.host_text_contract_version === "host-text-v1";
-          return ready && handshakeReady
-            ? { status: "PASS", summary: "recognition wheel、来源定位、绑定与 host-text-v1 握手通过" }
-            : { status: "FAIL", error_code: "RECOGNITION_WHEEL_UNAVAILABLE", summary: "识别引擎版本或定位契约不兼容" };
-        }
-        catch { return { status: "FAIL", error_code: "RECOGNITION_WHEEL_UNAVAILABLE", summary: "识别引擎握手失败" }; }
-      },
-      command_service: async () => {
-        try { const value = await getJson(this.fetcher, this.config.commandEndpoint, "v1/health"); return value.ok === true ? { status: "PASS", summary: "本地命令服务可达" } : { status: "FAIL", error_code: "COMMAND_SERVICE_UNHEALTHY", summary: "命令服务健康响应异常" }; }
-        catch { return { status: "FAIL", error_code: "COMMAND_SERVICE_UNAVAILABLE", summary: "本地命令服务不可达" }; }
-      },
-      session_token: async () => this.config.sessionToken.trim().length > 0 ? { status: "PASS", summary: "本机会话令牌已配置" } : { status: "FAIL", error_code: "SESSION_TOKEN_MISSING", summary: "本机会话令牌缺失" },
+      local_process_api: async () => typeof this.application.OAAssist?.ShellExecute === "function"
+        ? { status: "PASS", summary: "OAAssist.ShellExecute 可用" }
+        : { status: "FAIL", error_code: "LOCAL_PROCESS_EXECUTION_BLOCKED", summary: "WPS 未暴露本地进程调用能力" },
       required_fonts: async () => !this.profile || !fonts.length
         ? { status: "WARN", error_code: "DEFAULT_PROFILE_UNAVAILABLE", summary: "无法读取默认 Profile 字体清单" }
         : missingFonts.length ? { status: "WARN", error_code: "REQUIRED_FONT_MISSING", summary: `缺少 ${missingFonts.length} 种字体`, details_safe: { missing_font_count: missingFonts.length } }

@@ -244,12 +244,21 @@ export class WpsTargetLocator {
 
 const alignment: Record<string, number> = { left: 0, center: 1, right: 2, justify: 3, distributed: 4 };
 
+export interface WpsExecutionOptions { yieldEvery?: number; }
+
+function yieldToHost(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 export class WpsApiDocumentExecutor implements DocumentExecutor {
   constructor(
     private readonly locator = new WpsTargetLocator(),
     private readonly capabilities: CapabilityProvider = new WpsCapabilityProvider(),
     private readonly gridMode: GridMode = DEFAULT_GRID_MODE,
     private readonly transaction = new WpsTransactionManager(),
+    private readonly options: WpsExecutionOptions = {},
   ) {}
   async execute(commandSet: FormattingCommandSet, transactionId: string, revision: string): Promise<ExecutionResult> {
     const supported = new Set(this.capabilities.capabilities().capabilities);
@@ -257,10 +266,14 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
     try {
       assertFormattingCommandSet(commandSet, commandSet.request_id);
       if (await activeRevision() !== revision) throw new Error("DOCUMENT_CHANGED");
-      for (const command of commandSet.commands) {
+      const yieldEvery = Math.max(1, this.options.yieldEvery ?? 15);
+      for (let index = 0; index < commandSet.commands.length; index += 1) {
+        const command = commandSet.commands[index];
+        if ((index + 1) % yieldEvery === 0 && await activeRevision() !== revision) throw new Error("ACTIVE_DOCUMENT_CHANGED");
         if (!supported.has(command.required_capability)) throw new Error("CLIENT_CAPABILITY_MISSING");
         this.transaction.capture(transactionId, await this.apply(command));
         executed.push(command.command_id);
+        if ((index + 1) % yieldEvery === 0) await yieldToHost();
       }
       // Page commands are emitted before the paragraph commands by the service.
       // Validate after the full formal chain, so natural run metrics and the

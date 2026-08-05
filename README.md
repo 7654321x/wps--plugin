@@ -8,7 +8,7 @@
 
     npm run typecheck
     npm test
-    ../.venv/Scripts/python.exe -m pytest command-service/tests
-    ../.venv/Scripts/python.exe -m build command-service --wheel
+    ./.venv/Scripts/python.exe -m pytest command-service/tests local-agent/tests
+    npm run verify:local-direct
 
-真实 WPS API、Ribbon、任务窗格、安装器和云端部署不属于第一阶段。
+当前仓库根目录固定为 `D:\PycharmProjects\wps`。默认不读写旧的 `D:\PycharmProjects\docxtool` 仓库。

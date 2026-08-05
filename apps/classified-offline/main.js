@@ -18,15 +18,12 @@ document.write("<script src='ui/build-info.js?v=" + encodeURIComponent(DOCXTOOL_
 window.DocxtoolVersionedAsset = function (asset) { var build = window.DocxtoolBuildInfo && window.DocxtoolBuildInfo.build_id ? window.DocxtoolBuildInfo.build_id : DOCXTOOL_BOOTSTRAP_NONCE; return asset + "?v=" + encodeURIComponent(build); };
 window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/default-format-profile.js" });
 document.write("<script src='" + window.DocxtoolVersionedAsset("ui/default-format-profile.js") + "'></script>");
-window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/e2e-session.js" });
-document.write("<script src='" + window.DocxtoolVersionedAsset("ui/e2e-session.js") + "'></script>");
+window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "ui/local-runtime-config.js" });
+document.write("<script src='" + window.DocxtoolVersionedAsset("ui/local-runtime-config.js") + "'></script>");
 window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.requested", "请求加载脚本", { asset: "js/ribbon.js" });
 document.write("<script src='" + window.DocxtoolVersionedAsset("js/ribbon.js") + "'></script>");
-window.DocxtoolReportBootstrapStage = async function(stage, status, errorCode) {
-  try {
-    var session = await fetch("http://127.0.0.1:9528/v1/e2e/session").then(function(response) { return response.json(); });
-    if (session.session_id) await fetch("http://127.0.0.1:9528/v1/e2e/result", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session.session_id, stage: stage, status: status || "PASS", error_code: errorCode || "" }) });
-  } catch (ignore) {}
+window.DocxtoolReportBootstrapStage = function(stage, status, errorCode) {
+  window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.stage.local_only", "本地直连模式记录启动阶段", { stage: stage, status: status || "PASS", error_code: errorCode || "" });
 };
 void window.DocxtoolReportBootstrapStage("main_script_loaded", "PASS", "");
 window.DocxtoolTaskPanePath = "ui/taskpane-development.html";

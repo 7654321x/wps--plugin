@@ -1,6 +1,6 @@
-import { HttpCommandServiceClient, LocalEndpointProvider } from "../../../packages/command-service-client/src/index.js";
 import { ClearFormattingPreviewUseCase, FormatDocumentUseCase, PreviewDocumentUseCase, RecognizeDocumentUseCase } from "../../../packages/application/src/format-document-usecase.js";
-import { HttpLocalRecognitionTransport, LocalWheelRecognitionProvider } from "../../../packages/recognition-client/src/index.js";
+import { LocalProcessRecognitionTransport, LocalWheelRecognitionProvider, type WpsApplicationLike } from "../../../packages/recognition-client/src/index.js";
+import { LocalFormatCommandGenerator, type LocalFormatProfile } from "../../../packages/local-format-engine/src/index.js";
 import { CommandValidator } from "../../../packages/security/src/index.js";
 import { NoOpTelemetry } from "../../../packages/diagnostics/src/index.js";
 import type { DiagnosticReporter } from "../../../packages/diagnostics/src/index.js";
@@ -8,25 +8,52 @@ import { WpsApiDocumentExecutor, WpsCapabilityProvider, WpsDocumentReader, WpsFo
 import type { PreviewMutationTracker } from "../../../packages/application/src/ports.js";
 
 export interface ClassifiedRuntimeConfig {
-  recognitionEndpoint: string;
-  commandEndpoint: string;
-  sessionToken: string;
+  recognitionExecutablePath: string;
+  runtimeVersion: string;
+  runtimeSha256: string;
+  runtimeManifestPath?: string;
 }
+
+type ProfileWindow = typeof globalThis & {
+  DocxtoolDefaultProfile?: LocalFormatProfile;
+  Application?: unknown;
+};
+
 export type ClassifiedProductionComposition = ReturnType<typeof createClassifiedProductionComposition>;
 let productionComposition: ClassifiedProductionComposition | null = null;
 let productionConfigKey = "";
-class OfflineLicenseProvider { authorizationScope(): "classified-offline" { return "classified-offline"; } }
 
-/** The only production assembly used by the classified Ribbon and E2E driver. */
+class OfflineLicenseProvider {
+  authorizationScope(): "classified-offline" { return "classified-offline"; }
+}
+
+function readDefaultProfile(): LocalFormatProfile {
+  const profile = (globalThis as ProfileWindow).DocxtoolDefaultProfile;
+  if (!profile?.page_setup || !profile.styles) throw new Error("DEFAULT_PROFILE_UNAVAILABLE");
+  return profile;
+}
+
+/** The only production assembly used by the classified Ribbon. */
 export function createClassifiedProductionComposition(config: ClassifiedRuntimeConfig, diagnostics?: DiagnosticReporter) {
   const telemetry = new NoOpTelemetry();
   const reader = new WpsDocumentReader();
-  const recognition = new LocalWheelRecognitionProvider(new HttpLocalRecognitionTransport(new URL(config.recognitionEndpoint), config.sessionToken, diagnostics));
-  const commands = new HttpCommandServiceClient(new LocalEndpointProvider(config.commandEndpoint, config.sessionToken), undefined, diagnostics);
+  const application = (globalThis as ProfileWindow).Application as WpsApplicationLike | undefined;
+  if (!application) throw new Error("WPS_HOST_UNAVAILABLE");
+  const recognition = new LocalWheelRecognitionProvider(
+    new LocalProcessRecognitionTransport(
+      application,
+      config.recognitionExecutablePath,
+      120_000,
+      100,
+      20 * 1024 * 1024,
+      diagnostics,
+    ),
+  );
+  const commands = new LocalFormatCommandGenerator(readDefaultProfile());
   const validator = new CommandValidator();
   const transaction = new WpsTransactionManager();
-  const executor = new WpsApiDocumentExecutor(undefined, new WpsCapabilityProvider(), undefined, transaction);
   const capability = new WpsCapabilityProvider();
+  const executor = new WpsApiDocumentExecutor(undefined, capability, undefined, transaction, { yieldEvery: 15 });
   const fonts = new WpsFontCapabilityProvider();
   const license = new OfflineLicenseProvider();
   let preview: PreviewMutationTracker | null = null;
