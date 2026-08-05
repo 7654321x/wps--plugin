@@ -1,5 +1,6 @@
 import { DiagnosticRunner, type DiagnosticResult } from "../../../packages/diagnostics/src/index.js";
 import { CommentPreviewCapabilityProvider, WpsFontCapabilityProvider, WpsRuntimeProbe } from "../../../packages/wps-adapter/src/index.js";
+import { WpsLocalFileSystem } from "../../../packages/wps-adapter/src/local-filesystem.js";
 import type { ClassifiedRuntimeConfig } from "./composition-root.js";
 import { errorMessage } from "./error-messages.js";
 
@@ -23,7 +24,7 @@ const checks = [
   { check_id: "required_fonts", group: "wps", title: "必需字体", dependencies: [], retryable: false },
   { check_id: "taskpane_api", group: "wps", title: "任务窗格 API", dependencies: [], retryable: false },
   { check_id: "build_identity", group: "runtime", title: "构建一致性", dependencies: [], retryable: false },
-  { check_id: "host_router", group: "runtime", title: "命令路由", dependencies: [], retryable: false },
+  { check_id: "local_application_runtime", group: "runtime", title: "本地应用运行时", dependencies: [], retryable: false },
 ];
 
 function normalizedStatus(result: DiagnosticResult): HealthStatus {
@@ -56,7 +57,7 @@ export class ClassifiedHealthChecker {
   constructor(
     private readonly application: Record<string, any>, private readonly config: ClassifiedRuntimeConfig,
     private readonly currentBuild: BuildIdentity | undefined, private readonly storedBuild: BuildIdentity,
-    private readonly profile: DefaultProfile | undefined, private readonly routerInstalled: boolean,
+    private readonly profile: DefaultProfile | undefined, private readonly localRuntimeInstalled: boolean,
   ) {}
 
   async run(): Promise<SafeHealthReport> {
@@ -84,27 +85,35 @@ export class ClassifiedHealthChecker {
         ? { status: "PASS", summary: "批注集合可读且 Comments.Add 已暴露" }
         : { status: "FAIL", error_code: "COMMENT_PREVIEW_UNSUPPORTED", summary: "批注 API 不完整" },
       filesystem_api: async () => typeof this.application.FileSystem?.Exists === "function"
-        && (typeof this.application.FileSystem?.ReadFileString === "function" || typeof this.application.FileSystem?.readFileString === "function")
-        && (typeof this.application.FileSystem?.writeFileString === "function" || typeof this.application.FileSystem?.WriteFileString === "function")
+        && (typeof this.application.FileSystem?.ReadFile === "function" || typeof this.application.FileSystem?.ReadFileString === "function" || typeof this.application.FileSystem?.readFileString === "function")
+        && (typeof this.application.FileSystem?.WriteFile === "function" || typeof this.application.FileSystem?.writeFileString === "function" || typeof this.application.FileSystem?.WriteFileString === "function")
         && (typeof this.application.FileSystem?.unlinkSync === "function" || typeof this.application.FileSystem?.Remove === "function")
         ? { status: "PASS", summary: "Application.FileSystem 可用" }
         : { status: "FAIL", error_code: "WPS_FILESYSTEM_UNAVAILABLE", summary: "WPS 文件系统 API 不完整" },
       local_runtime: async () => {
         const exe = this.config.recognitionExecutablePath;
         if (!exe) return { status: "FAIL", error_code: "LOCAL_RUNTIME_CONFIGURATION_REQUIRED", summary: "未配置本地识别运行时" };
-        try { return this.application.FileSystem?.Exists?.(exe) ? { status: "PASS", summary: "本地识别 exe 存在" } : { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "本地识别 exe 不存在" }; }
+        try {
+          const fs = this.application.FileSystem ? new WpsLocalFileSystem(this.application.FileSystem) : null;
+          return fs?.exists(exe) ? { status: "PASS", summary: "本地识别 exe 存在" } : { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "本地识别 exe 不存在" };
+        }
         catch { return { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "无法访问本地识别 exe" }; }
       },
       runtime_manifest: async () => {
         const path = this.config.runtimeManifestPath;
         if (!path) return { status: "WARN", error_code: "LOCAL_RUNTIME_CONFIGURATION_REQUIRED", summary: "未配置 runtime 清单路径" };
-        const read = this.application.FileSystem?.ReadFileString ?? this.application.FileSystem?.readFileString;
-        if (typeof read !== "function" || !this.application.FileSystem?.Exists?.(path)) return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
-        const manifest = parseJson(String(read.call(this.application.FileSystem, path)));
-        if (!manifest || manifest.schema_version !== 1 || manifest.contract_version !== 1 || typeof manifest.executable_path !== "string" || typeof manifest.executable_sha256 !== "string") {
-          return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单字段不完整" };
+        if (!this.application.FileSystem) return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
+        try {
+          const fs = new WpsLocalFileSystem(this.application.FileSystem);
+          if (!fs.exists(path)) return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
+          const manifest = parseJson(fs.readText(path));
+          if (!manifest || manifest.schema_version !== 1 || manifest.contract_version !== 1 || typeof manifest.executable_path !== "string" || typeof manifest.executable_sha256 !== "string") {
+            return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单字段不完整" };
+          }
+          return { status: "PASS", summary: "runtime 清单可读" };
+        } catch {
+          return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
         }
-        return { status: "PASS", summary: "runtime 清单可读" };
       },
       local_process_api: async () => typeof this.application.OAAssist?.ShellExecute === "function"
         ? { status: "PASS", summary: "OAAssist.ShellExecute 可用" }
@@ -120,7 +129,7 @@ export class ClassifiedHealthChecker {
       build_identity: async () => this.currentBuild?.build_id && this.currentBuild.build_id === this.storedBuild.build_id && this.currentBuild.asset_hash === this.storedBuild.asset_hash
         ? { status: "PASS", summary: "build_id 与 asset_hash 一致" }
         : { status: "FAIL", error_code: "ADDIN_CONTEXT_STALE", summary: "当前构建与宿主状态不一致" },
-      host_router: async () => this.routerInstalled ? { status: "PASS", summary: "HostCommandRouter 已安装" } : { status: "FAIL", error_code: "HOST_COMMAND_ROUTER_NOT_READY", summary: "HostCommandRouter 未安装" },
+      local_application_runtime: async () => this.localRuntimeInstalled ? { status: "PASS", summary: "本地应用运行时已安装" } : { status: "FAIL", error_code: "LOCAL_APPLICATION_RUNTIME_NOT_READY", summary: "本地应用运行时未安装" },
     });
     const items = report.results.map((item) => ({ check_id: item.check_id, title: item.title, status: normalizedStatus(item), error_code: item.error_code, summary: item.summary }));
     const overall: HealthStatus = items.some((item) => item.status === "FAIL") ? "FAIL" : items.some((item) => item.status === "WARN") ? "WARN" : "PASS";

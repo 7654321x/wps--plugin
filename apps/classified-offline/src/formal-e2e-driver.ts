@@ -70,7 +70,7 @@ async function runAutomaticFormatTest(onProgress?: (stage: string) => void): Pro
     await dispatch("health_check"); await dispatch("preview_document"); const state = await dispatch("format_document");
     const report = { executed: Number(state.formatting_result?.match(/\d+/)?.[0] ?? 0), warnings: [] as string[], rollback: false };
     await reportE2E("PASS", "", "one_click_format");
-    if (result) result.textContent = "主上下文自动流程完成：功能检测、预览排版和一键排版均通过 HostCommandRouter。";
+    if (result) result.textContent = "本地应用流程完成：功能检测、预览排版和一键排版均直接调用正式用例。";
     return report;
   } catch (error) {
     const code = error instanceof Error ? error.message : "FORMAL_EXECUTION_FAILED";

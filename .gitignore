@@ -1,4 +1,7 @@
 .runtime/
+.idea/
+.reasonix/
+local_recycle/
 apps/classified-offline/ui/e2e-session.js
 tests/e2e-work/
 node_modules/
@@ -7,6 +10,9 @@ wps-addon-publish/
 *.whl
 *.log
 wps-plugin-debug.log*
+/*.docx
+/tests/*工作副本.docx
+/tests/~$*.docx
 *.tsbuildinfo
 **/__pycache__/
 **/*.py[cod]

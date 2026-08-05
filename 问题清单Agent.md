@@ -285,4 +285,70 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 症状：3889 和 WPS 注册均正常，Ribbon 已显示，但点击没有反馈，根目录旧日志也没有当前事件。
 - 根因：WPS 内嵌浏览器可能没有 `crypto.randomUUID()`；Host 安装阶段直接调用会中断，Ribbon 只剩外壳。旧本地直连日志仅存在内存队列，无法从宿主外部查看。
 - 正确方案：正式宿主链所有随机 ID 必须检测 `crypto.randomUUID` 并使用 `crypto.getRandomValues` 兼容；诊断事件通过 WPS FileSystem 写入仓库根目录 `wps-plugin-debug.log`，不恢复 9528。`main.py start` 默认常驻展示中文日志。
-- 自动验证门槛：旧浏览器环境不得因缺少 `randomUUID` 阻止 Host 安装；构建、类型检查和 Ribbon/Host 测试通过；真实 WPS 重新加载后日志必须出现 `host.install.success`，点击后必须出现 `ribbon.action.received` 和 `host.router.dispatch.received` 或明确的中文错误。
+- 自动验证门槛：旧浏览器环境不得因缺少 `randomUUID` 阻止 Host 安装；构建、类型检查和 Ribbon/Host 测试通过；真实 WPS 重新加载后日志必须出现 `application.install.success`，点击后必须出现 `ribbon.action.received` 和 `application.runtime.run.received` 或明确的中文错误。
+
+## P032 开发注册加载源码但验证的是 dist
+
+- 症状：构建和 verify-addin 均通过，真实 WPS 却执行另一套 main、Ribbon 或 Host 路径。
+- 根因：wpsjs debug 从源码目录服务，而 Vite 根据环境变量复制 production 副本；源码 main 又引用 dist 子目录，形成双重入口。
+- 禁止：保留两套业务入口；debug 服务源码而只验证 dist；源码 main 引用 `dist/host-runtime.js`。
+- 正确方案：canonical `main.js`、`js/ribbon.js` 是唯一入口和复制源，source/dist 构建后必须一致；后续 debug 只服务由 dist 生成的唯一 package。
+- 自动门槛：main/ribbon source 与 dist 分别字节一致；不存在 production 业务副本；main 不含 `dist/host-runtime.js`。
+
+## P033 WPS 早期启动失败没有独立日志
+
+- 症状：Ribbon 无响应，Host 文件日志为空，无法判断 main、Ribbon 或 Host 哪层未执行。
+- 根因：早期日志依赖 Host Runtime 安装成功后才建立，Host 自身装载失败时没有落盘渠道。
+- 禁止：只保留内存队列；依赖识别 runtime、Host Router、HTTP 或 9528 才能记录 bootstrap 错误。
+- 正确方案：最先加载经典 `bootstrap-probe.js`，独立捕获 error/rejection，并通过 3889 的诊断专用端点写入仓库根 `wps-plugin-debug.log`。早期日志不得依赖尚未验证的 WPS FileSystem 写入能力。
+- 自动门槛：main 首个业务脚本为 probe；probe 包含 `bootstrap.probe.loaded`、`window.error`、`window.unhandledrejection` 和 `/__docxtool_log`，且不存在 250ms 文件日志轮询；真实 WPS 当前 build 的早期事件必须落入根目录日志。
+- 当前补充：3889 只承载插件静态资源与诊断事件，不承载识别或排版业务，也不依赖 9528。
+
+## P034 WPS 本地应用 Runtime 使用 ES Module 静默失败
+
+- 症状：Ribbon 外壳出现，但 Runtime 装载事件和 `DocxtoolRunLocalCommand` 不存在。
+- 根因：Host 产物使用 module 标签、静态 import 和共享 chunk，当前 WPS WebView 可能不执行或无法解析。
+- 禁止：Host Runtime 使用 `type=module`、静态/dynamic import 或依赖外部 chunk。
+- 正确方案：本地应用 Runtime 单独构建为经典 IIFE 单文件，main 用普通 script 顺序加载。
+- 自动门槛：产物无 import，包含 Runtime 装载事件和 `DocxtoolRunLocalCommand`；Ribbon 三个回调显式挂到 window。
+
+## P035 WPS 本地功能仍经过 Host 队列中转
+
+- 症状：虽然识别 EXE 和命令生成器都在本地，Ribbon 仍执行 `HostEnqueue → LocalCommandBus → HostCommandRouter`，让本地直调看起来像另一套服务链。
+- 根因：早期为了异步调度和 TaskPane 共用而增加了 Host 队列层，后来正式 Application Use Case 已稳定，但入口没有同步收口。
+- 禁止：生产 Ribbon 使用 HostEnqueue/HostDispatch；为预览或排版另写队列执行器；回退 HTTP、9528、local-agent 或 command-service。
+- 正确方案：唯一全局入口为 `DocxtoolRunLocalCommand`，直接进入 `LocalApplicationRuntime` 和正式用例；用一个执行中互斥锁阻止重复点击。TaskPane 也调用同一入口。
+- 自动门槛：生产入口扫描不得出现 `DocxtoolHostEnqueue`、`DocxtoolHostDispatch`、`HostCommandRouter` 或 `LocalCommandBus`；Ribbon 测试证明四个按钮直接调用同一 Runtime；verify-local-direct 必须 PASS。
+
+## P036 wpsjs 静态服务弹出 CMD 并额外启动 WPS
+
+- 症状：运行 main 后出现独立 CMD/Terminal 窗口，`wpsjs debug -s` 还可能拉起新的 WPS 窗口。
+- 根因：官方调试工具同时承担资源服务、注册和宿主启动，长期运行不适合作为已经注册后的常驻资源进程。
+- 禁止：每次启动重复执行 wpsjs debug；用屏幕脚本关闭窗口；结束未知 Node 或 WPS 进程。
+- 正确方案：先用 XML 检查现有 WPS 注册；注册匹配时以 `CREATE_NO_WINDOW` 启动隐藏静态资源进程，只服务唯一 debug-package。记录 PID、端口、目录和 Build ID，并通过 HTTP 哈希探针验证归属。
+- 自动门槛：完整启动后新增 WPS 进程数为 0；3889 owner 为记录的隐藏静态进程；控制台显示资源和交互日志；重复启动可复用且不因目录锁失败。
+
+## P037 WPS 已显示 Ribbon 但仍执行旧页面
+
+- 症状：WPS 功能区仍可见，启动器和 3889 服务均 PASS，但按钮没有日志或动作；资源服务实际上没有收到当前构建的加载事件。
+- 根因：WPS 的 `publish.xml` 注册和内嵌 WebView 缓存不会被普通资源服务重启自动刷新；官方 `wpsjs debug` 文档与本地源码均要求运行中的 WPS 重启或刷新加载项后重新读取注册和页面。仅替换服务器或清空 Python 访问日志不能替代宿主重载。
+- 禁止：看到 Ribbon 可见就判定当前源码已经加载；不得在按钮无反应时先修改识别、排版或 WPS API 业务逻辑；不得强制结束存在用户可见文档的全部 WPS 进程。
+- 正确方案：资源服务使用同端口诊断回传和 `Cache-Control: no-store`；`main.py diagnose` 只统计当前 build_id 的事件。先完成保存并正常关闭脱敏测试文档，再完整关闭残留 WPS 宿主并重新打开，确认 `bootstrap.probe.loaded`、`ribbon.addin.load.success`、`application.install.success` 后再验收按钮。
+- 自动验证门槛：服务端接收 `POST /__docxtool_log` 并写入根目录 `wps-plugin-debug.log`；HTTP 资源探针 PASS；旧 build 事件不污染诊断；真实 WPS 重载后出现当前 build 的加载事件，按钮点击出现 `ribbon.action.received`。
+
+## P038 WPS FileSystem 拒绝 runtime 清单路径
+
+- 症状：Ribbon 和 Host 脚本均已加载，日志反复出现“读取本地运行时配置失败；错误：`path cannot contains '/' or '\\'`”，随后持续“等待 WPS Application、构建信息和本地运行时配置”；三个正式按钮没有进入本地 Runtime。
+- 根因：`runtimeConfig()` 使用非官方兼容方法 `ReadFileString` 读取绝对路径。当前真实 WPS 的该兼容方法把参数按“文件名”处理并拒绝 `/`、`\\`，而官方 `wps-jsapi 1.0.5` 声明的读取入口是 `Application.FileSystem.ReadFile(path)`。单纯替换路径分隔符无法解决。
+- 禁止：只在字符串上盲目把 `\\` 换成 `/` 或反过来；只修清单读取而不检查识别 exe、请求文件、结果文件和日志文件的同一套路径语义；继续每 250ms 无限刷 WARN。
+- 正确方案：唯一 WPS 文件适配层优先调用官方 `ReadFile`，仅在旧宿主没有官方方法时回退 `readFileString/ReadFileString`；`Exists`、路径规范化、runtime 清单、health check 和识别 transport 共用该适配层。官方单参数 `AppendFile(path)` 不得误传正文内容。早期和宿主诊断日志统一走 3889 诊断端点，避免用未确认的 WPS 文件写入方法制造二次故障。
+- 自动验证门槛：适配器单测证明官方 `ReadFile` 优先于兼容方法，单参数 `AppendFile` 不会被当作两参数写入；控制台自动识别 UTF-8/GB18030 并折叠连续相同事件。真实 WPS 重载后当前 build 必须出现一次 `application.install.success`、零次 `application.install.config.failed`，安装成功后不得继续产生安装轮询。
+- 真实验证结果：build `20260805144325-b0b446021681` 已在 WPS 12.1.0.28043 中加载；记录 1 次 `application.install.attempt`、1 次 `application.install.success`、0 次 `application.install.config.failed`，随后轮询停止。
+
+## P039 保存于 DOCX 的旧预览批注与当前 wheel 输出不一致
+
+- 症状：打开已有“识别预览工作副本”后，标题与正文粘在同一物理段落时仍显示整段“主标题续行”或其他旧角色，看起来像当前 wheel 分类错误。
+- 根因：预览批注会随 DOCX 保存。旧版本曾按整段写入批注；升级 wheel、SDK 或 WPS 适配器不会自动改写文件中已保存的旧批注。只看批注侧栏无法证明当前识别结果。
+- 正确判断：先读取当前 wheel 的 `physical_paragraph_index`、`raw_start_utf16/raw_end_utf16`、`segment_count_total` 和定位状态，再与 DOCX `commentRangeStart/commentRangeEnd` 对比。当前 wheel 若已返回不重叠且完整覆盖的“标题子范围 + 正文子范围”，而 DOCX 仍只有覆盖整段的旧批注，则属于旧预览未清理或当前预览尚未重新执行，不是 WPS 丢失了已发送的子范围信号。
+- 处理规则：重新预览前必须删除本插件旧批注并重新识别；同一物理段多个角色只允许按精确子 Range 预览，正式排版继续标记“需要拆段”，不得把多个段落级样式直接应用到同一物理段。
+- 验证门槛：脱敏样本中同段一级标题和正文必须分别产生两个已验证范围，范围连续、不重叠、覆盖全部可见文字；WPS 新批注锚点必须分别等于两个范围，旧整段批注数量为 0。

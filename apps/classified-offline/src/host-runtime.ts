@@ -3,43 +3,46 @@ import type { FormattingCommandSet, RecognitionResult } from "../../../packages/
 import { ClassifiedHealthChecker, type SafeHealthItem } from "./health-check.js";
 import { errorMessage } from "./error-messages.js";
 import type { DiagnosticEvent, DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
-import { LocalCommandBus, type CommandReceipt, type LocalCommandName, type LocalCommandSource } from "./local-command-bus.js";
-
-type HostCommandName = LocalCommandName | "show_about";
-type HostCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
+import { normalizeWpsPath, WpsLocalFileSystem, type WpsFileSystemApi } from "../../../packages/wps-adapter/src/local-filesystem.js";
+type LocalCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane";
+type LocalCommandSource = "ribbon" | "taskpane" | "test";
+type LocalApplicationCommandName = LocalCommandName | "show_about";
+type LocalApplicationCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface TaskPaneLike { ID: number | string; Visible: boolean; Delete?: () => void; Navigate?: (url: string) => void; Width?: number; DockPosition?: unknown; }
-interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: { Exists?: (path: string) => boolean; ReadFileString?: (path: string) => string; readFileString?: (path: string) => string; writeFileString?: (path: string, content: string) => void; WriteFileString?: (path: string, content: string) => void; mkdirSync?: (path: string, options?: { recursive?: boolean }) => void; Mkdir?: (path: string) => void }; Env?: { GetAppDataPath?: () => string }; }
+interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: WpsFileSystemApi; Env?: { GetAppDataPath?: () => string }; }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; build_timestamp: string; }
-interface CommandResult { command_id: string; command_name: HostCommandName; status: HostCommandStatus; stage: string; summary: string; error_code: string; started_at: string; finished_at: string; }
+interface CommandResult { command_id: string; command_name: LocalApplicationCommandName; status: LocalApplicationCommandStatus; stage: string; summary: string; error_code: string; started_at: string; finished_at: string; }
 interface RecognitionModel { paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean; }
 interface PreviewModel { paragraph_index: number; recognized_type: string; plan: string; needs_review: boolean; }
 interface CallbackLog { callback_name: string; build_id: string; host_context: string; started_at: string; completed_at: string; status: "PASS" | "FAIL"; stable_error_code: string; }
 interface HostState {
   schema_version: 1; build_id: string; asset_hash: string; host_context_id: string; document_identity_hash: string;
-  active_command: CommandResult | null; command_status: HostCommandStatus | "IDLE"; active_view: "recognition" | "preview" | "execution" | "issues";
+  active_command: CommandResult | null; command_status: LocalApplicationCommandStatus | "IDLE"; active_view: "recognition" | "preview" | "execution" | "issues";
   recognition_summary: string; paragraph_recognition_models: RecognitionModel[]; formatting_preview_models: PreviewModel[];
   preview_comment_status: string; formatting_progress: string; formatting_result: string; latest_error: string;
   unresolved_block_count: number; mixed_paragraph_count: number;
   health_overall: "PASS" | "WARN" | "FAIL" | ""; health_report: string; health_items: SafeHealthItem[];
   callback_log: CallbackLog[]; updated_at: string;
 }
-interface BridgeRequest { schema_version: 1; request_id: string; command_name: HostCommandName; taskpane_build_id: string; created_at: string; }
+interface BridgeRequest { schema_version: 1; request_id: string; command_name: LocalApplicationCommandName; taskpane_build_id: string; created_at: string; }
 
 type HostWindow = Window & {
   Application?: ApplicationLike; DocxtoolRuntimeConfig?: ClassifiedRuntimeConfig; DocxtoolBuildInfo?: BuildInfo;
   DocxtoolLocalRuntimeConfig?: Partial<ClassifiedRuntimeConfig>;
   DocxtoolDefaultProfile?: { page_setup?: { normal_east_asia_font_name?: string; normal_latin_font_name?: string }; styles?: Record<string, { east_asia_font_name?: string; latin_font_name?: string }> };
   DocxtoolTaskPanePath?: string;
-  DocxtoolHostEnqueue?: (name: LocalCommandName, source?: LocalCommandSource) => CommandReceipt;
+  DocxtoolRunLocalCommand?: (name: LocalCommandName, source?: LocalCommandSource, requestId?: string) => Promise<CommandResult>;
   DocxtoolCommandBusy?: boolean;
-  DocxtoolHostRuntime?: { router: HostCommandRouter; panes: TaskPaneManager; store: HostResultStore; build: BuildInfo; };
+  DocxtoolLocalApplication?: { runtime: LocalApplicationRuntime; panes: TaskPaneManager; store: HostResultStore; build: BuildInfo; };
   DocxtoolEarlyLogQueue?: DiagnosticEvent[];
   DocxtoolEarlyLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
+  DocxtoolBootstrapLog?: (level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown, component?: string) => void;
   DocxtoolDiagnosticLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
   DocxtoolDiagnosticLogger?: { writeForComponent: (component: string, level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void };
 };
 const hostWindow = globalThis as unknown as HostWindow;
+hostWindow.DocxtoolBootstrapLog?.("INFO", "host.module.loaded", "Host Runtime 经典脚本已执行", { application_available: Boolean(hostWindow.Application) }, undefined, "host");
 let diagnosticLogPath = "";
 let fallbackIdCounter = 0;
 function randomId(): string {
@@ -50,11 +53,11 @@ function randomId(): string {
 function appendHostLog(item: DiagnosticEvent): void {
   try {
     const application = hostWindow.Application; const fs = application?.FileSystem; const path = diagnosticLogPath;
-    const read = fs?.readFileString ?? fs?.ReadFileString; const write = fs?.writeFileString ?? fs?.WriteFileString;
-    if (!fs || !path || typeof fs.Exists !== "function" || typeof write !== "function") return;
-    let existing = ""; if (fs.Exists(path) && typeof read === "function") existing = String(read.call(fs, path));
+    if (!fs || !path) return;
+    const adapter = new WpsLocalFileSystem(fs);
+    let existing = ""; if (adapter.exists(path)) existing = adapter.readText(path);
     if (existing.length > 2_000_000) existing = existing.slice(-1_000_000);
-    write.call(fs, path, `${existing}${JSON.stringify(item)}\n`);
+    adapter.writeText(path, `${existing}${JSON.stringify(item)}\n`);
   } catch { /* file diagnostics never changes WPS host behavior */ }
 }
 function hostLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
@@ -77,7 +80,7 @@ const PANE_KEY = "docxtool_classified_taskpane";
 const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 function now(): string { return new Date().toISOString(); }
 function id(prefix: string): string { return `${prefix}-${Date.now().toString(36)}-${randomId().slice(0, 8)}`; }
-function stableError(error: unknown): string { const raw = error instanceof Error ? error.message : "HOST_COMMAND_FAILED"; if (/fetch|network/i.test(raw)) return "LOCAL_AGENT_UNAVAILABLE"; return /^[A-Z0-9_:.-]+$/.test(raw) ? raw : "HOST_COMMAND_FAILED"; }
+function stableError(error: unknown): string { const raw = error instanceof Error ? error.message : "HOST_COMMAND_FAILED"; if (/path cannot contains/i.test(raw)) return "WPS_FILESYSTEM_PATH_REJECTED"; if (/fetch|network/i.test(raw)) return "LOCAL_AGENT_UNAVAILABLE"; return /^[A-Z0-9_:.-]+$/.test(raw) ? raw : "HOST_COMMAND_FAILED"; }
 async function hash(value: string): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join(""); }
 function parse<T>(value: string | null): T | null { try { return value ? JSON.parse(value) as T : null; } catch { return null; } }
 function formattingPlan(commands: FormattingCommandSet["commands"]): string {
@@ -98,7 +101,7 @@ export class HostResultStore {
   }
   read(): HostState { return structuredClone(this.state); }
   update(patch: Partial<HostState>): void { this.state = { ...this.state, ...patch, updated_at: now() }; this.save(); }
-  begin(name: HostCommandName, commandId: string, view: HostState["active_view"]): CommandResult { const result: CommandResult = { command_id: commandId, command_name: name, status: "RUNNING", stage: "started", summary: "", error_code: "", started_at: now(), finished_at: "" }; this.update({ active_command: result, command_status: "RUNNING", active_view: view, latest_error: "" }); return result; }
+  begin(name: LocalApplicationCommandName, commandId: string, view: HostState["active_view"]): CommandResult { const result: CommandResult = { command_id: commandId, command_name: name, status: "RUNNING", stage: "started", summary: "", error_code: "", started_at: now(), finished_at: "" }; this.update({ active_command: result, command_status: "RUNNING", active_view: view, latest_error: "" }); return result; }
   finish(result: CommandResult, summary: string): CommandResult { const done = { ...result, status: "PASS" as const, stage: "completed", summary, finished_at: now() }; this.update({ active_command: done, command_status: "PASS", formatting_progress: summary }); return done; }
   fail(result: CommandResult, code: string): CommandResult { const done = { ...result, status: "FAIL" as const, stage: "failed", error_code: code, finished_at: now() }; this.update({ active_command: done, command_status: "FAIL", active_view: "issues", latest_error: code, formatting_progress: `失败：${errorMessage(code)}` }); return done; }
   callback(entry: CallbackLog): void { this.update({ callback_log: [...this.state.callback_log, entry].slice(-20) }); }
@@ -144,41 +147,41 @@ export class TaskPaneManager {
   dispose(): void { const pane = this.get(); if (pane) { try { pane.Delete?.(); } catch (error) { hostLog("DEBUG", "taskpane.dispose.failed", "WPS 已释放的任务窗格拒绝删除", {}, error); } } this.pane = null; this.storage.setItem(PANE_KEY, ""); }
 }
 
-export class HostCommandRouter {
-  private readonly registry: Record<HostCommandName, (result: CommandResult) => Promise<string>>;
+export class LocalApplicationRuntime {
+  private readonly registry: Record<LocalApplicationCommandName, (result: CommandResult) => Promise<string>>;
   constructor(private readonly app: ApplicationLike, private readonly panes: TaskPaneManager, private readonly store: HostResultStore, private readonly config: ClassifiedRuntimeConfig) {
     this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
   }
-  async dispatch(name: HostCommandName, source: LocalCommandSource | "e2e" = "ribbon", requestId = id("host"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
+  async run(name: LocalApplicationCommandName, source: LocalCommandSource | "e2e" = "ribbon", requestId = id("local"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
     const started = now(); const startedMs = Date.now();
     const context = { correlation_id: requestId, request_id: requestId, command_id: requestId, command_name: name, source };
-    hostLog("INFO", "host.router.dispatch.received", "HostCommandRouter 收到命令", context);
+    hostLog("INFO", "application.runtime.run.received", "本地应用运行时收到命令", context);
     if (!Object.prototype.hasOwnProperty.call(this.registry, name)) {
-      const error = new Error("UNKNOWN_HOST_COMMAND");
-      hostLog("ERROR", "host.router.dispatch.failed", "HostCommandRouter 拒绝未知命令", { ...context, stable_error_code: "UNKNOWN_HOST_COMMAND", duration_ms: Date.now() - startedMs }, error);
+      const error = new Error("UNKNOWN_LOCAL_COMMAND");
+      hostLog("ERROR", "application.runtime.run.failed", "本地应用运行时拒绝未知命令", { ...context, stable_error_code: "UNKNOWN_LOCAL_COMMAND", duration_ms: Date.now() - startedMs }, error);
       throw error;
     }
-    hostLog("DEBUG", "host.router.command.validated", "Host 命令名称验证通过", context);
+    hostLog("DEBUG", "application.runtime.command.validated", "本地命令名称验证通过", context);
     const view = name === "recognize_document" ? "recognition" : name === "preview_document" ? "preview" : name === "format_document" ? "execution" : name === "health_check" ? "issues" : this.store.read().active_view;
     const result = this.store.begin(name, requestId, view);
     try {
       if (taskpaneBuildId !== this.store.read().build_id) throw new Error("ADDIN_CONTEXT_STALE");
-      hostLog("DEBUG", "host.router.build.checked", "任务窗格与 Host build 一致", { ...context, build_id: this.store.read().build_id });
-      hostLog("INFO", "host.router.handler.start", "开始执行正式应用用例", context);
+      hostLog("DEBUG", "application.runtime.build.checked", "调用方与本地运行时 build 一致", { ...context, build_id: this.store.read().build_id });
+      hostLog("INFO", "application.runtime.use_case.start", "开始直接执行正式应用用例", context);
       const summary = await this.registry[name](result);
-      hostLog("INFO", "host.router.handler.success", "正式应用用例执行完成", { ...context, duration_ms: Date.now() - startedMs });
+      hostLog("INFO", "application.runtime.use_case.success", "正式应用用例执行完成", { ...context, duration_ms: Date.now() - startedMs });
       const done = this.store.finish(result, summary);
       this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "PASS", stable_error_code: "" });
-      hostLog("INFO", "host.router.dispatch.success", "HostCommandRouter 命令完成", { ...context, duration_ms: Date.now() - startedMs });
+      hostLog("INFO", "application.runtime.run.success", "本地应用命令执行完成", { ...context, duration_ms: Date.now() - startedMs });
       return done;
     } catch (error) {
       const code = stableError(error); const failed = this.store.fail(result, code);
       this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "FAIL", stable_error_code: code });
-      hostLog("ERROR", "host.router.dispatch.failed", "HostCommandRouter 命令失败", { ...context, stable_error_code: code, duration_ms: Date.now() - startedMs }, error);
+      hostLog("ERROR", "application.runtime.run.failed", "本地应用命令执行失败", { ...context, stable_error_code: code, duration_ms: Date.now() - startedMs }, error);
       return failed;
     }
   }
-  supports(name: string): name is HostCommandName { return Object.prototype.hasOwnProperty.call(this.registry, name); }
+  supports(name: string): name is LocalApplicationCommandName { return Object.prototype.hasOwnProperty.call(this.registry, name); }
   async reconcileActiveDocument(): Promise<void> {
     const current = await this.documentIdentity(); const state = this.store.read();
     if (state.document_identity_hash && state.document_identity_hash !== current) {
@@ -241,7 +244,7 @@ export class HostCommandRouter {
     const report = await new ClassifiedHealthChecker(
       this.app as unknown as Record<string, any>, this.config, hostWindow.DocxtoolBuildInfo,
       { build_id: state.build_id, asset_hash: state.asset_hash }, hostWindow.DocxtoolDefaultProfile,
-      typeof hostWindow.DocxtoolHostEnqueue === "function" && hostWindow.DocxtoolHostRuntime?.router === this,
+      typeof hostWindow.DocxtoolRunLocalCommand === "function" && hostWindow.DocxtoolLocalApplication?.runtime === this,
     ).run();
     this.store.update({ health_overall: report.overall, health_report: report.text, health_items: report.items, active_view: "issues", latest_error: report.overall === "PASS" ? "" : report.first_error_code });
     if (report.overall === "FAIL") throw new Error(report.first_error_code || "HEALTH_CHECK_FAILED");
@@ -252,15 +255,16 @@ export class HostCommandRouter {
 function expandAppDataPath(application: ApplicationLike, value: string | undefined): string {
   if (!value) return "";
   const appData = application.Env?.GetAppDataPath?.();
-  if (value.toUpperCase().startsWith("%APPDATA%") && appData) return appData.replace(/[\\/]+$/, "") + value.slice("%APPDATA%".length);
-  return value;
+  if (value.toUpperCase().startsWith("%APPDATA%") && appData) return normalizeWpsPath(appData.replace(/[\\/]+$/, "") + value.slice("%APPDATA%".length));
+  return normalizeWpsPath(value);
 }
 function readRuntimeManifest(application: ApplicationLike, manifestPath: string): ClassifiedRuntimeConfig | null {
   const fs = application.FileSystem;
-  const exists = fs?.Exists;
-  const read = fs?.ReadFileString ?? fs?.readFileString;
-  if (typeof exists !== "function" || typeof read !== "function" || !exists.call(fs, manifestPath)) return null;
-  const manifest = parse<Record<string, unknown>>(read.call(fs, manifestPath));
+  if (!fs) return null;
+  const adapter = new WpsLocalFileSystem(fs);
+  const normalizedManifestPath = normalizeWpsPath(manifestPath);
+  if (!adapter.exists(normalizedManifestPath)) return null;
+  const manifest = parse<Record<string, unknown>>(adapter.readText(normalizedManifestPath));
   if (!manifest) return null;
   const executablePath = typeof manifest.executable_path === "string"
     ? manifest.executable_path
@@ -274,8 +278,8 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
     runtimeSha256: typeof manifest.executable_sha256 === "string" ? manifest.executable_sha256 : typeof manifest.sha256 === "string" ? manifest.sha256 : "",
     recognitionPackageVersion: typeof manifest.recognition_package_version === "string" ? manifest.recognition_package_version : typeof manifest.recognitionPackageVersion === "string" ? manifest.recognitionPackageVersion : undefined,
     contractVersion: typeof manifest.contract_version === "number" ? manifest.contract_version : typeof manifest.contractVersion === "number" ? manifest.contractVersion : undefined,
-    runtimeManifestPath: manifestPath,
-    diagnosticLogPath: typeof manifest.diagnostic_log_path === "string" ? manifest.diagnostic_log_path : undefined,
+    runtimeManifestPath: normalizedManifestPath,
+    diagnosticLogPath: typeof manifest.diagnostic_log_path === "string" ? normalizeWpsPath(manifest.diagnostic_log_path) : undefined,
   };
 }
 function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
@@ -308,14 +312,19 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
 async function reportHostAcceptance(stage: string, status: "PASS" | "FAIL", errorCode = ""): Promise<void> {
   hostLog("DEBUG", "host.acceptance.local_only", "本地直连模式不向 9528 上报 E2E 状态", { stage, status, stable_error_code: errorCode });
 }
-async function runAutomaticHostAcceptance(application: ApplicationLike, router: HostCommandRouter, build: BuildInfo): Promise<void> {
-  void application; void router; void build;
+async function runAutomaticHostAcceptance(application: ApplicationLike, runtime: LocalApplicationRuntime, build: BuildInfo): Promise<void> {
+  void application; void runtime; void build;
 }
 function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildInfo, hostContextId: string): void {
+  const bootstrapLog = hostWindow.DocxtoolBootstrapLog;
   const logger = {
     writeForComponent(component: string, level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
+      if (bootstrapLog) {
+        bootstrapLog(level, event, message, data, error, component);
+        return;
+      }
       const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, data, ...(error === undefined ? {} : { error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? "" : "" } }) };
+      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, build_id: build.build_id, data, ...(error === undefined ? {} : { error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? "" : "" } }) };
       queue.push(item); appendHostLog(item);
       if (queue.length > 500) queue.splice(0, queue.length - 500);
       hostWindow.DocxtoolEarlyLogQueue = queue;
@@ -327,30 +336,27 @@ function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildI
 }
 function install(application: ApplicationLike, build: BuildInfo, config: ClassifiedRuntimeConfig, hostContextId: string): void {
   installDiagnosticLogger(config, build, hostContextId);
-  const store = new HostResultStore(application.PluginStorage, build, hostContextId); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const router = new HostCommandRouter(application, panes, store, config);
-  const bus = new LocalCommandBus(
-    async (queued) => {
-      await router.dispatch(queued.command_name, queued.source, queued.command_id, build.build_id);
-    },
-    (busy) => {
-      hostWindow.DocxtoolCommandBusy = busy;
-      const ribbon = application.ribbonUI as { InvalidateControl?: (id: string) => void } | undefined;
-      ribbon?.InvalidateControl?.("preview");
-      ribbon?.InvalidateControl?.("apply");
-      ribbon?.InvalidateControl?.("health");
-    },
-  );
-  hostWindow.DocxtoolHostRuntime = { router, panes, store, build };
-  hostWindow.DocxtoolHostEnqueue = (name, source = "ribbon") => bus.enqueue(name, source);
-  void reportHostAcceptance("host_router_installed", "PASS");
-  hostWindow.setInterval(() => { const request = parse<BridgeRequest>(application.PluginStorage.getItem(REQUEST_KEY)); if (!request) return; application.PluginStorage.setItem(REQUEST_KEY, ""); if (request.schema_version !== 1 || !router.supports(request.command_name) || request.command_name === "show_about") { store.update({ latest_error: "TASKPANE_MESSAGE_REJECTED", active_view: "issues" }); return; } bus.enqueue(request.command_name, "taskpane", request.request_id); }, 200);
-  hostWindow.setInterval(() => { void router.reconcileActiveDocument().catch(() => { /* no active document is normal during WPS transitions */ }); }, 750);
-  void runAutomaticHostAcceptance(application, router, build);
+  const store = new HostResultStore(application.PluginStorage, build, hostContextId); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const runtime = new LocalApplicationRuntime(application, panes, store, config);
+  let running = false;
+  const invalidate = () => { const ribbon = application.ribbonUI as { InvalidateControl?: (id: string) => void } | undefined; ribbon?.InvalidateControl?.("preview"); ribbon?.InvalidateControl?.("apply"); ribbon?.InvalidateControl?.("health"); };
+  hostWindow.DocxtoolLocalApplication = { runtime, panes, store, build };
+  hostWindow.DocxtoolRunLocalCommand = async (name, source = "ribbon", requestId) => {
+    if (running) throw new Error("LOCAL_COMMAND_BUSY");
+    running = true; hostWindow.DocxtoolCommandBusy = true; invalidate();
+    try { return await runtime.run(name, source, requestId, build.build_id); }
+    finally { running = false; hostWindow.DocxtoolCommandBusy = false; invalidate(); }
+  };
+  void reportHostAcceptance("local_application_runtime_installed", "PASS");
+  hostWindow.setInterval(() => { const request = parse<BridgeRequest>(application.PluginStorage.getItem(REQUEST_KEY)); if (!request) return; application.PluginStorage.setItem(REQUEST_KEY, ""); if (request.schema_version !== 1 || !runtime.supports(request.command_name) || request.command_name === "show_about") { store.update({ latest_error: "TASKPANE_MESSAGE_REJECTED", active_view: "issues" }); return; } void hostWindow.DocxtoolRunLocalCommand?.(request.command_name, "taskpane", request.request_id).catch((error) => hostLog("ERROR", "application.runtime.taskpane.failed", "任务窗格本地命令执行失败", { stable_error_code: stableError(error) }, error)); }, 200);
+  hostWindow.setInterval(() => { void runtime.reconcileActiveDocument().catch(() => { /* no active document is normal during WPS transitions */ }); }, 750);
+  void runAutomaticHostAcceptance(application, runtime, build);
 }
 let installDone = false;
 let installAttempt = 0;
 let hostModuleReported = false;
 let installTimer: number | undefined;
+let lastConfigError = "";
+let lastConfigErrorAt = 0;
 function tryInstall(): void {
   if (installDone) return;
   installAttempt += 1;
@@ -358,32 +364,40 @@ function tryInstall(): void {
   let config: ClassifiedRuntimeConfig | null = null;
   if (application) {
     try { config = runtimeConfig(application); }
-    catch (error) { if (stableError(error) !== "PRODUCTION_COMPOSITION_NOT_READY") hostLog("WARN", "host.install.config.failed", "读取 Host 运行时配置失败", { attempt: installAttempt, stable_error_code: stableError(error) }, error); }
+    catch (error) {
+      const code = stableError(error);
+      const nowMs = Date.now();
+      if (code !== "PRODUCTION_COMPOSITION_NOT_READY" && (code !== lastConfigError || nowMs - lastConfigErrorAt >= 5_000)) {
+        hostLog("WARN", "application.install.config.failed", "读取本地运行时配置失败", { attempt: installAttempt, stable_error_code: code }, error);
+        lastConfigError = code;
+        lastConfigErrorAt = nowMs;
+      }
+    }
   }
-  const readiness = { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: Boolean(config), plugin_storage_available: Boolean(application?.PluginStorage), active_document_available: Boolean(application?.ActiveDocument), host_enqueue_before_install: typeof hostWindow.DocxtoolHostEnqueue === "function" };
-  hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "host.install.attempt", "检查 Host runtime 安装条件", readiness);
+  const readiness = { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: Boolean(config), plugin_storage_available: Boolean(application?.PluginStorage), active_document_available: Boolean(application?.ActiveDocument), local_runtime_before_install: typeof hostWindow.DocxtoolRunLocalCommand === "function" };
+  if (installAttempt === 1 || installAttempt % 20 === 0) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "application.install.attempt", "检查本地应用运行时安装条件", readiness);
   if (!hostModuleReported) { hostModuleReported = true; void reportHostAcceptance("host_module_loaded", "PASS"); }
   if (!application || !build || !config) {
-    if ([1, 20, 40, 60].includes(installAttempt)) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "host.install.waiting", "等待 WPS Application、构建信息和运行时配置", readiness);
+    if ([1, 20, 40, 60].includes(installAttempt)) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "application.install.waiting", "等待 WPS Application、构建信息和本地运行时配置", readiness);
     return;
   }
   const started = Date.now();
   try {
-    hostLog("INFO", "host.install.start", "开始安装 HostCommandRouter", readiness);
+    hostLog("INFO", "application.install.start", "开始安装本地应用运行时", readiness);
     diagnosticLogPath = config.diagnosticLogPath ?? "";
     const hostContextId = randomId();
     install(application, build, config, hostContextId);
     installDone = true;
     if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
-    hostLog("INFO", "host.install.success", "HostCommandRouter 安装成功", { ...readiness, host_context_id: hostContextId, duration_ms: Date.now() - started });
+    hostLog("INFO", "application.install.success", "本地应用运行时安装成功", { ...readiness, host_context_id: hostContextId, duration_ms: Date.now() - started });
   } catch (error) {
     const code = stableError(error);
     installDone = true;
     if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
-    hostLog("ERROR", "host.install.failed", "HostCommandRouter 安装失败", { ...readiness, stable_error_code: code, duration_ms: Date.now() - started }, error);
+    hostLog("ERROR", "application.install.failed", "本地应用运行时安装失败", { ...readiness, stable_error_code: code, duration_ms: Date.now() - started }, error);
     void reportHostAcceptance("host_install", "FAIL", code);
     try { new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" }); }
-    catch (storeError) { hostLog("ERROR", "host.install.state.failed", "Host 安装失败状态无法写入 PluginStorage", { stable_error_code: code }, storeError); }
+    catch (storeError) { hostLog("ERROR", "application.install.state.failed", "本地运行时失败状态无法写入 PluginStorage", { stable_error_code: code }, storeError); }
   }
 }
 tryInstall();

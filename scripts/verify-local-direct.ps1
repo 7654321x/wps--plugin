@@ -9,8 +9,8 @@ try {
   if ($LASTEXITCODE) { throw "TYPESCRIPT_TYPECHECK_FAILED" }
 
   $scanTargets = @(
-    "apps/classified-offline/main.production.js",
-    "apps/classified-offline/js/ribbon-production.js",
+    "apps/classified-offline/main.js",
+    "apps/classified-offline/js/ribbon.js",
     "apps/classified-offline/src/host-runtime.ts",
     "apps/classified-offline/src/composition-root.ts",
     "apps/classified-offline/src/health-check.ts",
@@ -27,7 +27,7 @@ try {
     "scripts/remove-local-runtime.ps1",
     "scripts/local-direct.ps1"
   )
-  $forbidden = "HttpLocalRecognitionTransport|HttpCommandServiceClient|LocalEndpointProvider|sessionToken|recognitionEndpoint|commandEndpoint|127\.0\.0\.1:9528|/v1/recognize|/v1/commands|DocxtoolHostDispatch|fetch\("
+  $forbidden = "HttpLocalRecognitionTransport|HttpCommandServiceClient|LocalEndpointProvider|sessionToken|recognitionEndpoint|commandEndpoint|127\.0\.0\.1:9528|/v1/recognize|/v1/commands|DocxtoolHostDispatch|DocxtoolHostEnqueue|HostCommandRouter|LocalCommandBus|fetch\("
   $matches = rg -n $forbidden @scanTargets
   if ($LASTEXITCODE -eq 0) { throw "LOCAL_DIRECT_FORBIDDEN_PRODUCTION_DEPENDENCY" }
   if ($LASTEXITCODE -ne 1) { throw "LOCAL_DIRECT_SCAN_FAILED" }
@@ -35,7 +35,7 @@ try {
   $required = @(
     "LocalProcessRecognitionTransport",
     "LocalFormatCommandGenerator",
-    "DocxtoolHostEnqueue",
+    "DocxtoolRunLocalCommand",
     "LOCAL_RUNTIME_BUILD_PASS",
     "LOCAL_RUNTIME_INSTALL_PASS",
     "runtime-manifest.json"

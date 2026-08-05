@@ -32,10 +32,11 @@ import {
   GridTransactionManager,
   WpsPreviewCommentService,
   WpsLocalFileSystem,
+  normalizeWpsPath,
 } from "../dist/packages/wps-adapter/src/index.js";
 import { CommandValidator } from "../dist/packages/security/src/index.js";
 import { FormatDocumentUseCase, PreviewDocumentUseCase } from "../dist/packages/application/src/format-document-usecase.js";
-import { HostCommandRouter, HostResultStore, TaskPaneManager } from "../dist/apps/classified-offline/src/host-runtime.js";
+import { LocalApplicationRuntime, HostResultStore, TaskPaneManager } from "../dist/apps/classified-offline/src/host-runtime.js";
 import { ClassifiedHealthChecker } from "../dist/apps/classified-offline/src/health-check.js";
 import { errorMessage, errorText } from "../dist/apps/classified-offline/src/error-messages.js";
 import { DiagnosticRunner, classifyNetworkError } from "../dist/packages/diagnostics/src/index.js";
@@ -350,6 +351,30 @@ test("WPS local file system adapter exposes stable method-missing errors", () =>
   assert.throws(() => fs.readText("C:\\tmp\\a.txt"), /WPS_FILESYSTEM_READ_UNAVAILABLE/);
   assert.throws(() => fs.removeFile("C:\\tmp\\a.txt"), /WPS_FILESYSTEM_REMOVE_UNAVAILABLE|WPS_FILESYSTEM_EXISTS_UNAVAILABLE/);
   assert.throws(() => fs.removeDirectory("C:\\tmp"), /WPS_FILESYSTEM_RMDIR_UNAVAILABLE|WPS_FILESYSTEM_EXISTS_UNAVAILABLE/);
+});
+
+test("WPS local file system normalizes mixed Windows separators before calling the host", () => {
+  assert.equal(normalizeWpsPath("C:/Users/test\\Docxtool//runtime/current.json"), "C:\\Users\\test\\Docxtool\\runtime\\current.json");
+  const calls = [];
+  const fs = new WpsLocalFileSystem({ Exists(value) { calls.push(value); return false; } });
+  fs.exists("C:/Users/test\\Docxtool/current.json");
+  assert.equal(calls[0], "C:\\Users\\test\\Docxtool\\current.json");
+});
+
+test("WPS local file system prefers official ReadFile and does not misuse one-argument AppendFile", () => {
+  const calls = [];
+  const fs = new WpsLocalFileSystem({
+    Exists(value) { calls.push(["Exists", value]); return true; },
+    ReadFile(value) { calls.push(["ReadFile", value]); return "A"; },
+    ReadFileString() { throw new Error("compatibility reader must not be used"); },
+    WriteFile(value, text) { calls.push(["WriteFile", value, text]); },
+    AppendFile(value) { calls.push(["AppendFile", value]); },
+  });
+  assert.equal(fs.readText("C:/runtime/current.json"), "A");
+  fs.appendText("C:/runtime/current.json", "B");
+  assert.deepEqual(calls.filter(([name]) => name === "ReadFile").length, 2);
+  assert.deepEqual(calls.find(([name]) => name === "WriteFile"), ["WriteFile", "C:\\runtime\\current.json", "AB"]);
+  assert.equal(calls.some(([name]) => name === "AppendFile"), false);
 });
 
 test("quoteWindowsCommandLineArgument preserves Windows argv semantics", () => {
@@ -701,12 +726,14 @@ test("add-in main context loads the host router independently from the taskpane"
   const main = await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8");
   const taskpane = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
   const hostRuntime = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
-  assert.match(main, /<script type='module' src='/);
-  assert.match(main, /DocxtoolVersionedAsset\("dist\/host-runtime\.js"\)/);
+  assert.match(main, /js\/bootstrap-probe\.js/);
+  assert.match(main, /versioned\("host-runtime\.js"\)/);
+  assert.equal(main.includes("type='module'"), false);
+  assert.equal(main.includes("dist/host-runtime.js"), false);
   assert.equal(taskpane.includes("createClassifiedProductionComposition"), false);
   assert.equal(taskpane.includes("FormatDocumentUseCase"), false);
   assert.match(hostRuntime, /setInterval\(tryInstall,\s*250\)/);
-  assert.match(hostRuntime, /host_router_installed/);
+  assert.match(hostRuntime, /local_application_runtime_installed/);
 });
 
 function hostMocks() {
@@ -732,29 +759,29 @@ test("HostResultStore persists redacted state and isolates stale builds", () => 
   assert.equal(stale.latest_error, "ADDIN_CONTEXT_STALE"); assert.equal(stale.recognition_summary, "");
 });
 
-test("HostCommandRouter toggles a pane without a taskpane window and rejects unknown commands", async () => {
+test("LocalApplicationRuntime directly invokes pane actions and rejects unknown commands", async () => {
   const mocks = hostMocks(); const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
   const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
-  const router = new HostCommandRouter(mocks.application, panes, store, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9529", sessionToken: "x" });
-  assert.equal((await router.dispatch("toggle_taskpane")).status, "PASS"); assert.equal(panes.get().Visible, true);
-  assert.equal((await router.dispatch("toggle_taskpane")).status, "PASS"); assert.equal(panes.get().Visible, false);
-  await assert.rejects(() => router.dispatch("not_registered"), /UNKNOWN_HOST_COMMAND/);
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" });
+  assert.equal((await runtime.run("toggle_taskpane")).status, "PASS"); assert.equal(panes.get().Visible, true);
+  assert.equal((await runtime.run("toggle_taskpane")).status, "PASS"); assert.equal(panes.get().Visible, false);
+  await assert.rejects(() => runtime.run("not_registered"), /UNKNOWN_LOCAL_COMMAND/);
 });
 
-test("HostCommandRouter logs the original stack while HostState keeps only the stable error", async () => {
+test("LocalApplicationRuntime logs the original stack while public state keeps only the stable error", async () => {
   const mocks = hostMocks();
   const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
   const store = new HostResultStore(mocks.storage, build, "host-a");
   const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
-  const router = new HostCommandRouter(mocks.application, panes, store, { recognitionEndpoint: "http://127.0.0.1:9528", commandEndpoint: "http://127.0.0.1:9528", sessionToken: "fixture" });
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" });
   const events = [];
   const previous = globalThis.DocxtoolDiagnosticLog;
   globalThis.DocxtoolDiagnosticLog = (...values) => events.push(values);
   try {
-    const result = await router.dispatch("toggle_taskpane", "taskpane", "request-error", "stale-build");
+    const result = await runtime.run("toggle_taskpane", "taskpane", "request-error", "stale-build");
     assert.equal(result.status, "FAIL");
     assert.equal(result.error_code, "ADDIN_CONTEXT_STALE");
-    const failed = events.find((values) => values[2] === "host.router.dispatch.failed");
+    const failed = events.find((values) => values[2] === "application.runtime.run.failed");
     assert.ok(failed);
     assert.match(failed[5].stack, /ADDIN_CONTEXT_STALE/);
     const publicState = mocks.storage.getItem("docxtool_classified_host_result_v1");
@@ -766,11 +793,11 @@ test("HostCommandRouter logs the original stack while HostState keeps only the s
   }
 });
 
-test("HostCommandRouter isolates stored results after an active-document switch", async () => {
+test("LocalApplicationRuntime isolates stored results after an active-document switch", async () => {
   const mocks = hostMocks(); mocks.application.ActiveDocument = { FullName: "C:\\one.docx", Paragraphs: { Count: 2 } };
-  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" }; const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane"); const router = new HostCommandRouter(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" });
+  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" }; const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane"); const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" });
   store.update({ document_identity_hash: "previous-document", recognition_summary: "旧文档结果", paragraph_recognition_models: [{ paragraph_index: 0, recognized_type: "body", confidence: 1, needs_review: false }], unresolved_block_count: 2, mixed_paragraph_count: 3 });
-  await router.reconcileActiveDocument(); assert.equal(store.read().recognition_summary, ""); assert.deepEqual(store.read().paragraph_recognition_models, []);
+  await runtime.reconcileActiveDocument(); assert.equal(store.read().recognition_summary, ""); assert.deepEqual(store.read().paragraph_recognition_models, []);
   assert.equal(store.read().unresolved_block_count, 0); assert.equal(store.read().mixed_paragraph_count, 0);
 });
 
@@ -792,9 +819,9 @@ test("taskpane close button uses the host bridge and CSS stays inside its webvie
   assert.equal(/position\s*:\s*fixed|z-index|pointer-capture|focus-trap/i.test(html), false);
 });
 
-test("Ribbon callbacks enqueue local commands without touching the router directly", async () => {
+test("Ribbon callbacks directly invoke the single local application runtime", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8"); const calls = [];
-  const context = { Promise, JSON, Date, Number, String, Object, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3891/main.js"; } } }, window: { DocxtoolHostEnqueue(name, source) { calls.push([name, source]); return { accepted: true, command_id: "cmd", command_name: name }; }, Application: { PluginStorage: { getItem() { return null; }, setItem() {} } } } };
+  const context = { Promise, JSON, Date, Number, String, Object, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3891/main.js"; } } }, window: { DocxtoolRunLocalCommand(name, source) { calls.push([name, source]); return Promise.resolve({ status: "PASS", command_id: "cmd", command_name: name }); }, Application: { PluginStorage: { getItem() { return null; }, setItem() {} } } } };
   vm.runInNewContext(source, context); for (const id of ["preview", "apply", "health", "panel"]) context.OnAction({ Id: id });
   assert.deepEqual(calls, [["preview_document", "ribbon"], ["format_document", "ribbon"], ["health_check", "ribbon"], ["toggle_taskpane", "ribbon"]]);
 });
@@ -806,27 +833,28 @@ test("classified Ribbon exposes the local-direct buttons in the required order",
   for (const removed of ["仅识别", "打开任务窗格", "关闭任务窗格", "关于", "功能检测"]) assert.equal(xml.includes(removed), false);
 });
 
-test("production ribbon enqueues preview locally instead of dispatching directly", async () => {
-  const source = await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8");
+test("canonical ribbon directly runs preview locally without dispatch or queue", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
   assert.equal(source.includes("dispatchEvent"), false);
   assert.equal(source.includes("CustomEvent"), false);
-  assert.equal(source.includes("DocxtoolHostEnqueue"), true);
+  assert.equal(source.includes("DocxtoolRunLocalCommand"), true);
+  assert.equal(source.includes("DocxtoolHostEnqueue"), false);
   const calls = [];
-  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { Application: { PluginStorage: { getItem() { return null; }, setItem() {} } }, DocxtoolHostEnqueue(name, sourceName) { calls.push([name, sourceName]); return { accepted: true, command_id: "cmd", command_name: name }; } } };
+  const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { Application: { PluginStorage: { getItem() { return null; }, setItem() {} } }, DocxtoolRunLocalCommand(name, sourceName) { calls.push([name, sourceName]); return Promise.resolve({ status: "PASS", command_id: "cmd", command_name: name }); } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "preview" }), true);
   assert.deepEqual(calls, [["preview_document", "ribbon"]]);
 });
 
-test("production ribbon reports taskpane creation failure instead of swallowing it", async () => {
-  const source = await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8");
+test("canonical ribbon reports taskpane creation failure instead of swallowing it", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
   const storage = new Map();
   const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { DocxtoolBuildInfo: { build_id: "build", asset_hash: "hash" }, Application: { PluginStorage: { getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) { storage.set(key, value); } }, CreateTaskPane() { return null; } } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "preview" }), true);
   const state = JSON.parse(storage.get("docxtool_classified_host_result_v1"));
-  assert.equal(state.latest_error, "HOST_COMMAND_QUEUE_NOT_READY");
-  assert.match(state.formatting_progress, /本地命令队列尚未就绪/);
+  assert.equal(state.latest_error, "LOCAL_APPLICATION_RUNTIME_NOT_READY");
+  assert.match(state.formatting_progress, /本地应用运行时尚未就绪/);
 });
 
 test("taskpane exposes immediate pending feedback until host consumes request", async () => {
@@ -840,49 +868,53 @@ test("taskpane exposes immediate pending feedback until host consumes request", 
 
 test("classified diagnostics cover bootstrap, Ribbon, Host, taskpane and preview stages", async () => {
   const files = {
-    main: await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8"),
-    ribbon: await readFile(new URL("../apps/classified-offline/js/ribbon-production.js", import.meta.url), "utf8"),
+    main: await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8"),
+    probe: await readFile(new URL("../apps/classified-offline/js/bootstrap-probe.js", import.meta.url), "utf8"),
+    ribbon: await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8"),
     host: await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8"),
     taskpane: await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8"),
     recognition: await readFile(new URL("../packages/recognition-client/src/index.ts", import.meta.url), "utf8"),
     commands: await readFile(new URL("../packages/command-service-client/src/index.ts", import.meta.url), "utf8"),
     comments: await readFile(new URL("../packages/wps-adapter/src/preview-comments.ts", import.meta.url), "utf8"),
   };
-  for (const event of ["bootstrap.main.loaded", "bootstrap.script.requested"]) assert.match(files.main, new RegExp(event.replaceAll(".", "\\.")));
-  for (const event of ["ribbon.action.received", "ribbon.command.enqueued", "ribbon.command.enqueue.failed"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
-  for (const event of ["host.module.loaded", "host.install.attempt", "host.install.success", "host.router.dispatch.received", "host.router.dispatch.failed", "preview.use_case.start", "preview.comment.readback"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
+  assert.match(files.main, /bootstrap\.main\.loaded/);
+  for (const event of ["bootstrap.probe.loaded", "window.error", "window.unhandledrejection"]) assert.match(files.probe, new RegExp(event.replaceAll(".", "\\.")));
+  assert.match(files.probe, /__docxtool_log/);
+  assert.equal(files.probe.includes("setInterval"), false);
+  for (const event of ["ribbon.action.received", "ribbon.command.started", "ribbon.command.completed", "ribbon.command.failed"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["host.module.loaded", "application.install.attempt", "application.install.success", "application.runtime.run.received", "application.runtime.run.failed", "preview.use_case.start", "preview.comment.readback"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
   for (const event of ["taskpane.module.loaded", "taskpane.button.clicked", "taskpane.request.persisted", "taskpane.pending.timeout"]) assert.match(files.taskpane, new RegExp(event.replaceAll(".", "\\.")));
   assert.match(files.recognition, /(recognition\.request\.(start|response|failed)|recognition\.local_process\.start)/);
   assert.match(files.commands, /command_service\.request\.(start|response|failed)|local-format-engine/);
   for (const event of ["preview.comment.write.start", "preview.comment.write.failed", "preview.comment.readback.success"]) assert.match(files.comments, new RegExp(event.replaceAll(".", "\\.")));
 });
 
-test("hidden automatic workflow sends all formal actions through HostCommandRouter bridge", async () => {
+test("hidden automatic workflow names all formal actions without direct WPS formatting writes", async () => {
   const source = await readFile(new URL("../apps/classified-offline/src/formal-e2e-driver.ts", import.meta.url), "utf8");
   for (const command of ["health_check", "preview_document", "format_document"]) assert.match(source, new RegExp(command));
   assert.match(source, /docxtool_classified_host_request_v1/);
 });
 
-test("production classified build excludes development E2E taskpane assets", async () => {
+test("classified build has no environment-selected duplicate entry", async () => {
   const config = await readFile(new URL("../apps/classified-offline/vite.config.js", import.meta.url), "utf8");
-  assert.match(config, /DOCXTOOL_DEVELOPMENT_E2E/);
-  const productionMain = await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8");
-  assert.equal(productionMain.includes("development"), false);
+  assert.equal(config.includes("DOCXTOOL_DEVELOPMENT_E2E"), false);
+  assert.equal(config.includes("main.production.js"), false);
+  assert.equal(config.includes("ribbon-production.js"), false);
 });
 
-test("production entry loads the runtime config and the ribbon file that the build actually emits", async () => {
+test("canonical entry loads the runtime config, probe, ribbon and classic host emitted by the build", async () => {
   const config = await readFile(new URL("../apps/classified-offline/vite.config.js", import.meta.url), "utf8");
-  const productionMain = await readFile(new URL("../apps/classified-offline/main.production.js", import.meta.url), "utf8");
-  // The build always emits the production ribbon as js/ribbon.js, so the
-  // production entry must reference that name or the ribbon callbacks 404
-  // and WPS reports an invalid command for every button.
-  assert.match(productionMain, /DocxtoolVersionedAsset\("js\/ribbon\.js"\)/);
-  assert.equal(productionMain.includes("js/ribbon-production.js"), false);
-  assert.match(productionMain, /DocxtoolVersionedAsset\("ui\/local-runtime-config\.js"\)/);
+  const main = await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8");
+  const host = await readFile(new URL("../apps/classified-offline/dist/host-runtime.js", import.meta.url), "utf8");
+  assert.match(main, /versioned\("js\/ribbon\.js"\)/);
+  assert.match(main, /versioned\("ui\/local-runtime-config\.js"\)/);
+  assert.match(main, /js\/bootstrap-probe\.js/);
   assert.match(config, /copyFile\(\{src:"ui\/local-runtime-config\.js",dest:"ui\/local-runtime-config\.js"\}\)/);
-  assert.match(productionMain, /<script type='module' src='/);
-  assert.match(productionMain, /DocxtoolVersionedAsset\("host-runtime\.js"\)/);
-  assert.match(productionMain, /ui\/build-info\.js\?v=/);
+  assert.equal(main.includes("type='module'"), false);
+  assert.match(main, /versioned\("host-runtime\.js"\)/);
+  assert.equal(/^\s*import\s/m.test(host), false);
+  assert.equal(/import\s*\(/.test(host), false);
+  assert.match(host, /host\.module\.loaded/);
 });
 
 test("classified Ribbon preserves a safe error when the host queue is stale", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "docxtool-wps",
-  "version": "1.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -37,6 +37,7 @@
     "dev:local-direct:status": "pwsh -NoProfile -File scripts/local-direct.ps1 status",
     "dev:local-direct:stop": "pwsh -NoProfile -File scripts/local-direct.ps1 stop",
     "verify:local-direct": "pwsh -NoProfile -File scripts/verify-local-direct.ps1",
+    "prepare:wps-debug-package": "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1",
     "start": "python main.py start",
     "start:status": "python main.py status",
     "start:verify": "python main.py verify"
