@@ -11,7 +11,10 @@ export interface ClassifiedRuntimeConfig {
   recognitionExecutablePath: string;
   runtimeVersion: string;
   runtimeSha256: string;
+  recognitionPackageVersion?: string;
+  contractVersion?: number;
   runtimeManifestPath?: string;
+  diagnosticLogPath?: string;
 }
 
 type ProfileWindow = typeof globalThis & {

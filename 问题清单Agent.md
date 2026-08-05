@@ -236,8 +236,53 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 
 ## P025 WPS 仓库路径误判为旧嵌套目录
 
-- 症状：代码或文档被写入 `D:\PycharmProjects\docxtool\wps` 或上级 `D:\PycharmProjects\docxtool`，而不是当前真实仓库 `D:\PycharmProjects\wps`。
+- 症状：代码或文档被写入迁移前旧嵌套目录或其上级项目，而不是当前 WPS 仓库。
 - 根因：历史交接文档保留旧嵌套仓库路径，自动工具的当前工作目录也可能仍指向旧路径。
 - 禁止：凭默认工作目录直接修改文件；不得在未核对 `git rev-parse --show-toplevel` 的情况下新增入口、脚本或发布文件。
-- 正确方案：每轮涉及本项目文件前先确认仓库根为 `D:\PycharmProjects\wps`；所有相对路径均以该目录为根。只有用户明确要求时才跨目录，且跨目录前必须说明目标和原因。
-- 自动验证门槛：`git -C D:\PycharmProjects\wps rev-parse --show-toplevel` 返回 `D:/PycharmProjects/wps`；本轮 `git status` 只检查该仓库；规范扫描不得在现行规则中继续把 `D:\PycharmProjects\docxtool\wps` 写作事实源。
+- 正确方案：每轮涉及本项目文件前先确认当前目录就是 WPS 仓库根；所有相对路径均以该目录为根。只有用户明确要求时才跨目录，且跨目录前必须说明目标和原因。
+- 自动验证门槛：`git rev-parse --show-toplevel` 返回当前 WPS 仓库根；本轮 `git status` 只检查该仓库；规范扫描不得把迁移前旧嵌套目录写作事实源。
+
+## P026 本地直连 runtime 构建只做存在性检查
+
+- 症状：`build-local-recognition-runtime.ps1` 只检查 `dist/local-runtime/win-x64/docxtool-recognize.exe` 是否存在，无法在干净工作区生成 runtime。
+- 根因：runtime 构建脚本只保留了占位门禁，没有本地识别入口、没有 PyInstaller 打包、也没有 manifest。
+- 禁止：继续回退到 9528；把“检查 exe 存在”伪装成“已经构建 runtime”；在没有 manifest 和 current.json 的情况下宣称本地直连可用。
+- 正确方案：runtime 入口统一使用 `local-runtime/recognize_entry.py`；构建脚本必须生成 `docxtool-recognize.exe` 与 `runtime-manifest.json`；安装脚本必须写入 `%APPDATA%\Docxtool\runtime\current.json`；验证脚本必须同时检查 dist、安装指针和 9528 关闭状态。
+- 自动验证门槛：`scripts/build-local-recognition-runtime.ps1`、`scripts/install-local-runtime.ps1`、`scripts/verify-local-direct.ps1`、`scripts/local-direct.ps1 status` 全部 PASS；`docxtool-recognize.exe --help` 可运行；`current.json` 含 `runtime_version`、`executable_path`、`executable_sha256`、`recognition_package_version`。
+
+## P027 WPS 本地进程调用必须走官方 FileSystem / ShellExecute
+
+- 症状：本地识别临时目录创建、请求写入、结果读取或清理失败，或者 `ShellExecute` 传了多余参数。
+- 根因：旧适配器把 `CreateFolder`、`DeleteFile`、`DeleteFolder`、五参数 `ShellExecute` 当成主路径，和 WPS 官方合同不一致。
+- 禁止：继续把非官方别名当作唯一实现；不得用 fetch/HTTP 替代本地进程；不得在 production 里重新引入 localhost 识别服务。
+- 正确方案：新增 `WpsLocalFileSystem`，主路径使用 `Exists` / `mkdirSync` / `Mkdir` / `writeFileString` / `readFileString` / `unlinkSync` / `rmdirSync` / `Remove`；`LocalProcessRecognitionTransport` 只调用 `ShellExecute(exe, args)` 两参数。
+- 自动验证门槛：Node 测试覆盖官方方法、fallback 和稳定错误；`tests/wps-phase-one.test.mjs` 覆盖 `quoteWindowsCommandLineArgument` 与 `LocalProcessRecognitionTransport`；生产扫描不得再命中 `HttpLocalRecognitionTransport`、`HttpCommandServiceClient`、`LocalEndpointProvider`、`sessionToken`、`127.0.0.1:9528`、`/v1/recognize`、`/v1/commands` 或 `DocxtoolHostDispatch`。
+
+## P028 常驻开发服务不得被入口同步等待
+
+- 症状：`main.py start` 停在“注册 WPS 插件项目”，最终超时或一直没有后续中文日志。
+- 根因：`wpsjs debug -s` 会持续提供加载项资源，不会自行退出；将其交给同步命令执行器会阻断整个启动链。
+- 禁止：用加大超时时间掩盖常驻进程；把“进程没有退出”报告成构建失败；重复启动同一端口服务。
+- 正确方案：入口后台启动该进程，以 3889 端口可连接作为就绪条件；端口已经就绪时直接复用。一次性构建和验证命令仍同步执行并检查退出码。
+- 自动验证门槛：从无监听状态执行 `main.py start` 必须在合理时间内返回 0，并依次输出“注册项目已加载”“WPS 功能检测已完成”“启动完成”；再次执行时不得因端口占用失败。
+
+## P029 PyCharm 解释器名称正确但全局 SDK 路径失效
+
+- 症状：运行配置和模块都显示 `Python 3.8 (wps)`，实际运行仍提示“找不到此运行配置的 Python 解释器”。
+- 根因：项目文件只保存 SDK 名称，PyCharm 全局 `jdk.table.xml` 中同名 SDK 的 `homePath`、环境根或关联项目仍指向迁移前目录。
+- 正确方案：同时核对全局 SDK 登记、`.idea/misc.xml` 的项目 SDK、模块 `jdkName` 和运行配置；运行配置优先使用模块 SDK，避免再保存独立路径。
+- 自动验证门槛：全局同名 SDK 只对应当前项目虚拟环境；解释器文件可执行；项目配置中没有迁移前路径；固定 `main` 配置的 `IS_MODULE_SDK=true`；`main.py status` 返回 0。
+
+## P030 重建虚拟环境后本地 runtime 构建失败
+
+- 症状：`main.py start` 在“构建本地识别组件”失败，底层报告 PyInstaller 构建失败或未安装。
+- 根因：重建 `.venv` 后只有基础打包工具，没有安装项目根目录的 `docxtool 4.0` wheel、其运行依赖和 PyInstaller。
+- 正确方案：使用当前 `.venv` 从项目根目录本地 wheel 安装 `docxtool 4.0`，再安装兼容 Python 3.8 的 `PyInstaller<7`；开发验证环境同步安装项目锁定版本的 pytest 与 ruff。
+- 自动验证门槛：可导入 `docxtool` 和 `PyInstaller`；runtime 构建脚本返回 PASS；生成的 exe 可执行 `--help`；runtime 单元测试通过；最后完整执行 `main.py start`。
+
+## P031 Ribbon 可见但点击无反应且没有新日志
+
+- 症状：3889 和 WPS 注册均正常，Ribbon 已显示，但点击没有反馈，根目录旧日志也没有当前事件。
+- 根因：WPS 内嵌浏览器可能没有 `crypto.randomUUID()`；Host 安装阶段直接调用会中断，Ribbon 只剩外壳。旧本地直连日志仅存在内存队列，无法从宿主外部查看。
+- 正确方案：正式宿主链所有随机 ID 必须检测 `crypto.randomUUID` 并使用 `crypto.getRandomValues` 兼容；诊断事件通过 WPS FileSystem 写入仓库根目录 `wps-plugin-debug.log`，不恢复 9528。`main.py start` 默认常驻展示中文日志。
+- 自动验证门槛：旧浏览器环境不得因缺少 `randomUUID` 阻止 Host 安装；构建、类型检查和 Ribbon/Host 测试通过；真实 WPS 重新加载后日志必须出现 `host.install.success`，点击后必须出现 `ribbon.action.received` 和 `host.router.dispatch.received` 或明确的中文错误。

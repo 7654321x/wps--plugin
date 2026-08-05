@@ -9,7 +9,7 @@ type HostCommandName = LocalCommandName | "show_about";
 type HostCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface TaskPaneLike { ID: number | string; Visible: boolean; Delete?: () => void; Navigate?: (url: string) => void; Width?: number; DockPosition?: unknown; }
-interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: { Exists?: (path: string) => boolean; ReadFileString?: (path: string) => string; readFileString?: (path: string) => string }; Env?: { GetAppDataPath?: () => string }; }
+interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: { Exists?: (path: string) => boolean; ReadFileString?: (path: string) => string; readFileString?: (path: string) => string; writeFileString?: (path: string, content: string) => void; WriteFileString?: (path: string, content: string) => void; mkdirSync?: (path: string, options?: { recursive?: boolean }) => void; Mkdir?: (path: string) => void }; Env?: { GetAppDataPath?: () => string }; }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; build_timestamp: string; }
 interface CommandResult { command_id: string; command_name: HostCommandName; status: HostCommandStatus; stage: string; summary: string; error_code: string; started_at: string; finished_at: string; }
 interface RecognitionModel { paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean; }
@@ -40,12 +40,30 @@ type HostWindow = Window & {
   DocxtoolDiagnosticLogger?: { writeForComponent: (component: string, level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void };
 };
 const hostWindow = globalThis as unknown as HostWindow;
+let diagnosticLogPath = "";
+let fallbackIdCounter = 0;
+function randomId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  if (typeof crypto.getRandomValues === "function") { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join(""); }
+  fallbackIdCounter += 1; return `${Date.now().toString(36)}-${fallbackIdCounter.toString(36)}`;
+}
+function appendHostLog(item: DiagnosticEvent): void {
+  try {
+    const application = hostWindow.Application; const fs = application?.FileSystem; const path = diagnosticLogPath;
+    const read = fs?.readFileString ?? fs?.ReadFileString; const write = fs?.writeFileString ?? fs?.WriteFileString;
+    if (!fs || !path || typeof fs.Exists !== "function" || typeof write !== "function") return;
+    let existing = ""; if (fs.Exists(path) && typeof read === "function") existing = String(read.call(fs, path));
+    if (existing.length > 2_000_000) existing = existing.slice(-1_000_000);
+    write.call(fs, path, `${existing}${JSON.stringify(item)}\n`);
+  } catch { /* file diagnostics never changes WPS host behavior */ }
+}
 function hostLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
   try {
     if (hostWindow.DocxtoolDiagnosticLog) { hostWindow.DocxtoolDiagnosticLog(level, "host", event, message, data, error); return; }
     if (hostWindow.DocxtoolEarlyLog) { hostWindow.DocxtoolEarlyLog(level, "host", event, message, data, error); return; }
     const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-    queue.push({ timestamp: new Date().toISOString(), level, component: "host", event, message, data });
+    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "host", event, message, data };
+    queue.push(item); appendHostLog(item);
     if (queue.length > 500) queue.splice(0, queue.length - 500);
     hostWindow.DocxtoolEarlyLogQueue = queue;
   } catch { /* diagnostics never changes WPS host behavior */ }
@@ -58,7 +76,7 @@ const CONFIG_KEY = "docxtool_classified_runtime_config";
 const PANE_KEY = "docxtool_classified_taskpane";
 const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 function now(): string { return new Date().toISOString(); }
-function id(prefix: string): string { return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`; }
+function id(prefix: string): string { return `${prefix}-${Date.now().toString(36)}-${randomId().slice(0, 8)}`; }
 function stableError(error: unknown): string { const raw = error instanceof Error ? error.message : "HOST_COMMAND_FAILED"; if (/fetch|network/i.test(raw)) return "LOCAL_AGENT_UNAVAILABLE"; return /^[A-Z0-9_:.-]+$/.test(raw) ? raw : "HOST_COMMAND_FAILED"; }
 async function hash(value: string): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join(""); }
 function parse<T>(value: string | null): T | null { try { return value ? JSON.parse(value) as T : null; } catch { return null; } }
@@ -73,7 +91,7 @@ function formattingPlan(commands: FormattingCommandSet["commands"]): string {
 
 export class HostResultStore {
   private state: HostState;
-  constructor(private readonly storage: StorageLike, private readonly build: BuildInfo, readonly hostContextId: string = crypto.randomUUID()) {
+  constructor(private readonly storage: StorageLike, private readonly build: BuildInfo, readonly hostContextId: string = randomId()) {
     const stored = parse<HostState>(storage.getItem(RESULT_KEY));
     this.state = stored?.build_id === build.build_id ? { ...stored, host_context_id: hostContextId, unresolved_block_count: stored.unresolved_block_count ?? 0, mixed_paragraph_count: stored.mixed_paragraph_count ?? 0, health_overall: stored.health_overall ?? "", health_report: stored.health_report ?? "", health_items: stored.health_items ?? [] } : { schema_version: 1, build_id: build.build_id, asset_hash: build.asset_hash, host_context_id: hostContextId, document_identity_hash: "", active_command: null, command_status: "IDLE", active_view: "execution", recognition_summary: "", paragraph_recognition_models: [], formatting_preview_models: [], preview_comment_status: "", formatting_progress: "就绪", formatting_result: "", latest_error: stored ? "ADDIN_CONTEXT_STALE" : "", unresolved_block_count: 0, mixed_paragraph_count: 0, health_overall: "", health_report: "", health_items: [], callback_log: [], updated_at: now() };
     this.save();
@@ -243,12 +261,21 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
   const read = fs?.ReadFileString ?? fs?.readFileString;
   if (typeof exists !== "function" || typeof read !== "function" || !exists.call(fs, manifestPath)) return null;
   const manifest = parse<Record<string, unknown>>(read.call(fs, manifestPath));
-  if (!manifest || typeof manifest.executable_path !== "string") return null;
+  if (!manifest) return null;
+  const executablePath = typeof manifest.executable_path === "string"
+    ? manifest.executable_path
+    : typeof manifest.executable === "string" && manifest.executable.includes("\\")
+      ? manifest.executable
+      : "";
+  if (!executablePath) return null;
   return {
-    recognitionExecutablePath: expandAppDataPath(application, manifest.executable_path),
-    runtimeVersion: typeof manifest.runtime_version === "string" ? manifest.runtime_version : "unknown",
-    runtimeSha256: typeof manifest.sha256 === "string" ? manifest.sha256 : "",
+    recognitionExecutablePath: expandAppDataPath(application, executablePath),
+    runtimeVersion: typeof manifest.runtime_version === "string" ? manifest.runtime_version : typeof manifest.runtimeVersion === "string" ? manifest.runtimeVersion : "unknown",
+    runtimeSha256: typeof manifest.executable_sha256 === "string" ? manifest.executable_sha256 : typeof manifest.sha256 === "string" ? manifest.sha256 : "",
+    recognitionPackageVersion: typeof manifest.recognition_package_version === "string" ? manifest.recognition_package_version : typeof manifest.recognitionPackageVersion === "string" ? manifest.recognitionPackageVersion : undefined,
+    contractVersion: typeof manifest.contract_version === "number" ? manifest.contract_version : typeof manifest.contractVersion === "number" ? manifest.contractVersion : undefined,
     runtimeManifestPath: manifestPath,
+    diagnosticLogPath: typeof manifest.diagnostic_log_path === "string" ? manifest.diagnostic_log_path : undefined,
   };
 }
 function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
@@ -268,7 +295,10 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
       recognitionExecutablePath: expandAppDataPath(application, direct.recognitionExecutablePath),
       runtimeVersion: direct.runtimeVersion || "unknown",
       runtimeSha256: direct.runtimeSha256 || "",
+      recognitionPackageVersion: direct.recognitionPackageVersion,
+      contractVersion: direct.contractVersion,
       runtimeManifestPath: manifestPath || direct.runtimeManifestPath,
+      diagnosticLogPath: direct.diagnosticLogPath,
     };
     application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(value));
     return value;
@@ -285,7 +315,8 @@ function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildI
   const logger = {
     writeForComponent(component: string, level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
       const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-      queue.push({ timestamp: new Date().toISOString(), level, component, event, message, data, ...(error === undefined ? {} : { error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? "" : "" } }) });
+      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, data, ...(error === undefined ? {} : { error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? "" : "" } }) };
+      queue.push(item); appendHostLog(item);
       if (queue.length > 500) queue.splice(0, queue.length - 500);
       hostWindow.DocxtoolEarlyLogQueue = queue;
     },
@@ -339,7 +370,8 @@ function tryInstall(): void {
   const started = Date.now();
   try {
     hostLog("INFO", "host.install.start", "开始安装 HostCommandRouter", readiness);
-    const hostContextId = crypto.randomUUID();
+    diagnosticLogPath = config.diagnosticLogPath ?? "";
+    const hostContextId = randomId();
     install(application, build, config, hostContextId);
     installDone = true;
     if (installTimer !== undefined) hostWindow.clearInterval(installTimer);

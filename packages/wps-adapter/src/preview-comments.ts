@@ -110,7 +110,7 @@ export class WpsPreviewCommentService implements PreviewCommentService {
   async addPreviewComments(input: { snapshot: LocalDocumentSnapshot; recognition: RecognitionResult; commands: FormattingCommandSet; mode: PreviewDisplayMode }): Promise<PreviewCommentResult> {
     const started = Date.now();
     this.diagnostics?.writeForComponent("wps-preview-comments", "INFO", "preview.comment.write.start", "开始写入 WPS 预览批注", { recognition_paragraph_count: input.recognition.paragraphs.length, formatting_command_count: input.commands.commands.length });
-    const document = app().ActiveDocument as WpsObject; const comments = collection(document); const session = crypto.randomUUID().replace(/-/g, "");
+    const document = app().ActiveDocument as WpsObject; const comments = collection(document); const session = typeof crypto.randomUUID === "function" ? crypto.randomUUID().replace(/-/g, "") : Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, "0")).join("");
     const userFingerprint = userCommentFingerprint(comments);
     const created: string[] = []; const commandsByTarget = new Map<string, FormattingCommandSet["commands"]>();
     for (const command of input.commands.commands) { const values = commandsByTarget.get(command.target.target_id) ?? []; values.push(command); commandsByTarget.set(command.target.target_id, values); }

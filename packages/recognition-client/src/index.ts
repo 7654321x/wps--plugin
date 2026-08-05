@@ -9,6 +9,7 @@ import {
   createHostTextTape,
   rawSliceUtf16,
 } from "../../wps-adapter/src/host-text.js";
+import { WpsLocalFileSystem, type WpsFileSystemApi } from "../../wps-adapter/src/local-filesystem.js";
 import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 
 export interface LocalHostParagraph {
@@ -62,20 +63,10 @@ export interface WheelRecognitionPlan {
 }
 export interface LocalRecognitionTransport { recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan>; }
 export interface RecognitionProvider { recognize(snapshot: LocalDocumentSnapshot): Promise<RecognitionResult>; }
-interface WpsFileSystemLike {
-  Exists?: (path: string) => boolean;
-  CreateFolder?: (path: string) => void;
-  DeleteFile?: (path: string) => void;
-  DeleteFolder?: (path: string) => void;
-  WriteFileString?: (path: string, value: string) => void;
-  ReadFileString?: (path: string) => string;
-  writeFileString?: (path: string, value: string) => void;
-  readFileString?: (path: string) => string;
-}
 export interface WpsApplicationLike {
   Env?: { GetTempPath?: () => string; GetAppDataPath?: () => string };
-  FileSystem?: WpsFileSystemLike;
-  OAAssist?: { ShellExecute?: (path: string, args?: string, directory?: string, operation?: string, show?: number) => unknown };
+  FileSystem?: WpsFileSystemApi;
+  OAAssist?: { ShellExecute?: (path: string, args: string) => unknown };
 }
 
 const CONTRACT_TYPE_BY_WHEEL_TYPE: Record<string, RecognitionParagraph["recognized_type"]> = {
@@ -253,19 +244,34 @@ export class HttpLocalRecognitionTransport implements LocalRecognitionTransport 
 function joinPath(left: string, right: string): string {
   return left.replace(/[\\/]+$/, "") + "\\" + right.replace(/^[\\/]+/, "");
 }
-function quoteArg(value: string): string {
-  return `"${value.replaceAll('"', '\\"')}"`;
+export function quoteWindowsCommandLineArgument(value: string): string {
+  if (value.length === 0) return '""';
+  if (!/[\s"]/u.test(value)) return value;
+  let result = '"';
+  let slashes = 0;
+  for (const char of value) {
+    if (char === "\\") {
+      slashes += 1;
+      continue;
+    }
+    if (char === '"') {
+      result += "\\".repeat(slashes * 2 + 1) + '"';
+      slashes = 0;
+      continue;
+    }
+    result += "\\".repeat(slashes) + char;
+    slashes = 0;
+  }
+  result += "\\".repeat(slashes * 2) + '"';
+  return result;
 }
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function fileSystem(application: WpsApplicationLike): Required<Pick<WpsFileSystemLike, "Exists" | "WriteFileString" | "ReadFileString">> & WpsFileSystemLike {
+function fileSystem(application: WpsApplicationLike): WpsLocalFileSystem {
   const fs = application.FileSystem;
-  const exists = fs?.Exists;
-  const write = fs?.WriteFileString ?? fs?.writeFileString;
-  const read = fs?.ReadFileString ?? fs?.readFileString;
-  if (typeof exists !== "function" || typeof write !== "function" || typeof read !== "function") throw new Error("WPS_FILESYSTEM_UNAVAILABLE");
-  return { ...fs, Exists: exists.bind(fs), WriteFileString: write.bind(fs), ReadFileString: read.bind(fs) };
+  if (!fs) throw new Error("WPS_FILESYSTEM_UNAVAILABLE");
+  return new WpsLocalFileSystem(fs);
 }
 function parseJsonObject(raw: string, code: string): Record<string, unknown> {
   try {
@@ -295,10 +301,11 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
   async recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan> {
     if (!snapshot.localDocxPath) throw new Error("DOCUMENT_MUST_BE_SAVED");
     const fs = fileSystem(this.application);
-    if (!fs.Exists(this.executablePath)) throw new Error("LOCAL_RECOGNITION_RUNTIME_NOT_FOUND");
+    if (!fs.exists(this.executablePath)) throw new Error("LOCAL_RECOGNITION_RUNTIME_NOT_FOUND");
     const tempRoot = this.application.Env?.GetTempPath?.();
     if (!tempRoot) throw new Error("WPS_TEMP_PATH_UNAVAILABLE");
-    const requestId = `local-rec-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+    const randomPart = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : Array.from(crypto.getRandomValues(new Uint8Array(4)), (value) => value.toString(16).padStart(2, "0")).join("");
+    const requestId = `local-rec-${Date.now().toString(36)}-${randomPart}`;
     const jobDir = joinPath(tempRoot, requestId);
     const requestPath = joinPath(jobDir, "request.json");
     const resultPath = joinPath(jobDir, "result.json");
@@ -324,15 +331,20 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
     };
     const shellExecute = this.application.OAAssist?.ShellExecute;
     if (typeof shellExecute !== "function") throw new Error("LOCAL_PROCESS_EXECUTION_BLOCKED");
-    fs.CreateFolder?.(jobDir);
-    fs.WriteFileString(requestPath, JSON.stringify(request));
+    fs.mkdir(jobDir);
+    fs.writeText(requestPath, JSON.stringify(request));
     const started = Date.now();
     this.diagnostics?.writeForComponent("recognition-client", "INFO", "recognition.local_process.start", "开始调用本地识别进程", { request_id: requestId, paragraph_count: snapshot.paragraphs.length });
     try {
-      shellExecute.call(this.application.OAAssist, this.executablePath, `--request ${quoteArg(requestPath)} --result ${quoteArg(resultPath)} --error ${quoteArg(errorPath)}`, "", "open", 0);
+      const argumentsText = [
+        "--request", quoteWindowsCommandLineArgument(requestPath),
+        "--result", quoteWindowsCommandLineArgument(resultPath),
+        "--error", quoteWindowsCommandLineArgument(errorPath),
+      ].join(" ");
+      shellExecute.call(this.application.OAAssist, this.executablePath, argumentsText);
       while (Date.now() - started <= this.timeoutMs) {
-        if (fs.Exists(resultPath)) {
-          const raw = fs.ReadFileString(resultPath);
+        if (fs.exists(resultPath)) {
+          const raw = fs.readText(resultPath);
           if (new TextEncoder().encode(raw).byteLength > this.maxResultBytes) throw new Error("LOCAL_RECOGNITION_RESULT_TOO_LARGE");
           const payload = parseJsonObject(raw, "LOCAL_RECOGNITION_INVALID_JSON");
           if (payload.request_id !== requestId) throw new Error("LOCAL_RECOGNITION_REQUEST_ID_MISMATCH");
@@ -340,15 +352,15 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
           if (!plan || typeof plan !== "object") throw new Error("LOCAL_RECOGNITION_INVALID_RESULT");
           return plan as WheelRecognitionPlan;
         }
-        if (fs.Exists(errorPath)) throw new Error(processError(fs.ReadFileString(errorPath)));
+        if (fs.exists(errorPath)) throw new Error(processError(fs.readText(errorPath)));
         await delay(this.pollMs);
       }
       throw new Error("LOCAL_RECOGNITION_TIMEOUT");
     } finally {
       for (const path of [requestPath, resultPath, errorPath]) {
-        try { if (fs.Exists(path)) fs.DeleteFile?.(path); } catch { /* cleanup must not hide the real error */ }
+        try { fs.removeFile(path); } catch { /* cleanup must not hide the real error */ }
       }
-      try { if (fs.Exists(jobDir)) fs.DeleteFolder?.(jobDir); } catch { /* cleanup must not hide the real error */ }
+      try { fs.removeDirectory(jobDir); } catch { /* cleanup must not hide the real error */ }
     }
   }
 }

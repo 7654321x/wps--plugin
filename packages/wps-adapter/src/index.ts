@@ -6,6 +6,7 @@ export * from "./format-validation.js";
 export * from "./grid.js";
 export * from "./preview-comments.js";
 export * from "./host-text.js";
+export * from "./local-filesystem.js";
 export class CommandRegistry { allows(kind: string): boolean { return ALLOWED_COMMANDS.has(kind as never); } }
 export class MockDocumentReader implements DocumentReader {
   constructor(private readonly snapshot: LocalDocumentSnapshot) {}

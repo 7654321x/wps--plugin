@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, readFile as readFileText, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -11,7 +15,7 @@ import {
   RECOGNITION_RESULT_VERSION,
   assertCommandRequest,
 } from "../dist/packages/contracts/src/index.js";
-import { LocalWheelRecognitionProvider } from "../dist/packages/recognition-client/src/index.js";
+import { LocalProcessRecognitionTransport, LocalWheelRecognitionProvider, quoteWindowsCommandLineArgument } from "../dist/packages/recognition-client/src/index.js";
 import { HttpCommandServiceClient, LocalEndpointProvider } from "../dist/packages/command-service-client/src/index.js";
 import {
   MockDocumentExecutor,
@@ -27,6 +31,7 @@ import {
   GridReadbackValidator,
   GridTransactionManager,
   WpsPreviewCommentService,
+  WpsLocalFileSystem,
 } from "../dist/packages/wps-adapter/src/index.js";
 import { CommandValidator } from "../dist/packages/security/src/index.js";
 import { FormatDocumentUseCase, PreviewDocumentUseCase } from "../dist/packages/application/src/format-document-usecase.js";
@@ -114,6 +119,10 @@ const transport = {
     };
   },
 };
+
+function createTempRoot(prefix) {
+  return mkdtemp(path.join(os.tmpdir(), prefix));
+}
 
 test("local wheel adapter preserves the decision but emits only full hash anchors", async () => {
   const result = await new LocalWheelRecognitionProvider(boundTransport(transport)).recognize(snapshot);
@@ -295,6 +304,121 @@ test("classified composition does not reference cloud-only dependencies", async 
   const source = await readFile(new URL("../apps/classified-offline/src/composition-root.ts", import.meta.url), "utf8");
   for (const forbidden of ["CloudEndpointProvider", "OnlineTelemetry", "Cloudflare", "https://"]) {
     assert.equal(source.includes(forbidden), false, forbidden + " leaked into classified edition");
+  }
+});
+
+test("WPS local file system adapter uses official methods and stable fallbacks", async () => {
+  const root = await createTempRoot("docxtool-fs-");
+  try {
+    const calls = [];
+    const api = {
+      Exists(value) { calls.push(["Exists", value]); return existsSync(value); },
+      mkdirSync(value, options) { calls.push(["mkdirSync", value, options]); return mkdirSync(value, options); },
+      writeFileString(value, text) { calls.push(["writeFileString", value, text]); return writeFileSync(value, text, "utf8"); },
+      readFileString(value) { calls.push(["readFileString", value]); return readFileSync(value, "utf8"); },
+      unlinkSync(value) { calls.push(["unlinkSync", value]); return unlinkSync(value); },
+      rmdirSync(value) { calls.push(["rmdirSync", value]); return rmdirSync(value); },
+      AppendFile(value, text) { calls.push(["AppendFile", value, text]); return appendFileSync(value, text, "utf8"); },
+    };
+    const fs = new WpsLocalFileSystem(api);
+    const nested = path.join(root, "one", "two");
+    const file = path.join(nested, "value.txt");
+    assert.equal(fs.exists(nested), false);
+    fs.mkdir(nested);
+    fs.writeText(file, "A");
+    fs.appendText(file, "B");
+    assert.equal(fs.readText(file), "AB");
+    fs.removeFile(file);
+    fs.removeDirectory(nested);
+    assert.equal(existsSync(file), false);
+    assert.equal(existsSync(nested), false);
+    assert.ok(calls.some(([name]) => name === "mkdirSync"));
+    assert.ok(calls.some(([name]) => name === "writeFileString"));
+    assert.ok(calls.some(([name]) => name === "readFileString"));
+    assert.ok(calls.some(([name]) => name === "unlinkSync"));
+    assert.ok(calls.some(([name]) => name === "rmdirSync"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("WPS local file system adapter exposes stable method-missing errors", () => {
+  const fs = new WpsLocalFileSystem({});
+  assert.throws(() => fs.exists("C:\\tmp"), /WPS_FILESYSTEM_EXISTS_UNAVAILABLE/);
+  assert.throws(() => fs.mkdir("C:\\tmp"), /WPS_FILESYSTEM_MKDIR_UNAVAILABLE/);
+  assert.throws(() => fs.writeText("C:\\tmp\\a.txt", "x"), /WPS_FILESYSTEM_WRITE_UNAVAILABLE/);
+  assert.throws(() => fs.readText("C:\\tmp\\a.txt"), /WPS_FILESYSTEM_READ_UNAVAILABLE/);
+  assert.throws(() => fs.removeFile("C:\\tmp\\a.txt"), /WPS_FILESYSTEM_REMOVE_UNAVAILABLE|WPS_FILESYSTEM_EXISTS_UNAVAILABLE/);
+  assert.throws(() => fs.removeDirectory("C:\\tmp"), /WPS_FILESYSTEM_RMDIR_UNAVAILABLE|WPS_FILESYSTEM_EXISTS_UNAVAILABLE/);
+});
+
+test("quoteWindowsCommandLineArgument preserves Windows argv semantics", () => {
+  assert.equal(quoteWindowsCommandLineArgument("plain"), "plain");
+  assert.equal(quoteWindowsCommandLineArgument("C:\\tmp path\\doc.txt"), "\"C:\\tmp path\\doc.txt\"");
+  assert.equal(quoteWindowsCommandLineArgument("C:\\测试\\doc.txt"), "C:\\测试\\doc.txt");
+  assert.equal(quoteWindowsCommandLineArgument("C:\\tmp path\\"), "\"C:\\tmp path\\\\\"");
+  assert.equal(quoteWindowsCommandLineArgument("A\"B"), "\"A\\\"B\"");
+  assert.equal(quoteWindowsCommandLineArgument(""), "\"\"");
+});
+
+test("local process recognition transport uses two-argument ShellExecute and cleans job files", async (context) => {
+  const root = await createTempRoot("docxtool-process-");
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => { throw new Error("FETCH_NOT_EXPECTED"); };
+  try {
+    const snapshot = { documentId: "doc-1", revision: "rev-1", sourceSha256: SHA, localDocxPath: path.join(root, "source.docx"), paragraphs: [{ sourceParagraphIndex: 0, text: "测试段落" }] };
+    await writeFile(snapshot.localDocxPath, "fake docx", "utf8");
+    const calls = [];
+    let capturedJobDir = "";
+    const runtimeExecutablePath = "C:\\runtime\\docxtool-recognize.exe";
+    const application = {
+      Env: { GetTempPath() { return root; } },
+      FileSystem: {
+        Exists(value) { calls.push(["Exists", value]); return value === runtimeExecutablePath || existsSync(value); },
+        mkdirSync(value, options) { calls.push(["mkdirSync", value, options]); return mkdirSync(value, options); },
+        writeFileString(value, text) { calls.push(["writeFileString", value, text]); return writeFileSync(value, text, "utf8"); },
+        readFileString(value) { calls.push(["readFileString", value]); return readFileSync(value, "utf8"); },
+        unlinkSync(value) { calls.push(["unlinkSync", value]); return unlinkSync(value); },
+        rmdirSync(value) { calls.push(["rmdirSync", value]); return rmdirSync(value); },
+      },
+      OAAssist: {
+        ShellExecute(shellPath, argumentsText) {
+          calls.push(["ShellExecute", shellPath, argumentsText, arguments.length]);
+          assert.equal(arguments.length, 2);
+          assert.equal(shellPath, runtimeExecutablePath);
+          const requestPath = argumentsText.match(/--request\s+"([^"]+)"/)?.[1] ?? argumentsText.match(/--request\s+(\S+)/)?.[1];
+          const resultPath = argumentsText.match(/--result\s+"([^"]+)"/)?.[1] ?? argumentsText.match(/--result\s+(\S+)/)?.[1];
+          const errorPath = argumentsText.match(/--error\s+"([^"]+)"/)?.[1] ?? argumentsText.match(/--error\s+(\S+)/)?.[1];
+          assert.ok(requestPath && resultPath && errorPath);
+          capturedJobDir = path.dirname(requestPath);
+          const request = JSON.parse(readFileSync(requestPath, "utf8"));
+          writeFileSync(resultPath, JSON.stringify({
+            schema_version: 1,
+            request_id: request.request_id,
+            recognition_plan: {
+              schema_version: "1.0",
+              engine_version: "3.0",
+              document_mode: "normal",
+              document_mode_confidence: 1,
+              host_text_contract_version: "host-text-v1",
+              blocks: [],
+              binding: { host_text_contract_version: "host-text-v1", blocks: [] },
+            },
+          }), "utf8");
+        },
+      },
+    };
+    const transport = new LocalProcessRecognitionTransport(application, runtimeExecutablePath, 500, 5);
+    const plan = await transport.recognize(snapshot);
+    assert.equal(plan.engine_version, "3.0");
+    assert.equal(plan.binding.host_text_contract_version, "host-text-v1");
+    assert.equal(capturedJobDir && existsSync(capturedJobDir), false);
+    assert.equal(calls.some(([name]) => name === "ShellExecute"), true);
+    assert.equal(calls.some(([name]) => name === "writeFileString"), true);
+    assert.equal(calls.some(([name]) => name === "readFileString"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -815,27 +939,35 @@ test("preview document identity mismatch refuses cleanup and formatting", async 
 });
 
 test("classified health check is read-only and returns concrete PASS items", async () => {
+  const runtimeRoot = await createTempRoot("docxtool-runtime-health-");
+  const manifestPath = path.join(runtimeRoot, "current.json");
+  await writeFile(manifestPath, JSON.stringify({ schema_version: 1, contract_version: 1, executable_path: "C:\\runtime\\docxtool-recognize.exe", executable_sha256: "a", recognition_package_version: "4.0" }), "utf8");
   const font = { Name: "仿宋_GB2312" }; const format = { Alignment: 0 }; const page = { PageWidth: 1 };
   const comments = { Count: 0, Item() { throw new Error("none"); }, Add() {} };
-  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏测试\r", Font: font, ParagraphFormat: format, PageSetup: page } }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 2, Item(index) { return { Name: index === 1 ? "仿宋_GB2312" : "Times New Roman" }; } }, FileSystem: { Exists() { return true; }, ReadFileString() { return JSON.stringify({ executable_path: "C:\\runtime\\docxtool-recognize.exe" }); } }, OAAssist: { ShellExecute() {} } };
+  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏测试\r", Font: font, ParagraphFormat: format, PageSetup: page } }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 2, Item(index) { return { Name: index === 1 ? "仿宋_GB2312" : "Times New Roman" }; } }, FileSystem: { Exists(value) { return value === "C:\\runtime\\docxtool-recognize.exe" || value === manifestPath || existsSync(value); }, ReadFileString(value) { return readFileSync(value, "utf8"); }, WriteFileString() {}, unlinkSync() {}, Remove() {}, mkdirSync() {}, rmdirSync() {} }, OAAssist: { ShellExecute() {} } };
   const before = JSON.stringify({ saved: application.ActiveDocument.Saved, comments: comments.Count, font, format, page });
   const profile = { page_setup: { normal_east_asia_font_name: "仿宋_GB2312", normal_latin_font_name: "Times New Roman" }, styles: {} };
-  const report = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" }, { build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, profile, true).run();
+  const report = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a", runtimeManifestPath: manifestPath }, { build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, profile, true).run();
   assert.equal(report.overall, "PASS"); assert.equal(report.items.every((item) => item.status === "PASS"), true); assert.match(report.text, /总体结果：PASS/);
   assert.equal(JSON.stringify({ saved: application.ActiveDocument.Saved, comments: comments.Count, font, format, page }), before);
+  await rm(runtimeRoot, { recursive: true, force: true });
 });
 
 test("classified health check reports missing fonts as WARN and unreachable services with stable codes", async () => {
+  const runtimeRoot = await createTempRoot("docxtool-runtime-health-");
+  const manifestPath = path.join(runtimeRoot, "current.json");
+  await writeFile(manifestPath, JSON.stringify({ schema_version: 1, contract_version: 1, executable_path: "C:\\runtime\\docxtool-recognize.exe", executable_sha256: "a", recognition_package_version: "4.0" }), "utf8");
   const range = { Text: "fixture\r", Font: {}, ParagraphFormat: {}, PageSetup: {} }; const comments = { Count: 0, Item() {}, Add() {} };
-  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: range }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} }, FileSystem: { Exists(path) { return path.includes("docxtool-recognize.exe"); }, ReadFileString() { return "{}"; } }, OAAssist: { ShellExecute() {} } };
+  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1, Item() { return { Range: range }; } }, Comments: comments }, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} }, FileSystem: { Exists(value) { return value === "C:\\runtime\\docxtool-recognize.exe" || value === manifestPath || existsSync(value); }, ReadFileString(value) { return readFileSync(value, "utf8"); }, WriteFileString() {}, unlinkSync() {}, Remove() {}, mkdirSync() {}, rmdirSync() {} }, OAAssist: { ShellExecute() {} } };
   const base = [{ build_id: "build", asset_hash: "hash" }, { build_id: "build", asset_hash: "hash" }, { page_setup: { normal_east_asia_font_name: "方正小标宋简体" }, styles: {} }];
-  const warn = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" }, ...base, true).run();
+  const warn = await new ClassifiedHealthChecker(application, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a", runtimeManifestPath: manifestPath }, ...base, true).run();
   assert.equal(warn.overall, "WARN"); assert.deepEqual(warn.missing_fonts, ["方正小标宋简体"]); assert.equal(warn.first_error_code, "REQUIRED_FONT_MISSING");
   const failed = await new ClassifiedHealthChecker({ ActiveDocument: application.ActiveDocument, CreateTaskPane() {}, ApiEvent: {}, FontNames: { Count: 0, Item() {} }, FileSystem: undefined }, { recognitionExecutablePath: "", runtimeVersion: "1", runtimeSha256: "a" }, ...base, true).run();
   assert.equal(failed.overall, "FAIL");
   assert.equal(failed.items.find((item) => item.check_id === "filesystem_api").error_code, "WPS_FILESYSTEM_UNAVAILABLE");
   assert.equal(failed.items.find((item) => item.check_id === "local_runtime").error_code, "LOCAL_RUNTIME_CONFIGURATION_REQUIRED");
   assert.equal(failed.items.find((item) => item.check_id === "local_process_api").error_code, "LOCAL_PROCESS_EXECUTION_BLOCKED");
+  await rm(runtimeRoot, { recursive: true, force: true });
 });
 
 test("classified UI error messages localize stable WPS error codes", () => {

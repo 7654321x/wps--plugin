@@ -18,6 +18,7 @@ const checks = [
   { check_id: "comment_api", group: "wps", title: "批注 API", dependencies: [], retryable: false },
   { check_id: "filesystem_api", group: "wps", title: "文件系统 API", dependencies: [], retryable: false },
   { check_id: "local_runtime", group: "runtime", title: "本地识别运行时", dependencies: [], retryable: false },
+  { check_id: "runtime_manifest", group: "runtime", title: "运行时清单", dependencies: [], retryable: false },
   { check_id: "local_process_api", group: "wps", title: "本地进程调用", dependencies: [], retryable: false },
   { check_id: "required_fonts", group: "wps", title: "必需字体", dependencies: [], retryable: false },
   { check_id: "taskpane_api", group: "wps", title: "任务窗格 API", dependencies: [], retryable: false },
@@ -35,6 +36,14 @@ function requiredFonts(profile?: DefaultProfile): string[] {
   const names = [profile.page_setup?.normal_east_asia_font_name, profile.page_setup?.normal_latin_font_name];
   for (const style of Object.values(profile.styles ?? {})) names.push(style.east_asia_font_name, style.latin_font_name);
   return [...new Set(names.filter((value): value is string => Boolean(value)))];
+}
+function parseJson(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
 }
 function reportText(overall: HealthStatus, items: SafeHealthItem[], missingFonts: string[]): string {
   const lines = ["DocxTool 功能检测", "", ...items.map((item) => `${item.title}：${item.status}${item.error_code ? `（${errorMessage(item.error_code)}；错误码：${item.error_code}）` : ""}`), "", `总体结果：${overall}`];
@@ -74,7 +83,10 @@ export class ClassifiedHealthChecker {
       comment_api: async () => api("Document.Comments")?.supported && api("Comments.Add")?.supported && comments.COMMENT_COLLECTION_READABLE && comments.COMMENT_ADD_WRITABLE
         ? { status: "PASS", summary: "批注集合可读且 Comments.Add 已暴露" }
         : { status: "FAIL", error_code: "COMMENT_PREVIEW_UNSUPPORTED", summary: "批注 API 不完整" },
-      filesystem_api: async () => typeof this.application.FileSystem?.Exists === "function" && (typeof this.application.FileSystem?.ReadFileString === "function" || typeof this.application.FileSystem?.readFileString === "function")
+      filesystem_api: async () => typeof this.application.FileSystem?.Exists === "function"
+        && (typeof this.application.FileSystem?.ReadFileString === "function" || typeof this.application.FileSystem?.readFileString === "function")
+        && (typeof this.application.FileSystem?.writeFileString === "function" || typeof this.application.FileSystem?.WriteFileString === "function")
+        && (typeof this.application.FileSystem?.unlinkSync === "function" || typeof this.application.FileSystem?.Remove === "function")
         ? { status: "PASS", summary: "Application.FileSystem 可用" }
         : { status: "FAIL", error_code: "WPS_FILESYSTEM_UNAVAILABLE", summary: "WPS 文件系统 API 不完整" },
       local_runtime: async () => {
@@ -82,6 +94,17 @@ export class ClassifiedHealthChecker {
         if (!exe) return { status: "FAIL", error_code: "LOCAL_RUNTIME_CONFIGURATION_REQUIRED", summary: "未配置本地识别运行时" };
         try { return this.application.FileSystem?.Exists?.(exe) ? { status: "PASS", summary: "本地识别 exe 存在" } : { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "本地识别 exe 不存在" }; }
         catch { return { status: "FAIL", error_code: "LOCAL_RECOGNITION_RUNTIME_NOT_FOUND", summary: "无法访问本地识别 exe" }; }
+      },
+      runtime_manifest: async () => {
+        const path = this.config.runtimeManifestPath;
+        if (!path) return { status: "WARN", error_code: "LOCAL_RUNTIME_CONFIGURATION_REQUIRED", summary: "未配置 runtime 清单路径" };
+        const read = this.application.FileSystem?.ReadFileString ?? this.application.FileSystem?.readFileString;
+        if (typeof read !== "function" || !this.application.FileSystem?.Exists?.(path)) return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
+        const manifest = parseJson(String(read.call(this.application.FileSystem, path)));
+        if (!manifest || manifest.schema_version !== 1 || manifest.contract_version !== 1 || typeof manifest.executable_path !== "string" || typeof manifest.executable_sha256 !== "string") {
+          return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单字段不完整" };
+        }
+        return { status: "PASS", summary: "runtime 清单可读" };
       },
       local_process_api: async () => typeof this.application.OAAssist?.ShellExecute === "function"
         ? { status: "PASS", summary: "OAAssist.ShellExecute 可用" }

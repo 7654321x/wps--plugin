@@ -67,7 +67,8 @@ function request(commandName: HostCommandName): void {
     taskpaneLog("ERROR", "taskpane.request.persist.failed", "任务窗格桥接尚未就绪", { command_name: commandName, plugin_storage_available: Boolean(storage), build_info_available: Boolean(build), stable_error_code: "TASKPANE_BRIDGE_NOT_READY", duration_ms: Date.now() - started });
     text("issues", "TASKPANE_BRIDGE_NOT_READY：主上下文通信尚未就绪。"); return;
   }
-  pendingRequestId = `pane-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+  const randomPart = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : Array.from(crypto.getRandomValues(new Uint8Array(4)), (value) => value.toString(16).padStart(2, "0")).join("");
+  pendingRequestId = `pane-${Date.now().toString(36)}-${randomPart}`;
   pendingStartedAt = Date.now();
   lastObservedRequestState = "created";
   taskpaneLog("INFO", "taskpane.request.created", "任务窗格命令请求已创建", { command_name: commandName, request_id: pendingRequestId, correlation_id: pendingRequestId, build_id: build.build_id, plugin_storage_available: true });

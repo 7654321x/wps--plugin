@@ -36,7 +36,10 @@
     "dev:local-direct:prepare": "pwsh -NoProfile -File scripts/local-direct.ps1 prepare",
     "dev:local-direct:status": "pwsh -NoProfile -File scripts/local-direct.ps1 status",
     "dev:local-direct:stop": "pwsh -NoProfile -File scripts/local-direct.ps1 stop",
-    "verify:local-direct": "pwsh -NoProfile -File scripts/verify-local-direct.ps1"
+    "verify:local-direct": "pwsh -NoProfile -File scripts/verify-local-direct.ps1",
+    "start": "python main.py start",
+    "start:status": "python main.py status",
+    "start:verify": "python main.py verify"
   },
   "devDependencies": {
     "ajv": "8.17.1",
