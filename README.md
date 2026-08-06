@@ -1,4 +1,4 @@
-# Docxtool WPS Control Plane v1.5.0
+# Docxtool WPS Control Plane v1.5.1
 
 本目录是独立于现有 Web 服务的 WPS 加载项工程。第一阶段已建立本地识别适配、脱敏协议、统一命令服务、声明式命令校验、Mock WPS 执行器和两个发行版装配。
 

@@ -73,10 +73,6 @@ if (-not (Test-Path -LiteralPath $brokerExe)) {
 
 & $brokerExe --help | Out-Null
 if ($LASTEXITCODE) { throw "LOCAL_JOB_BROKER_BUILD_FAILED: Broker --help 失败。" }
-$brokerSmokeRoot = Join-Path $root ".runtime\broker-build-smoke"
-New-Item -ItemType Directory -Force -Path $brokerSmokeRoot | Out-Null
-& $brokerExe once --root $brokerSmokeRoot | Out-Null
-if ($LASTEXITCODE) { throw "LOCAL_JOB_BROKER_BUILD_FAILED: Broker --once 失败。" }
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
 $brokerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $brokerExe).Hash.ToLowerInvariant()
@@ -102,6 +98,37 @@ $manifest = @{
 }
 
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+
+$brokerSmokeRoot = Join-Path $root ".runtime\broker-build-smoke"
+$brokerSmokeRuntime = Join-Path $brokerSmokeRoot "runtime"
+New-Item -ItemType Directory -Force -Path $brokerSmokeRuntime | Out-Null
+$smokeRecognizer = Join-Path $brokerSmokeRuntime "docxtool-recognize.exe"
+Copy-Item -LiteralPath $exe -Destination $smokeRecognizer -Force
+$pathHashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+try {
+  $pathHashInput = [System.Text.Encoding]::UTF8.GetBytes($brokerExe.ToLowerInvariant().Replace('/', '\'))
+  $brokerPathHash = ([System.BitConverter]::ToString($pathHashAlgorithm.ComputeHash($pathHashInput))).Replace('-', '').ToLowerInvariant()
+} finally {
+  $pathHashAlgorithm.Dispose()
+}
+$smokeCurrent = @{
+  schema_version = 1
+  contract_version = 1
+  runtime_version = [string]$manifest.runtime_version
+  executable_path = $smokeRecognizer
+  executable_sha256 = $hash
+  broker_executable_path = $brokerExe
+  broker_sha256 = $brokerHash
+  broker_executable_path_hash = $brokerPathHash
+  broker_contract_version = 1
+  queue_contract_version = 1
+  broker_version = [string]$manifest.broker_version
+}
+$smokeCurrentPath = Join-Path $brokerSmokeRoot "runtime\current.json"
+$smokeCurrent | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $smokeCurrentPath -Encoding utf8NoBOM
+& $brokerExe once --root $brokerSmokeRoot | Out-Null
+if ($LASTEXITCODE) { throw "LOCAL_JOB_BROKER_BUILD_FAILED: Broker --once 失败。" }
+
 Write-Output ("LOCAL_RUNTIME_BUILD_PASS " + $exe)
 Write-Output ("runtime_version: " + $manifest.runtime_version)
 Write-Output ("sha256: " + $hash)

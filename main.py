@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import calendar
 import ctypes
 import hashlib
 import json
@@ -13,9 +12,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from wps_logging import UnifiedLogWriter, read_log_events
 
@@ -46,6 +46,25 @@ WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
 JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
 CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
+BROKER_READY_TIMEOUT_SECONDS = 10.0
+BROKER_HEARTBEAT_MAX_AGE_SECONDS = 3.0
+PROCESS_METADATA_TIMEOUT_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class BrokerReadiness:
+    ready: bool
+    error_code: Optional[str]
+    reason_cn: str
+    action_cn: str
+    details: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class ProcessMetadataResult:
+    metadata: Dict[str, object]
+    state: str
+    detail: str = ""
 
 
 def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None) -> None:
@@ -64,10 +83,24 @@ def log_event(level: str, event: str, message: str, data: Optional[Dict[str, obj
 
 
 class StepFailed(RuntimeError):
-    def __init__(self, title: str, command: str, output: str) -> None:
+    def __init__(
+        self,
+        title: str,
+        command: str,
+        output: str,
+        *,
+        reason_cn: str = "",
+        action_cn: str = "",
+        error_code: str = "",
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
         self.title = title
         self.command = command
         self.output = output
+        self.reason_cn = reason_cn
+        self.action_cn = action_cn
+        self.error_code = error_code
+        self.details = details or {}
         super().__init__(title)
 
 
@@ -141,10 +174,19 @@ def print_status() -> None:
     print(f"- 本地识别组件：{'已安装' if values.get('local_runtime') == 'READY' else '未安装'}")
     print(f"- 识别程序文件：{'存在' if values.get('runtime_executable_exists') == 'YES' else '不存在'}")
     current = broker_current()
-    status = broker_status()
-    print(f"- 本地任务 Broker：{'已就绪' if broker_healthy(current, status) else '未就绪'}")
+    status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+    broker_check = status_error or broker_readiness(current, status)
+    print(f"- 本地任务 Broker：{'已就绪' if broker_check.ready else '未就绪'}")
     print(f"- Broker PID：{status.get('pid', '未知')}")
     print(f"- Broker 版本：{status.get('broker_version', '未知')}")
+    if not broker_check.ready:
+        print("- Broker 失败阶段：校验本地任务代理")
+        print(f"- Broker 具体原因：{broker_check.reason_cn}")
+        print(f"- Broker 错误码：{broker_check.error_code}")
+        print(f"- Broker 建议处理：{broker_check.action_cn}")
+        detail = readiness_technical_detail(broker_check)
+        if detail:
+            print(f"- Broker 诊断详情：{detail}")
     control = control_server_health()
     print(f"- WPS Control Server：{'已就绪' if control.get('status') == 'ready' else '未就绪'}")
     print(f"- Control Server 端口：{control.get('port', '未知')}（仅 127.0.0.1 随机端口）")
@@ -288,6 +330,57 @@ def read_json(path: Path) -> Dict[str, object]:
         return {}
 
 
+def broker_failure(code: str, reason_cn: str, action_cn: str, details: Optional[Dict[str, object]] = None) -> BrokerReadiness:
+    return BrokerReadiness(False, code, reason_cn, action_cn, details or {})
+
+
+def broker_ready() -> BrokerReadiness:
+    return BrokerReadiness(True, None, "", "", {})
+
+
+def read_broker_status(path: Path) -> Tuple[Dict[str, object], Optional[BrokerReadiness]]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_MISSING",
+            "Broker 状态文件尚未生成",
+            "检查 Broker 是否已启动，并查看统一日志中的 Broker 启动事件",
+            {"file": path.name},
+        )
+    except (OSError, UnicodeError) as error:
+        return {}, broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态文件无法读取",
+            "检查状态文件权限和本地 runtime 安装状态后重试",
+            {"file": path.name, "error_type": type(error).__name__},
+        )
+    if not raw.strip():
+        return {}, broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态文件为空，内容尚未完整写入",
+            "等待 Broker 完成启动；若持续出现，请重新安装本地识别组件",
+            {"file": path.name},
+        )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return {}, broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态文件不是有效 JSON",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"file": path.name, "line": error.lineno, "column": error.colno},
+        )
+    if not isinstance(value, dict):
+        return {}, broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态文件根节点不是对象",
+            "重新安装本地识别组件后重试",
+            {"file": path.name, "root_type": type(value).__name__},
+        )
+    return value, None
+
+
 def appdata_docxtool_root() -> Path:
     value = os.environ.get("APPDATA")
     if not value:
@@ -300,7 +393,8 @@ def broker_current() -> Dict[str, object]:
 
 
 def broker_status() -> Dict[str, object]:
-    return read_json(appdata_docxtool_root() / "broker" / "status.json")
+    status, _ = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+    return status
 
 
 def process_is_alive(pid: object) -> bool:
@@ -317,25 +411,77 @@ def process_is_alive(pid: object) -> bool:
         return False
 
 
-def process_metadata(pid: object) -> Dict[str, object]:
-    if not process_is_alive(pid):
-        return {}
-    script = f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; if($p){{[pscustomobject]@{{pid=$p.ProcessId; executable_path=$p.ExecutablePath; command_line=$p.CommandLine; process_created_at=$p.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
+def query_process_metadata(pid: object) -> ProcessMetadataResult:
     try:
-        output = subprocess.check_output(["pwsh", "-NoProfile", "-Command", script], cwd=str(ROOT), text=True, encoding="utf-8", errors="replace", timeout=10)
-        value = json.loads(output) if output.strip() else {}
-        return value if isinstance(value, dict) else {}
-    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
-        return {}
+        process_id = int(pid)
+    except (TypeError, ValueError):
+        return ProcessMetadataResult({}, "not_running", "PID 无效")
+    if process_id <= 0:
+        return ProcessMetadataResult({}, "not_running", "PID 无效")
+    if sys.platform != "win32":
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return ProcessMetadataResult({}, "not_running", "进程不存在")
+        except OSError as error:
+            return ProcessMetadataResult({}, "unavailable", type(error).__name__)
+        return ProcessMetadataResult({}, "unavailable", "当前平台没有受支持的进程身份查询")
+    script = f"$process=Get-CimInstance Win32_Process -Filter 'ProcessId={process_id}'; if($process){{[pscustomobject]@{{pid=$process.ProcessId; executable_path=$process.ExecutablePath; command_line=$process.CommandLine; process_created_at=$process.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
+    try:
+        output = subprocess.check_output(
+            ["pwsh", "-NoProfile", "-Command", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROCESS_METADATA_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return ProcessMetadataResult({}, "unavailable", "进程身份查询超时")
+    except (OSError, subprocess.SubprocessError) as error:
+        return ProcessMetadataResult({}, "unavailable", type(error).__name__)
+    if not output.strip():
+        return ProcessMetadataResult({}, "not_running", "进程不存在")
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as error:
+        return ProcessMetadataResult({}, "unavailable", f"JSON 第 {error.lineno} 行无效")
+    if not isinstance(value, dict):
+        return ProcessMetadataResult({}, "unavailable", "进程查询结果不是对象")
+    return ProcessMetadataResult(value, "ready")
+
+
+def process_metadata(pid: object) -> Dict[str, object]:
+    return query_process_metadata(pid).metadata
+
+
+def parse_utc_timestamp(value: object) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    if "." in normalized:
+        date_part, suffix = normalized.split(".", 1)
+        offset_index = len(suffix)
+        for marker in ("+", "-"):
+            marker_index = suffix.find(marker, 1)
+            if marker_index >= 0:
+                offset_index = min(offset_index, marker_index)
+        fraction = suffix[:offset_index]
+        if fraction:
+            normalized = f"{date_part}.{fraction[:6]}{suffix[offset_index:]}"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def timestamps_match(left: object, right: object) -> bool:
-    try:
-        first = datetime.fromisoformat(str(left).replace("Z", "+00:00")).astimezone(timezone.utc)
-        second = datetime.fromisoformat(str(right).replace("Z", "+00:00")).astimezone(timezone.utc)
-        return abs((first - second).total_seconds()) <= 2
-    except (TypeError, ValueError, OverflowError):
-        return False
+    first = parse_utc_timestamp(left)
+    second = parse_utc_timestamp(right)
+    return first is not None and second is not None and abs((first - second).total_seconds()) <= 2
 
 
 def managed_control_server_process(pid: object, manifest_path: Path, expected_created_at: object = None) -> bool:
@@ -361,31 +507,207 @@ def managed_broker_process(pid: object, executable: Path, expected_created_at: o
     return expected_created_at is not None and timestamps_match(value.get("process_created_at"), expected_created_at)
 
 
-def broker_healthy(current: Dict[str, object], status: Dict[str, object]) -> bool:
-    heartbeat = status.get("heartbeat_at")
-    if status.get("state") not in {"READY", "RUNNING"} or not isinstance(heartbeat, str):
-        return False
-    try:
-        heartbeat_ms = calendar.timegm(time.strptime(heartbeat[:19], "%Y-%m-%dT%H:%M:%S"))
-    except (ValueError, OverflowError):
-        return False
-    if time.time() - heartbeat_ms > 3:
-        return False
-    if not status.get("broker_instance_id") or not status.get("process_created_at"):
-        return False
+def broker_quick_readiness(current: Dict[str, object], status: Dict[str, object], expected_pid: Optional[int] = None) -> BrokerReadiness:
+    if status.get("schema_version") != 1:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态文件缺少有效的 schema 版本",
+            "重新安装本地识别组件后重试",
+            {"expected_schema_version": 1, "actual_schema_version": status.get("schema_version")},
+        )
+    if status.get("state") not in {"READY", "RUNNING"}:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_STATE_INVALID",
+            "Broker 状态不是可服务的 READY 或 RUNNING",
+            "检查 Broker 启动日志；若状态为 FAILED，请先修复对应错误后重启",
+            {"expected_state": "READY 或 RUNNING", "actual_state": status.get("state")},
+        )
+    pid = status.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_PID_MISMATCH",
+            "Broker 状态文件中的 PID 无效",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"expected_pid": "正整数", "actual_pid": pid},
+        )
+    if expected_pid is not None and pid != expected_pid:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_PID_MISMATCH",
+            "Broker 状态 PID 与本次启动记录不一致",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"expected_pid": expected_pid, "actual_pid": pid},
+        )
+    process_created_at = status.get("process_created_at")
+    if not isinstance(status.get("broker_instance_id"), str) or not status.get("broker_instance_id") or parse_utc_timestamp(process_created_at) is None:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_STATUS_INVALID",
+            "Broker 状态缺少有效的实例标识或进程创建时间",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"broker_instance_id_present": bool(status.get("broker_instance_id")), "process_created_at": process_created_at},
+        )
+    heartbeat = parse_utc_timestamp(status.get("heartbeat_at"))
+    if heartbeat is None:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_HEARTBEAT_INVALID",
+            "Broker 状态中的心跳时间格式无效",
+            "检查 Broker 统一日志和本机时间后重启本地识别组件",
+            {"heartbeat_at": status.get("heartbeat_at")},
+        )
+    heartbeat_age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    if heartbeat_age > BROKER_HEARTBEAT_MAX_AGE_SECONDS:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_HEARTBEAT_STALE",
+            "Broker 状态文件存在，但心跳已超过允许时间",
+            "检查 Broker 是否卡在初始化阶段，并查看同一日志中的 Broker 启动事件",
+            {"heartbeat_age_seconds": round(heartbeat_age, 3), "max_age_seconds": BROKER_HEARTBEAT_MAX_AGE_SECONDS},
+        )
     if status.get("broker_version") != current.get("broker_version"):
-        return False
+        return broker_failure(
+            "LOCAL_JOB_BROKER_VERSION_MISMATCH",
+            "Broker 版本与当前安装版本不一致",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"expected_version": current.get("broker_version"), "actual_version": status.get("broker_version")},
+        )
     if status.get("broker_executable_path_hash") != current.get("broker_executable_path_hash"):
-        return False
+        return broker_failure(
+            "LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH",
+            "Broker 可执行文件路径与当前 runtime 清单不一致",
+            "重新安装本地识别组件，禁止复用旧 Broker",
+            {"expected_path_hash": current.get("broker_executable_path_hash"), "actual_path_hash": status.get("broker_executable_path_hash")},
+        )
     if status.get("broker_executable_sha256") != current.get("broker_sha256"):
-        return False
-    if status.get("queue_contract_version") != current.get("queue_contract_version", current.get("broker_contract_version")):
-        return False
+        return broker_failure(
+            "LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH",
+            "运行中的 Broker 文件哈希与当前 runtime 清单不一致",
+            "重新构建并安装本地识别组件后重试",
+            {"expected_sha256": current.get("broker_sha256"), "actual_sha256": status.get("broker_executable_sha256")},
+        )
+    if status.get("runtime_version") != current.get("runtime_version"):
+        return broker_failure(
+            "LOCAL_JOB_BROKER_RUNTIME_VERSION_MISMATCH",
+            "Broker 使用的运行时版本与当前安装版本不一致",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"expected_runtime_version": current.get("runtime_version"), "actual_runtime_version": status.get("runtime_version")},
+        )
+    if status.get("runtime_sha256") != current.get("executable_sha256"):
+        return broker_failure(
+            "LOCAL_JOB_BROKER_RUNTIME_HASH_MISMATCH",
+            "Broker 使用的识别程序哈希与当前安装版本不一致",
+            "重新安装本地识别组件后重试",
+            {"expected_runtime_sha256": current.get("executable_sha256"), "actual_runtime_sha256": status.get("runtime_sha256")},
+        )
+    expected_queue_contract = current.get("queue_contract_version", current.get("broker_contract_version"))
+    if status.get("queue_contract_version") != expected_queue_contract:
+        return broker_failure(
+            "LOCAL_JOB_BROKER_QUEUE_CONTRACT_MISMATCH",
+            "Broker 文件队列合同版本与当前 runtime 不一致",
+            "重新安装本地识别组件后重试，不要回退旧服务链",
+            {"expected_queue_contract": expected_queue_contract, "actual_queue_contract": status.get("queue_contract_version")},
+        )
     if status.get("contract_version") != current.get("contract_version"):
-        return False
-    if status.get("runtime_version") != current.get("runtime_version") or status.get("runtime_sha256") != current.get("executable_sha256"):
-        return False
-    return managed_broker_process(status.get("pid"), Path(str(current.get("broker_executable_path", ""))), status.get("process_created_at"))
+        return broker_failure(
+            "LOCAL_JOB_BROKER_CONTRACT_MISMATCH",
+            "Broker 合同版本与当前 runtime 不一致",
+            "重新安装本地识别组件后重试",
+            {"expected_contract": current.get("contract_version"), "actual_contract": status.get("contract_version")},
+        )
+    return broker_ready()
+
+
+def broker_process_readiness(current: Dict[str, object], status: Dict[str, object]) -> BrokerReadiness:
+    result = query_process_metadata(status.get("pid"))
+    if result.state == "not_running":
+        return broker_failure(
+            "LOCAL_JOB_BROKER_PROCESS_NOT_RUNNING",
+            "Broker 状态已通过文件校验，但对应进程已经退出",
+            "检查 Broker 统一日志中的退出原因后重新启动",
+            {"pid": status.get("pid")},
+        )
+    if result.state != "ready":
+        return broker_failure(
+            "LOCAL_JOB_BROKER_PROCESS_METADATA_UNAVAILABLE",
+            "无法读取 Broker 进程身份信息",
+            "检查 PowerShell/CIM 进程查询权限后重试；不要跳过进程身份校验",
+            {"pid": status.get("pid"), "query_state": result.state, "query_detail": result.detail},
+        )
+    metadata = result.metadata
+    executable = Path(str(current.get("broker_executable_path", "")))
+    actual_executable = str(metadata.get("executable_path", ""))
+    if not actual_executable or actual_executable.casefold().replace("/", "\\") != str(executable).casefold().replace("/", "\\"):
+        return broker_failure(
+            "LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH",
+            "Broker PID 对应的可执行文件不是当前受信 runtime",
+            "停止旧 Broker 后重新安装并启动当前 runtime",
+            {"expected_executable_name": executable.name, "actual_executable_name": Path(actual_executable).name if actual_executable else "缺失"},
+        )
+    command_line = str(metadata.get("command_line", ""))
+    if "docxtool-job-broker" not in command_line.casefold():
+        return broker_failure(
+            "LOCAL_JOB_BROKER_COMMAND_LINE_MISMATCH",
+            "Broker PID 对应的命令行不是受信任的 Broker 启动命令",
+            "停止该进程后重新启动当前本地任务代理",
+            {"pid": status.get("pid"), "broker_command_marker_present": False},
+        )
+    actual_created_at = metadata.get("process_created_at")
+    if not timestamps_match(actual_created_at, status.get("process_created_at")):
+        return broker_failure(
+            "LOCAL_JOB_BROKER_PROCESS_TIME_MISMATCH",
+            "Broker 进程创建时间与状态文件不一致",
+            "停止旧 Broker 后重新启动本地识别组件",
+            {"expected_process_created_at": status.get("process_created_at"), "actual_process_created_at": actual_created_at},
+        )
+    return broker_ready()
+
+
+def broker_readiness(current: Dict[str, object], status: Dict[str, object]) -> BrokerReadiness:
+    quick = broker_quick_readiness(current, status)
+    if not quick.ready:
+        return quick
+    return broker_process_readiness(current, status)
+
+
+def broker_healthy(current: Dict[str, object], status: Dict[str, object]) -> bool:
+    return broker_readiness(current, status).ready
+
+
+def broker_readiness_snapshot() -> BrokerReadiness:
+    current = broker_current()
+    status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+    return status_error or broker_readiness(current, status)
+
+
+def readiness_technical_detail(readiness: BrokerReadiness) -> str:
+    return "；".join(f"{key}={value}" for key, value in readiness.details.items())
+
+
+def readiness_log_data(readiness: BrokerReadiness) -> Dict[str, object]:
+    data: Dict[str, object] = {
+        "stage_cn": "校验本地任务代理",
+        "reason_cn": readiness.reason_cn,
+        "action_cn": readiness.action_cn,
+        "stable_error_code": readiness.error_code or "",
+    }
+    technical_detail = readiness_technical_detail(readiness)
+    if technical_detail:
+        data["technical_detail"] = technical_detail
+    return data
+
+
+def readiness_fingerprint(readiness: BrokerReadiness) -> Tuple[Optional[str], str, str]:
+    return readiness.error_code, readiness.reason_cn, readiness.action_cn
+
+
+def step_failed_for_readiness(readiness: BrokerReadiness) -> StepFailed:
+    error_code = readiness.error_code or "LOCAL_JOB_BROKER_READY_TIMEOUT"
+    return StepFailed(
+        "启动本地任务 Broker",
+        "docxtool-job-broker.exe",
+        error_code,
+        reason_cn=readiness.reason_cn or "本地任务代理在规定时间内没有进入就绪状态",
+        action_cn=readiness.action_cn or "查看统一日志中的错误码并修复后重试",
+        error_code=error_code,
+        details=readiness.details,
+    )
 
 
 def stop_job_broker() -> None:
@@ -417,34 +739,79 @@ def ensure_job_broker() -> Dict[str, object]:
     expected_hash = str(current.get("broker_sha256", "")).lower()
     if not expected_hash or hashlib.sha256(executable.read_bytes()).hexdigest().lower() != expected_hash:
         raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_SHA256_MISMATCH")
-    status = broker_status()
-    if broker_healthy(current, status):
+    status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+    initial_readiness = status_error or broker_readiness(current, status)
+    if initial_readiness.ready:
         JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
         JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
         log_event("INFO", "broker.reused", "本地任务代理已复用", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
         return status
     stale_pid = status.get("pid")
-    if stale_pid and process_is_alive(stale_pid) and not managed_broker_process(stale_pid, executable, status.get("process_created_at")):
-        raise StepFailed("启动本地任务 Broker", "Broker 身份校验", "LOCAL_JOB_BROKER_IDENTITY_MISMATCH")
-    if stale_pid and managed_broker_process(stale_pid, executable, status.get("process_created_at")):
-        subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if stale_pid:
+        managed = managed_broker_process(stale_pid, executable, status.get("process_created_at"))
+        if not managed and process_is_alive(stale_pid):
+            raise StepFailed(
+                "启动本地任务 Broker",
+                "Broker 身份校验",
+                "LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH",
+                reason_cn="发现存活的同名进程，但无法证明它属于当前 runtime",
+                action_cn="不要结束未知进程；先停止旧 Broker 后重新安装本地识别组件",
+                error_code="LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH",
+                details={"pid": stale_pid, "expected_executable_name": executable.name},
+            )
+        if managed:
+            subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     log_event("INFO", "broker.start", "开始启动本地任务代理", {"stage_cn": "启动本地任务代理"})
     process = subprocess.Popen([str(executable), "run", "--log-path", str(WPS_LOG)], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags, close_fds=True)
     JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
-    JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "process_created_at": process_metadata(process.pid).get("process_created_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-    for _ in range(50):
-        time.sleep(0.1)
-        status = broker_status()
-        if broker_healthy(current, status):
+    JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": utc_now(), "process_created_at": ""}, ensure_ascii=False, indent=2), encoding="utf-8")
+    deadline = time.monotonic() + BROKER_READY_TIMEOUT_SECONDS
+    last_readiness: Optional[BrokerReadiness] = None
+    last_fingerprint: Optional[Tuple[Optional[str], str, str]] = None
+    identity_readiness: Optional[BrokerReadiness] = None
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            readiness = broker_failure(
+                "LOCAL_JOB_BROKER_EXITED",
+                "Broker 在写入就绪状态前已经退出",
+                "查看统一日志中的 Broker 启动错误和退出码后重试",
+                {"launcher_pid": process.pid, "exit_code": exit_code},
+            )
+            raise step_failed_for_readiness(readiness)
+        status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+        if status_error:
+            readiness = status_error
+        else:
+            quick = broker_quick_readiness(current, status)
+            if quick.ready:
+                if identity_readiness is None:
+                    identity_readiness = broker_process_readiness(current, status)
+                readiness = identity_readiness
+            else:
+                readiness = quick
+        last_readiness = readiness
+        fingerprint = readiness_fingerprint(readiness)
+        if readiness.ready:
             JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
             log_event("INFO", "broker.ready", "本地任务代理已就绪", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
             return status
-        if process.poll() is not None:
-            raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_EXITED")
-    raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_READY_TIMEOUT")
+        if fingerprint != last_fingerprint:
+            log_event("WARN", "broker.readiness.waiting", "本地任务代理尚未就绪", readiness_log_data(readiness))
+            last_fingerprint = fingerprint
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.1, remaining))
+    if last_readiness is not None:
+        raise step_failed_for_readiness(last_readiness)
+    raise step_failed_for_readiness(broker_failure(
+        "LOCAL_JOB_BROKER_READY_TIMEOUT",
+        "本地任务代理在规定时间内没有进入就绪状态",
+        "查看统一日志中的错误码并修复后重试",
+    ))
 
 
 def fetch_resource(relative: str) -> Dict[str, object]:
@@ -580,6 +947,7 @@ def diagnose() -> None:
     registration_raw = run_command("pwsh -NoProfile -File scripts/inspect-wps-registration.ps1", timeout=30)
     registration = json.loads(registration_raw)
     events = diagnostic_events(); names = [str(item.get("event", "")) for item in events]
+    broker_check = broker_readiness_snapshot()
     checks = [
         ("WPS资源服务", resource.get("status") == "PASS"),
         ("WPS注册配置", bool(registration.get("registration_matches_current_server"))),
@@ -587,9 +955,18 @@ def diagnose() -> None:
         ("功能区脚本", "ribbon.script.loaded" in names),
         ("功能区回调", "ribbon.addin.load.success" in names),
         ("WPS宿主运行时", "application.install.success" in names),
+        ("本地任务代理", broker_check.ready),
     ]
     print("WPS 装载诊断：")
     for label, passed in checks: print(f"- {label}：{'正常' if passed else '等待'}")
+    if not broker_check.ready:
+        print("- Broker 失败阶段：校验本地任务代理")
+        print(f"- Broker 具体原因：{broker_check.reason_cn}")
+        print(f"- Broker 错误码：{broker_check.error_code}")
+        print(f"- Broker 建议处理：{broker_check.action_cn}")
+        detail = readiness_technical_detail(broker_check)
+        if detail:
+            print(f"- Broker 诊断详情：{detail}")
     last_action = next((item for item in reversed(events) if item.get("event") == "ribbon.action.received"), None)
     last_error = next((item for item in reversed(events) if item.get("level") in ("错误", "致命")), None)
     print(f"- 最近一次按钮操作：{last_action.get('timestamp') if last_action else '无'}")
@@ -697,8 +1074,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             run_step("重置本地识别组件指针", "pwsh -NoProfile -File scripts/local-direct.ps1 reset", "本地识别组件指针已重置。")
         return 0
     except StepFailed as error:
-        log_event("ERROR", "launcher.failed", "WPS 启动流程未完成", {"stage_cn": error.title, "reason_cn": "当前启动步骤失败", "action_cn": "查看统一日志中的错误码并修复后重试", "technical_detail": useful_error(error.output)}, error)
-        print("处理未完成。请查看 wps-plugin.log 中的中文错误继续排查。", flush=True)
+        error_code = error.error_code or useful_error(error.output)
+        reason_cn = error.reason_cn or "当前启动步骤失败"
+        action_cn = error.action_cn or "查看统一日志中的错误码并修复后重试"
+        data: Dict[str, object] = {
+            "stage_cn": error.title,
+            "reason_cn": reason_cn,
+            "action_cn": action_cn,
+            "stable_error_code": error_code,
+        }
+        details = error.details or {}
+        if details:
+            data["technical_detail"] = "；".join(f"{key}={value}" for key, value in details.items())
+        elif useful_error(error.output):
+            data["technical_detail"] = useful_error(error.output)
+        log_event("ERROR", "launcher.failed", "WPS 启动流程未完成", data, error)
+        print(f"处理未完成。错误码：{error_code}；原因：{reason_cn}；建议：{action_cn}", flush=True)
+        print("详细诊断已写入 wps-plugin.log。", flush=True)
         return 1
 
 

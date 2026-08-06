@@ -520,3 +520,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：新增第二个运行日志文件、恢复 `wps-plugin-debug.log` 作为生产日志、生成 `.1` 轮转副本、把完整路径/token/Cookie/正文/堆栈写入日志；不得用空 `catch`、默认值或重复兼容路径掩盖诊断发送失败。
 - 正确方案：所有运行期事件统一交给根目录 `wps-plugin.log` 的中文格式化器；输入事件经过当前 API 合同校验和脱敏后只输出中文可读行，错误必须包含阶段、原因、处理建议和稳定错误码；连续相同事件只记录一次，状态恢复后重新记录。Broker 子进程 stdout/stderr 不另写任务日志，旧 9528 诊断客户端和 WPS FileSystem 日志缓冲器不再属于生产链。
 - 自动验证门槛：`tests/test_unified_logging.py` 覆盖中文字段、稳定错误码、重复抑制、状态恢复、敏感值/绝对路径/堆栈脱敏和超限完整行保留；local-agent 与 Broker 测试确认只写 `wps-plugin.log`；`rg` 不得在生产代码发现 `wpsjs-debug.log`、`.runtime/logs`、`broker.log`、任务级 `.log` 或旧 Loopback 诊断客户端；真实 WPS 未运行时只能记录 `NOT RUN`，不得写成通过。
+
+## P061 Broker 启动轮询重复执行昂贵进程查询
+
+- 症状：Broker 已经启动并写出状态，但 `main.py start --once` 等待约 53 秒后只报告 `LOCAL_JOB_BROKER_READY_TIMEOUT`；日志没有指出状态、PID 或进程身份的具体失败项。
+- 根因：`broker_healthy()` 只返回布尔值，启动循环每 100ms 都执行 PowerShell/CIM 进程查询；PyInstaller one-file 的启动父 PID 与实际工作 PID 还可能不同，旧逻辑没有区分本次 `Popen` 的退出状态和 Broker 工作进程身份。
+- 禁止：在固定次数轮询中重复执行 `Get-Process`/`Get-CimInstance`；只增加超时时间；把所有状态读取错误转换为空对象；跳过 PID、路径、命令行、创建时间或哈希校验；用单一 `LOCAL_JOB_BROKER_READY_TIMEOUT` 覆盖具体原因。
+- 正确方案：先严格读取 `status.json` 并执行只读内存/文件的快速就绪检查；快速检查通过后最多执行一次进程身份查询；启动期间使用本次 `Popen.poll()` 和 PID 判断退出；使用 `time.monotonic()` 的 10 秒预算；按状态缺失/损坏、心跳、版本、哈希、合同、PID、进程路径、命令行和创建时间返回稳定错误码，并把阶段、原因、建议和必要期望/实际摘要写入唯一 `wps-plugin.log`。
+- 自动验证门槛：快速检查不调用 PowerShell/CIM；快速检查失败不查询进程；快速检查通过后进程身份查询最多一次；状态缺失、损坏、心跳过期、版本/hash/合同不一致、进程提前退出和身份不一致均返回具体错误码；模拟慢查询时启动预算仍由单调时钟控制；相同 readiness 原因不刷屏；Broker 入口记录启动、runtime 校验、状态文件和就绪/失败阶段。

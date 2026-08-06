@@ -77,10 +77,140 @@ ERROR_CATALOG: Dict[str, Dict[str, str]] = {
         "reason_cn": "本地任务代理未运行或状态已过期",
         "action_cn": "执行 python main.py start，再运行“本机检测”",
     },
+    "LOCAL_JOB_BROKER_NOT_FOUND": {
+        "stage_cn": "检查本地任务代理",
+        "reason_cn": "没有找到受信任的本地任务代理程序",
+        "action_cn": "重新构建并安装本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_SHA256_MISMATCH": {
+        "stage_cn": "校验本地任务代理文件",
+        "reason_cn": "Broker 文件哈希与当前 runtime 清单不一致",
+        "action_cn": "重新构建并安装本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_RUNTIME_MISMATCH": {
+        "stage_cn": "读取本地运行时清单",
+        "reason_cn": "运行时清单版本或合同不一致",
+        "action_cn": "重新安装本地识别组件后重试",
+    },
+    "LOCAL_JOB_BROKER_RECOGNIZER_NOT_ALLOWED": {
+        "stage_cn": "校验本地识别程序路径",
+        "reason_cn": "运行时清单中的识别程序路径不在受信 runtime 内",
+        "action_cn": "重新安装本地识别组件后重试",
+    },
+    "LOCAL_JOB_BROKER_RUNTIME_SHA256_MISMATCH": {
+        "stage_cn": "校验本地识别程序文件",
+        "reason_cn": "识别程序文件哈希与运行时清单不一致",
+        "action_cn": "重新构建并安装本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_IDENTITY_MISMATCH": {
+        "stage_cn": "校验本地任务代理身份",
+        "reason_cn": "运行时清单中的 Broker 身份字段不一致",
+        "action_cn": "重新构建并安装当前 Broker",
+    },
+    "LOCAL_JOB_BROKER_HASH_MISMATCH": {
+        "stage_cn": "校验本地任务代理文件",
+        "reason_cn": "Broker 文件哈希与运行时清单不一致",
+        "action_cn": "重新构建并安装当前 Broker",
+    },
+    "LOCAL_JOB_BROKER_STATUS_WRITE_FAILED": {
+        "stage_cn": "写入本地任务代理状态",
+        "reason_cn": "Broker 无法写入就绪状态文件",
+        "action_cn": "检查本地 runtime 状态目录权限后重试",
+    },
     "LOCAL_JOB_BROKER_READY_TIMEOUT": {
         "stage_cn": "启动本地任务代理",
         "reason_cn": "本地任务代理在规定时间内没有进入就绪状态",
         "action_cn": "执行 python main.py start 并检查本地 runtime 安装状态",
+    },
+    "LOCAL_JOB_BROKER_STATUS_MISSING": {
+        "stage_cn": "校验本地任务代理状态",
+        "reason_cn": "Broker 状态文件尚未生成",
+        "action_cn": "检查 Broker 是否已启动，并查看统一日志中的 Broker 启动事件",
+    },
+    "LOCAL_JOB_BROKER_STATUS_INVALID": {
+        "stage_cn": "校验本地任务代理状态",
+        "reason_cn": "Broker 状态文件无法通过严格格式校验",
+        "action_cn": "停止旧 Broker 后重新安装本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_STATE_INVALID": {
+        "stage_cn": "校验本地任务代理状态",
+        "reason_cn": "Broker 状态不是可服务的 READY 或 RUNNING",
+        "action_cn": "查看 Broker 启动日志并修复状态对应的错误",
+    },
+    "LOCAL_JOB_BROKER_PID_MISMATCH": {
+        "stage_cn": "校验本地任务代理进程",
+        "reason_cn": "Broker 状态 PID 与受信启动记录不一致",
+        "action_cn": "停止旧 Broker 后重新启动本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_HEARTBEAT_INVALID": {
+        "stage_cn": "校验本地任务代理心跳",
+        "reason_cn": "Broker 心跳时间格式无效",
+        "action_cn": "检查本机时间和 Broker 统一日志后重启",
+    },
+    "LOCAL_JOB_BROKER_HEARTBEAT_STALE": {
+        "stage_cn": "校验本地任务代理心跳",
+        "reason_cn": "Broker 状态文件存在，但心跳已超过允许时间",
+        "action_cn": "检查 Broker 是否卡在初始化阶段后重启",
+    },
+    "LOCAL_JOB_BROKER_VERSION_MISMATCH": {
+        "stage_cn": "校验本地任务代理版本",
+        "reason_cn": "Broker 版本与当前安装版本不一致",
+        "action_cn": "停止旧 Broker 后重新启动本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH": {
+        "stage_cn": "校验本地任务代理文件",
+        "reason_cn": "运行中的 Broker 文件哈希与当前 runtime 清单不一致",
+        "action_cn": "重新构建并安装本地识别组件后重试",
+    },
+    "LOCAL_JOB_BROKER_RUNTIME_VERSION_MISMATCH": {
+        "stage_cn": "校验本地识别运行时版本",
+        "reason_cn": "Broker 使用的运行时版本与当前安装版本不一致",
+        "action_cn": "停止旧 Broker 后重新启动本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_RUNTIME_HASH_MISMATCH": {
+        "stage_cn": "校验本地识别运行时文件",
+        "reason_cn": "Broker 使用的识别程序哈希与当前安装版本不一致",
+        "action_cn": "重新安装本地识别组件后重试",
+    },
+    "LOCAL_JOB_BROKER_QUEUE_CONTRACT_MISMATCH": {
+        "stage_cn": "校验本地任务队列合同",
+        "reason_cn": "Broker 文件队列合同版本与当前 runtime 不一致",
+        "action_cn": "重新安装本地识别组件，不要回退旧服务链",
+    },
+    "LOCAL_JOB_BROKER_CONTRACT_MISMATCH": {
+        "stage_cn": "校验本地任务代理合同",
+        "reason_cn": "Broker 合同版本与当前 runtime 不一致",
+        "action_cn": "重新安装本地识别组件后重试",
+    },
+    "LOCAL_JOB_BROKER_PROCESS_NOT_RUNNING": {
+        "stage_cn": "校验本地任务代理进程",
+        "reason_cn": "Broker 状态已通过文件校验，但对应进程已经退出",
+        "action_cn": "查看 Broker 统一日志中的退出原因后重新启动",
+    },
+    "LOCAL_JOB_BROKER_PROCESS_METADATA_UNAVAILABLE": {
+        "stage_cn": "读取本地任务代理进程身份",
+        "reason_cn": "无法读取 Broker 进程身份信息",
+        "action_cn": "检查 PowerShell/CIM 进程查询权限后重试，不要跳过校验",
+    },
+    "LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH": {
+        "stage_cn": "校验本地任务代理可执行文件",
+        "reason_cn": "Broker PID 对应的可执行文件不是当前受信 runtime",
+        "action_cn": "停止旧 Broker 后重新安装并启动当前 runtime",
+    },
+    "LOCAL_JOB_BROKER_COMMAND_LINE_MISMATCH": {
+        "stage_cn": "校验本地任务代理命令行",
+        "reason_cn": "Broker PID 对应的命令行不是受信任的启动命令",
+        "action_cn": "停止该进程后重新启动当前本地任务代理",
+    },
+    "LOCAL_JOB_BROKER_PROCESS_TIME_MISMATCH": {
+        "stage_cn": "校验本地任务代理进程时间",
+        "reason_cn": "Broker 进程创建时间与状态文件不一致",
+        "action_cn": "停止旧 Broker 后重新启动本地识别组件",
+    },
+    "LOCAL_JOB_BROKER_EXITED": {
+        "stage_cn": "启动本地任务代理",
+        "reason_cn": "Broker 在写入就绪状态前已经退出",
+        "action_cn": "查看统一日志中的 Broker 启动错误和退出码后重试",
     },
     "PIPELINE_WORKER_NOT_READY": {
         "stage_cn": "启动工作线程",

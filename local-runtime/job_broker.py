@@ -40,6 +40,15 @@ UUID_V4 = re.compile(
     re.IGNORECASE,
 )
 
+BROKER_STARTUP_ERROR_TEXT = {
+    "LOCAL_JOB_BROKER_RUNTIME_MISMATCH": ("运行时清单版本或合同不一致", "重新安装本地识别组件后重试"),
+    "LOCAL_JOB_BROKER_RECOGNIZER_NOT_ALLOWED": ("运行时清单中的识别程序路径不在受信 runtime 内", "重新安装本地识别组件后重试"),
+    "LOCAL_JOB_BROKER_RUNTIME_SHA256_MISMATCH": ("识别程序文件哈希与运行时清单不一致", "重新构建并安装本地识别组件"),
+    "LOCAL_JOB_BROKER_IDENTITY_MISMATCH": ("运行时清单中的 Broker 身份字段不一致", "重新构建并安装当前 Broker"),
+    "LOCAL_JOB_BROKER_HASH_MISMATCH": ("Broker 文件哈希与运行时清单不一致", "重新构建并安装当前 Broker"),
+    "LOCAL_JOB_BROKER_VERSION_MISMATCH": ("Broker 版本与运行时清单不一致", "重新构建并安装当前 Broker"),
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -174,6 +183,7 @@ class BrokerConfig:
 class JobBroker:
     def __init__(self, config: BrokerConfig) -> None:
         self.config = config
+        self.log_writer = UnifiedLogWriter(config.log_path) if config.log_path else None
         self.pid = os.getpid()
         self.started_at = utc_now()
         self.broker_instance_id = str(uuid.uuid4())
@@ -183,8 +193,41 @@ class JobBroker:
         self.last_error_code = ""
         self.active_job_id: Optional[str] = None
         self.active_process: Optional[subprocess.Popen] = None
-        self.log_writer = UnifiedLogWriter(config.log_path) if config.log_path else None
         self.last_heartbeat = 0.0
+        self.started = False
+        self.startup_stage = "启动本地任务代理"
+
+    def startup(self) -> None:
+        if self.started:
+            return
+        self._log_lifecycle("INFO", "broker.process.started", "本地任务代理进程已启动", "启动本地任务代理")
+        self.startup_stage = "读取运行时清单"
+        self._log_lifecycle("INFO", "broker.runtime.read.start", "开始读取运行时清单", self.startup_stage)
+        self._current_runtime()
+        self._log_lifecycle("INFO", "broker.runtime.valid", "运行时清单校验通过", self.startup_stage)
+        self.startup_stage = "初始化任务队列"
+        self._log_lifecycle("INFO", "broker.queue.init", "开始初始化任务队列", self.startup_stage)
+        self.config.jobs_root.mkdir(parents=True, exist_ok=True)
+        actual_state = self._write_status("READY")
+        if actual_state != "READY":
+            raise ValueError(self.last_error_code or "LOCAL_JOB_BROKER_STATUS_WRITE_FAILED")
+        self._log_lifecycle("INFO", "broker.status.created", "状态文件已创建", "写入 Broker 状态")
+        self._log_lifecycle("INFO", "broker.ready", "本地任务代理已就绪", "完成本地任务代理启动")
+        self.started = True
+
+    def log_startup_failure(self, error: BaseException) -> None:
+        code = str(error).split(":", 1)[0] or "BROKER_STARTUP_FAILED"
+        reason_cn, action_cn = BROKER_STARTUP_ERROR_TEXT.get(code, ("本地任务代理初始化失败", "查看本地任务代理统一日志中的原始错误后重试"))
+        self._log_lifecycle(
+            "ERROR",
+            "broker.start.failed",
+            "本地任务代理初始化失败",
+            self.startup_stage,
+            reason_cn,
+            action_cn,
+            code,
+            f"{type(error).__name__}: {error}",
+        )
 
     def run_once(self) -> bool:
         self._write_status("READY")
@@ -201,7 +244,7 @@ class JobBroker:
         return True
 
     def run_forever(self, stop_event: threading.Event) -> int:
-        self._write_status("READY")
+        self.startup()
         try:
             while not stop_event.is_set():
                 self.run_once()
@@ -252,7 +295,7 @@ class JobBroker:
             "queue_contract_version": queue_contract_version,
         }
 
-    def _write_status(self, state: str) -> None:
+    def _write_status(self, state: str) -> str:
         actual_state = state
         try:
             runtime = self._current_runtime()
@@ -262,7 +305,7 @@ class JobBroker:
             broker_sha256 = runtime["broker_sha256"]
             broker_path_hash = runtime["broker_executable_path_hash"]
             queue_contract_version = runtime["queue_contract_version"]
-        except Exception as error:  # noqa: BLE001 - status must remain diagnosable
+        except (OSError, ValueError) as error:
             runtime_version = ""
             runtime_sha256 = ""
             broker_version = self.config.broker_version
@@ -291,6 +334,7 @@ class JobBroker:
             "last_error_code": self.last_error_code,
         })
         self.last_heartbeat = time.monotonic()
+        return actual_state
 
     def _heartbeat_status(self) -> None:
         if time.monotonic() - self.last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
@@ -553,6 +597,37 @@ class JobBroker:
         self.active_process = None
         self.active_job_id = None
 
+    def _log_lifecycle(
+        self,
+        level: str,
+        event: str,
+        message: str,
+        stage_cn: str,
+        reason_cn: str = "",
+        action_cn: str = "",
+        error_code: str = "",
+        technical_detail: str = "",
+    ) -> None:
+        if self.log_writer is None:
+            return
+        data: Dict[str, object] = {"stage_cn": stage_cn}
+        if reason_cn:
+            data["reason_cn"] = reason_cn
+        if action_cn:
+            data["action_cn"] = action_cn
+        if error_code:
+            data["stable_error_code"] = error_code
+        if technical_detail:
+            data["technical_detail"] = technical_detail
+        self.log_writer.append([{
+            "timestamp": utc_now(),
+            "level": level,
+            "component": "broker",
+            "event": event,
+            "message": message,
+            "data": data,
+        }])
+
     def _log(self, message: str, job_id: str, code: str = "") -> None:
         if self.log_writer is None:
             return
@@ -592,6 +667,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     root = Path(args.root) if args.root else appdata_root(None)
     config = BrokerConfig(appdata_root=root, scan_interval_seconds=max(0.1, min(0.25, args.scan_interval)), log_path=Path(args.log_path) if args.log_path else None)
     broker = JobBroker(config)
+    try:
+        broker.startup()
+    except (OSError, ValueError) as error:
+        broker.log_startup_failure(error)
+        return 1
     if args.action == "once":
         broker.run_once()
         broker._write_status("STOPPED")
