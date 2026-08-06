@@ -75,6 +75,7 @@ def test_quick_readiness_checks_all_contract_fields_without_process_query(monkey
 
 def test_timestamps_match_wmi_seven_digit_fraction() -> None:
     assert main.timestamps_match("2026-08-06T14:31:09.301944Z", "2026-08-06T14:31:09.3019440Z")
+    assert main.timestamps_match("2026-08-06T16:00:12.3198240Z", "2026-08-07T00:00:12+0800")
 
 
 @pytest.mark.parametrize(
@@ -121,6 +122,31 @@ def test_process_identity_is_checked_once_after_quick_check(monkeypatch: pytest.
     readiness = main.broker_readiness(current_manifest(), status)
     assert readiness.ready is True
     assert calls == 1
+
+
+def test_process_identity_accepts_pyinstaller_child_with_blank_wmi_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = Path(current_manifest()["broker_executable_path"])
+    path_hash = main.broker_executable_path_hash(executable)
+    current = {**current_manifest(), "broker_executable_path_hash": path_hash}
+    status = broker_status(broker_executable_path_hash=path_hash)
+    monkeypatch.setattr(
+        main,
+        "query_process_metadata",
+        lambda _pid: main.ProcessMetadataResult(
+            {
+                "name": executable.name,
+                "executable_path": None,
+                "command_line": None,
+                "parent_name": executable.name,
+                "process_created_at": status["process_created_at"],
+            },
+            "ready",
+        ),
+    )
+
+    readiness = main.broker_readiness(current, status)
+
+    assert readiness.ready is True
 
 
 @pytest.mark.parametrize(
@@ -259,3 +285,66 @@ def test_broker_startup_writes_lifecycle_events(tmp_path: Path) -> None:
     assert "本地任务代理进程已启动" in text
     assert "运行时清单校验通过" in text
     assert "本地任务代理已就绪" in text
+
+
+def runtime_build_fixture(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    recognizer = installed / "docxtool-recognize.exe"
+    broker = installed / "docxtool-job-broker.exe"
+    recognizer.write_bytes(b"recognizer")
+    broker.write_bytes(b"broker")
+    manifest = {
+        "contract_version": 1,
+        "runtime_version": "docxtool-test",
+        "executable": recognizer.name,
+        "executable_sha256": hashlib.sha256(b"recognizer").hexdigest(),
+        "broker_version": "1.3.2",
+        "broker_executable": broker.name,
+        "broker_sha256": hashlib.sha256(b"broker").hexdigest(),
+        "broker_contract_version": 1,
+        "queue_contract_version": 1,
+        "recognition_package_version": "4.0",
+    }
+    manifest_path = tmp_path / "runtime-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    current = {
+        **manifest,
+        "executable_path": str(recognizer),
+        "broker_executable_path": str(broker),
+        "recognition_package_version": "4.0",
+    }
+    return manifest_path, current
+
+
+def test_start_reuses_matching_runtime_without_rebuild(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest_path, current = runtime_build_fixture(tmp_path)
+    monkeypatch.setattr(main, "LOCAL_RUNTIME_MANIFEST", manifest_path)
+    monkeypatch.setattr(main, "broker_current", lambda: current)
+    monkeypatch.setattr(main, "ensure_job_broker", lambda: {})
+    monkeypatch.setattr(main, "log_event", lambda *args, **kwargs: None)
+    commands: list[str] = []
+    monkeypatch.setattr(main, "run_step", lambda _title, command, _success, **_kwargs: commands.append(command))
+
+    main.prepare(rebuild_runtime=False)
+
+    assert "npm run build:local-runtime" not in commands
+    assert "npm run install:local-runtime" not in commands
+    assert "npm run build:classified" in commands
+
+
+def test_start_rebuilds_runtime_when_build_manifest_differs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest_path, current = runtime_build_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["broker_sha256"] = "different-build"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(main, "LOCAL_RUNTIME_MANIFEST", manifest_path)
+    monkeypatch.setattr(main, "broker_current", lambda: current)
+    monkeypatch.setattr(main, "ensure_job_broker", lambda: {})
+    monkeypatch.setattr(main, "log_event", lambda *args, **kwargs: None)
+    commands: list[str] = []
+    monkeypatch.setattr(main, "run_step", lambda _title, command, _success, **_kwargs: commands.append(command))
+
+    main.prepare(rebuild_runtime=False)
+
+    assert commands[:2] == ["npm run build:local-runtime", "npm run install:local-runtime"]

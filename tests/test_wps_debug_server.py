@@ -157,3 +157,28 @@ def test_start_finalizes_build_before_resource_service() -> None:
     assert block.index("verify()") < block.index("同步最终 WPS 调试包")
     assert block.index("同步最终 WPS 调试包") < block.index("ensure_control_server()")
     assert "register_addin(force_restart=True)" in block
+
+
+def test_managed_debug_server_owner_accepts_pyinstaller_child_without_command_line() -> None:
+    started_at = "2026-08-07T00:00:12+08:00"
+    metadata = {
+        "pid": 2872,
+        "started_at": started_at,
+        "cwd": str(main.DEBUG_PACKAGE),
+        "command": [str(main.sys.executable), "-u", str(main.ROOT / "scripts" / "wps_debug_server.py"), "--root", str(main.DEBUG_PACKAGE)],
+    }
+    owner = {
+        "pid": 39584,
+        "name": "python.exe",
+        "command_line": None,
+        "parent_process_id": 2872,
+        "parent_name": "python.exe",
+        "parent_process_created_at": started_at,
+    }
+
+    assert main.managed_debug_server_owner(metadata, owner) is True
+    assert main.managed_debug_server_stop_pid(metadata, owner) == "2872"
+
+    owner["parent_process_id"] = 9999
+    assert main.managed_debug_server_owner(metadata, owner) is False
+    assert main.managed_debug_server_stop_pid(metadata, owner) == "39584"

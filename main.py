@@ -42,6 +42,7 @@ WPS_LOG = ROOT / "wps-plugin.log"
 LOG_WRITER = UnifiedLogWriter(WPS_LOG)
 DEBUG_PACKAGE = ROOT / ".runtime" / "wps-debug-package"
 DEBUG_MANIFEST = DEBUG_PACKAGE / "debug-package.json"
+LOCAL_RUNTIME_MANIFEST = ROOT / "dist" / "local-runtime" / "win-x64" / "runtime-manifest.json"
 WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
 JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
@@ -198,9 +199,18 @@ def print_status() -> None:
     print("- 排版命令：插件内部生成")
 
 
-def prepare() -> None:
-    run_step("构建本地识别组件", "npm run build:local-runtime", "本地识别组件构建完成。", timeout=240)
-    run_step("安装本地识别组件", "npm run install:local-runtime", "本地识别组件已安装。")
+def prepare(*, rebuild_runtime: bool = True) -> None:
+    if rebuild_runtime or not local_runtime_matches_build():
+        run_step("构建本地识别组件", "npm run build:local-runtime", "本地识别组件构建完成。", timeout=240)
+        run_step("安装本地识别组件", "npm run install:local-runtime", "本地识别组件已安装。")
+    else:
+        current = broker_current()
+        log_event(
+            "INFO",
+            "broker.runtime.reused",
+            "已复用已安装的本地识别组件，跳过 runtime 重建",
+            {"result_cn": "成功", "runtime_version": current.get("runtime_version")},
+        )
     ensure_job_broker()
     run_step("构建 WPS 插件", "npm run build:classified", "WPS 插件构建完成。")
     run_step("检查 WPS 插件结构", "npm run verify:addin -- classified-offline", "WPS 插件结构检查已完成。")
@@ -392,6 +402,30 @@ def broker_current() -> Dict[str, object]:
     return read_json(appdata_docxtool_root() / "runtime" / "current.json")
 
 
+def local_runtime_matches_build() -> bool:
+    manifest = read_json(LOCAL_RUNTIME_MANIFEST)
+    current = broker_current()
+    if not manifest or not current:
+        return False
+    for key in (
+        "contract_version",
+        "runtime_version",
+        "executable_sha256",
+        "broker_version",
+        "broker_sha256",
+        "broker_contract_version",
+        "queue_contract_version",
+        "recognition_package_version",
+    ):
+        if current.get(key) != manifest.get(key):
+            return False
+    if Path(str(current.get("executable_path", ""))).name != str(manifest.get("executable", "")):
+        return False
+    if Path(str(current.get("broker_executable_path", ""))).name != str(manifest.get("broker_executable", "")):
+        return False
+    return Path(str(current.get("executable_path", ""))).is_file() and Path(str(current.get("broker_executable_path", ""))).is_file()
+
+
 def broker_status() -> Dict[str, object]:
     status, _ = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
     return status
@@ -426,7 +460,7 @@ def query_process_metadata(pid: object) -> ProcessMetadataResult:
         except OSError as error:
             return ProcessMetadataResult({}, "unavailable", type(error).__name__)
         return ProcessMetadataResult({}, "unavailable", "当前平台没有受支持的进程身份查询")
-    script = f"$process=Get-CimInstance Win32_Process -Filter 'ProcessId={process_id}'; if($process){{[pscustomobject]@{{pid=$process.ProcessId; executable_path=$process.ExecutablePath; command_line=$process.CommandLine; process_created_at=$process.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
+    script = f"$process=Get-CimInstance Win32_Process -Filter 'ProcessId={process_id}'; if($process){{$parent=Get-CimInstance Win32_Process -Filter ('ProcessId='+$process.ParentProcessId);[pscustomobject]@{{pid=$process.ProcessId; name=$process.Name; executable_path=$process.ExecutablePath; command_line=$process.CommandLine; parent_process_id=$process.ParentProcessId; parent_name=$parent.Name; process_created_at=$process.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
     try:
         output = subprocess.check_output(
             ["pwsh", "-NoProfile", "-Command", script],
@@ -469,6 +503,8 @@ def parse_utc_timestamp(value: object) -> Optional[datetime]:
         fraction = suffix[:offset_index]
         if fraction:
             normalized = f"{date_part}.{fraction[:6]}{suffix[offset_index:]}"
+    if len(normalized) >= 5 and normalized[-5] in ("+", "-") and normalized[-4:].isdigit():
+        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
@@ -496,14 +532,28 @@ def managed_control_server_process(pid: object, manifest_path: Path, expected_cr
     return expected_created_at is not None and timestamps_match(value.get("process_created_at"), expected_created_at)
 
 
-def managed_broker_process(pid: object, executable: Path, expected_created_at: object = None) -> bool:
+def broker_executable_path_hash(executable: Path) -> str:
+    normalized = str(executable).casefold().replace("/", "\\")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def managed_broker_process(pid: object, executable: Path, expected_created_at: object = None, expected_path_hash: object = None) -> bool:
     value = process_metadata(pid)
     if not value:
         return False
-    if str(value.get("executable_path", "")).lower() != str(executable).lower():
-        return False
-    if "docxtool-job-broker" not in str(value.get("command_line", "")).lower():
-        return False
+    actual_executable = str(value.get("executable_path") or "")
+    if actual_executable:
+        if actual_executable.casefold() != str(executable).casefold():
+            return False
+        if "docxtool-job-broker" not in str(value.get("command_line", "")).casefold():
+            return False
+    else:
+        if str(value.get("name", "")).casefold() != executable.name.casefold():
+            return False
+        if str(value.get("parent_name", "")).casefold() != executable.name.casefold():
+            return False
+        if expected_path_hash != broker_executable_path_hash(executable):
+            return False
     return expected_created_at is not None and timestamps_match(value.get("process_created_at"), expected_created_at)
 
 
@@ -632,21 +682,33 @@ def broker_process_readiness(current: Dict[str, object], status: Dict[str, objec
         )
     metadata = result.metadata
     executable = Path(str(current.get("broker_executable_path", "")))
-    actual_executable = str(metadata.get("executable_path", ""))
-    if not actual_executable or actual_executable.casefold().replace("/", "\\") != str(executable).casefold().replace("/", "\\"):
+    actual_executable = str(metadata.get("executable_path") or "")
+    if actual_executable:
+        if actual_executable.casefold().replace("/", "\\") != str(executable).casefold().replace("/", "\\"):
+            return broker_failure(
+                "LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH",
+                "Broker PID 对应的可执行文件不是当前受信 runtime",
+                "停止旧 Broker 后重新安装并启动当前 runtime",
+                {"expected_executable_name": executable.name, "actual_executable_name": Path(actual_executable).name},
+            )
+        command_line = str(metadata.get("command_line", ""))
+        if "docxtool-job-broker" not in command_line.casefold():
+            return broker_failure(
+                "LOCAL_JOB_BROKER_COMMAND_LINE_MISMATCH",
+                "Broker PID 对应的命令行不是受信任的 Broker 启动命令",
+                "停止该进程后重新启动当前本地任务代理",
+                {"pid": status.get("pid"), "broker_command_marker_present": False},
+            )
+    elif (
+        str(metadata.get("name", "")).casefold() != executable.name.casefold()
+        or str(metadata.get("parent_name", "")).casefold() != executable.name.casefold()
+        or current.get("broker_executable_path_hash") != broker_executable_path_hash(executable)
+    ):
         return broker_failure(
             "LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH",
-            "Broker PID 对应的可执行文件不是当前受信 runtime",
+            "PyInstaller Broker 的路径信息不可见，且无法用受信启动树证明其身份",
             "停止旧 Broker 后重新安装并启动当前 runtime",
-            {"expected_executable_name": executable.name, "actual_executable_name": Path(actual_executable).name if actual_executable else "缺失"},
-        )
-    command_line = str(metadata.get("command_line", ""))
-    if "docxtool-job-broker" not in command_line.casefold():
-        return broker_failure(
-            "LOCAL_JOB_BROKER_COMMAND_LINE_MISMATCH",
-            "Broker PID 对应的命令行不是受信任的 Broker 启动命令",
-            "停止该进程后重新启动当前本地任务代理",
-            {"pid": status.get("pid"), "broker_command_marker_present": False},
+            {"expected_executable_name": executable.name, "actual_executable_name": str(metadata.get("name", "缺失")), "parent_executable_name": str(metadata.get("parent_name", "缺失"))},
         )
     actual_created_at = metadata.get("process_created_at")
     if not timestamps_match(actual_created_at, status.get("process_created_at")):
@@ -715,7 +777,7 @@ def stop_job_broker() -> None:
     executable = Path(str(current.get("broker_executable_path", "")))
     metadata = read_json(JOB_BROKER_PROCESS)
     pid = metadata.get("pid")
-    if not pid or not managed_broker_process(pid, executable, metadata.get("process_created_at")):
+    if not pid or not managed_broker_process(pid, executable, metadata.get("process_created_at"), current.get("broker_executable_path_hash")):
         return
     subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     for _ in range(20):
@@ -748,7 +810,7 @@ def ensure_job_broker() -> Dict[str, object]:
         return status
     stale_pid = status.get("pid")
     if stale_pid:
-        managed = managed_broker_process(stale_pid, executable, status.get("process_created_at"))
+        managed = managed_broker_process(stale_pid, executable, status.get("process_created_at"), current.get("broker_executable_path_hash"))
         if not managed and process_is_alive(stale_pid):
             raise StepFailed(
                 "启动本地任务 Broker",
@@ -923,13 +985,34 @@ def write_process_metadata(process: subprocess.Popen[bytes], manifest: Dict[str,
 
 
 def port_owner_info() -> Dict[str, object]:
-    script = f"$c=Get-NetTCPConnection -LocalPort {WPSJS_PORT} -State Listen -ErrorAction SilentlyContinue|Select-Object -First 1;if($c){{$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$c.OwningProcess);[pscustomobject]@{{pid=$c.OwningProcess;name=$p.Name;command_line=$p.CommandLine}}|ConvertTo-Json -Compress}}"
+    script = f"$c=Get-NetTCPConnection -LocalPort {WPSJS_PORT} -State Listen -ErrorAction SilentlyContinue|Select-Object -First 1;if($c){{$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$c.OwningProcess);$parent=Get-CimInstance Win32_Process -Filter ('ProcessId='+$p.ParentProcessId);[pscustomobject]@{{pid=$c.OwningProcess;name=$p.Name;command_line=$p.CommandLine;parent_process_id=$p.ParentProcessId;parent_name=$parent.Name;parent_process_created_at=$parent.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
     try:
         output = subprocess.check_output(["pwsh", "-NoProfile", "-Command", script], cwd=str(ROOT), text=True, encoding="utf-8", errors="replace", timeout=10).strip()
         value = json.loads(output) if output else {}
         return value if isinstance(value, dict) else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
+
+
+def managed_debug_server_owner(metadata: Dict[str, object], owner: Dict[str, object]) -> bool:
+    if Path(str(metadata.get("cwd", ""))).resolve() != DEBUG_PACKAGE.resolve() or not owner.get("pid"):
+        return False
+    command = metadata.get("command")
+    if not isinstance(command, list) or str(ROOT / "scripts" / "wps_debug_server.py") not in command or str(DEBUG_PACKAGE) not in command:
+        return False
+    command_line = str(owner.get("command_line") or "")
+    if str(DEBUG_PACKAGE) in command_line and "wps_debug_server.py" in command_line:
+        return True
+    return (
+        owner.get("parent_process_id") == metadata.get("pid")
+        and str(owner.get("name") or "").casefold() == "python.exe"
+        and str(owner.get("parent_name") or "").casefold() == "python.exe"
+        and timestamps_match(owner.get("parent_process_created_at"), metadata.get("started_at"))
+    )
+
+
+def managed_debug_server_stop_pid(metadata: Dict[str, object], owner: Dict[str, object]) -> str:
+    return str(metadata.get("pid") if owner.get("parent_process_id") == metadata.get("pid") else owner.get("pid", ""))
 
 
 def update_server_owner_metadata() -> None:
@@ -942,28 +1025,44 @@ def register_addin(*, force_restart: bool = False) -> None:
         report = probe_debug_server()
         metadata = read_json(WPSJS_PROCESS)
         owner = port_owner_info()
-        command_line = str(owner.get("command_line", ""))
+        command_line = str(owner.get("command_line") or "")
         # The launcher process can exit after creating a child on Windows, so
         # the port owner PID is not required to equal the recorded Popen PID.
         # The package directory and command kind are the safety boundary.
-        managed_owner = Path(str(metadata.get("cwd", ""))).resolve() == DEBUG_PACKAGE.resolve() and bool(owner.get("pid")) and str(DEBUG_PACKAGE) in command_line
-        if not force_restart and report.get("status") == "PASS" and managed_owner and "wps_debug_server.py" in command_line:
+        managed_owner = managed_debug_server_owner(metadata, owner)
+        if not force_restart and report.get("status") == "PASS" and managed_owner:
             metadata["expected_build_id"] = read_json(DEBUG_MANIFEST).get("build_id", "")
             WPSJS_PROCESS.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
             log_event("INFO", "debug_server.reused", "WPS 资源服务已验证并复用", {"result_cn": "成功"})
             return
-        if managed_owner and ("wps_debug_server.py" in command_line or "http.server" in command_line):
-            pid = str(owner.get("pid", ""))
+        if managed_owner:
+            pid = managed_debug_server_stop_pid(metadata, owner)
             if pid.isdigit():
                 if force_restart:
                     log_event("INFO", "debug_server.restart", "当前构建已完成，重启 WPS 资源服务", {"stage_cn": "同步当前构建"})
-                subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                stopped = subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if stopped.returncode != 0:
+                    raise StepFailed(
+                        "停止受管理 WPS 资源服务",
+                        "taskkill",
+                        "WPSJS_MANAGED_PROCESS_STOP_FAILED",
+                        reason_cn="当前会话没有权限停止受管理的旧 WPS 资源服务",
+                        action_cn="从启动旧服务的同一权限终端关闭它，再重新运行 main.py",
+                        error_code="WPSJS_MANAGED_PROCESS_STOP_FAILED",
+                    )
                 for _ in range(20):
                     if not is_port_open(WPSJS_PORT):
                         break
                     time.sleep(0.25)
         if is_port_open(WPSJS_PORT):
-            raise StepFailed("启动 WPS 调试服务", "wps_debug_server.py", "WPSJS_PORT_OCCUPIED_BY_UNMANAGED_PROCESS")
+            raise StepFailed(
+                "停止受管理 WPS 资源服务" if managed_owner else "启动 WPS 调试服务",
+                "wps_debug_server.py",
+                "WPSJS_MANAGED_PROCESS_STOP_FAILED" if managed_owner else "WPSJS_PORT_OCCUPIED_BY_UNMANAGED_PROCESS",
+                reason_cn="受管理的旧 WPS 资源服务在停止后仍占用端口" if managed_owner else "3889 端口被未知进程占用",
+                action_cn="确认旧服务已退出后重试" if managed_owner else "不要结束未知进程；先确认端口归属后重试",
+                error_code="WPSJS_MANAGED_PROCESS_STOP_FAILED" if managed_owner else "WPSJS_PORT_OCCUPIED_BY_UNMANAGED_PROCESS",
+            )
 
     if not DEBUG_MANIFEST.exists():
         raise StepFailed("启动 WPS 调试服务", "wpsjs debug -s", "WPS_DEBUG_PACKAGE_MISSING")
@@ -1110,7 +1209,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if args.action == "start":
-            prepare()
+            prepare(rebuild_runtime=False)
             verify()
             run_step("同步最终 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "最终 WPS 调试包已同步。", timeout=60)
             ensure_control_server()
@@ -1123,7 +1222,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not args.once:
                 watch_wps_log()
         elif args.action == "prepare":
-            prepare()
+            prepare(rebuild_runtime=True)
             print("准备完成。", flush=True)
         elif args.action == "status":
             print_status()

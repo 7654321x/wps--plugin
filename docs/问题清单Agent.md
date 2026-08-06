@@ -544,3 +544,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：只比较当前磁盘文件的字节就复用资源服务；把 `WPSJS_PROCESS.expected_build_id` 的后写值当作资源服务进程实际 build_id；用旧服务日志证明当前构建已加载。
 - 正确方案：启动时先完成会重建产物的验证，再同步最终调试包；控制服务和资源服务必须在最终 build 确定后启动，资源服务在新启动流程中强制重启，确保进程缓存 build_id 与调试包一致。
 - 自动验证门槛：一次 `main.py start --once` 后，`apps/classified-offline/ui/build-info.js`、`.runtime/wps-debug-package/debug-package.json`、资源服务日志的 build_id 三者一致；首页字节、长度和 SHA-256 仍完全一致；旧受管理资源服务被重启，未知端口进程不被结束。
+
+## P064 普通启动重复重建 runtime，且 PyInstaller 子进程身份不可见
+
+- 症状：每次 `main.py start` 都执行约十几秒的 PyInstaller runtime 构建，Broker EXE 哈希每次变化；跳过重建后，WMI 又可能为 PyInstaller 子进程返回空的 `ExecutablePath` 与 `CommandLine`，误报 `LOCAL_JOB_BROKER_EXECUTABLE_IDENTITY_MISMATCH` 或把受管理资源服务误判为未知端口进程。
+- 根因：启动流程没有区分“显式准备 runtime”和“复用已安装 runtime”；进程身份检查只接受可见路径/命令行，没有使用受信启动器 PID、同名直接父子树、创建时间及安装清单路径哈希的联合证据。
+- 禁止：每次普通启动重建 runtime；只凭 PID、心跳或同名进程复用/结束服务；在身份不明时结束 3889 端口进程；静默吞掉 `taskkill` 的权限失败。
+- 正确方案：`start` 只在 `current.json` 与 runtime 构建清单的版本、合同、摘要和安装文件不一致时重建；显式 `prepare` 强制重建。PyInstaller 空路径场景必须同时校验状态路径哈希、同名直接父子树和创建时间；资源服务仅在端口监听者是启动器记录的直接子进程且父 PID/创建时间/启动命令均一致时停止。停止失败必须返回明确权限错误。
+- 自动验证门槛：匹配清单的 `start` 不执行 `build:local-runtime` 或 `install:local-runtime`；清单不一致时重建；空 WMI 路径的受信 Broker 子进程可复用；未知子进程不可复用；受管理资源服务的停止目标为记录父 PID；完整 `main.py --once` 记录 runtime/Broker 复用。真实 WPS 未重启前仍只能写 `NOT RUN`。
