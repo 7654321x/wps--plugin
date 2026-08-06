@@ -67,11 +67,11 @@ class ProcessMetadataResult:
     detail: str = ""
 
 
-def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None) -> None:
+def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None, *, component: str = "main") -> None:
     event_value: Dict[str, object] = {
         "timestamp": utc_now(),
         "level": level,
-        "component": "main",
+        "component": component,
         "event": event,
         "message": message,
         "data": data or {},
@@ -819,9 +819,20 @@ def fetch_resource(relative: str) -> Dict[str, object]:
     try:
         with urllib.request.urlopen(url, timeout=3) as response:
             content = response.read()
-            return {"path": relative, "status": int(response.status), "content_type": response.headers.get("Content-Type", ""), "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(), "text": content.decode("utf-8", errors="replace")}
+            return {
+                "path": relative,
+                "status": int(response.status),
+                "content_type": response.headers.get("Content-Type", ""),
+                "content_length": int(response.headers.get("Content-Length", "-1")),
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "content": content,
+                "text": content.decode("utf-8", errors="replace"),
+            }
+    except ValueError as error:
+        return {"path": relative, "status": 0, "error": str(error), "content": b"", "text": ""}
     except (OSError, urllib.error.URLError) as error:
-        return {"path": relative, "status": 0, "error": str(error), "text": ""}
+        return {"path": relative, "status": 0, "error": str(error), "content": b"", "text": ""}
 
 
 def probe_debug_server() -> Dict[str, object]:
@@ -829,9 +840,38 @@ def probe_debug_server() -> Dict[str, object]:
     required = ["index.html", "main.js", "ribbon.xml", "js/bootstrap-probe.js", "js/ribbon.js", "host-runtime.js", "pipeline-worker-probe.js", "pipeline-worker.js", "ui/build-info.js", "ui/local-runtime-config.js", "ui/default-format-profile.js", "ui/taskpane.html"]
     resources = {path: fetch_resource(path) for path in required}
     errors: List[str] = []
+    build_root = ROOT / "apps" / "classified-offline" / "dist"
     for path, item in resources.items():
         if item.get("status") != 200:
             errors.append(f"RESOURCE_UNAVAILABLE:{path}")
+    expected_bytes: Dict[str, bytes] = {}
+    for path in ("index.html", "main.js", "host-runtime.js", "js/ribbon.js"):
+        expected_path = build_root / path
+        if not expected_path.is_file():
+            errors.append(f"BUILD_ASSET_MISSING:{path}")
+            continue
+        content = expected_path.read_bytes()
+        expected_bytes[path] = content
+        served = resources[path]
+        if served.get("status") != 200:
+            continue
+        expected_type = {
+            "index.html": "text/html; charset=utf-8",
+            "main.js": "application/javascript; charset=utf-8",
+            "host-runtime.js": "application/javascript; charset=utf-8",
+            "js/ribbon.js": "application/javascript; charset=utf-8",
+        }[path]
+        if served.get("content_type") != expected_type:
+            errors.append("WPS_INDEX_RESPONSE_MISMATCH" if path == "index.html" else f"BUILD_ASSET_MISMATCH:{path}")
+        actual = served.get("content")
+        if actual != content:
+            errors.append("WPS_INDEX_RESPONSE_MISMATCH" if path == "index.html" else f"BUILD_ASSET_MISMATCH:{path}")
+        if served.get("content_length") != len(content) or served.get("bytes") != len(content) or served.get("sha256") != hashlib.sha256(content).hexdigest():
+            errors.append("WPS_INDEX_RESPONSE_MISMATCH" if path == "index.html" else f"BUILD_ASSET_MISMATCH:{path}")
+    index_expected = expected_bytes.get("index.html", b"")
+    index_served = resources["index.html"].get("content", b"")
+    if index_expected and b"/hot-update-inject.js" in index_served:
+        errors.append("WPS_INDEX_RESPONSE_MISMATCH")
     main_text = str(resources["main.js"].get("text", "")); ribbon_text = str(resources["js/ribbon.js"].get("text", "")); host_text = str(resources["host-runtime.js"].get("text", "")); build_text = str(resources["ui/build-info.js"].get("text", ""))
     if not all(marker in main_text for marker in ("js/bootstrap-probe.js", "js/ribbon.js", "host-runtime.js")) or "type='module'" in main_text or "dist/host-runtime.js" in main_text: errors.append("MAIN_ENTRY_MISMATCH")
     if not all(marker in ribbon_text for marker in ("DocxtoolRunLocalCommand", "window.OnAction", "ribbon.action.received")) or "DocxtoolHostEnqueue" in ribbon_text: errors.append("RIBBON_ENTRY_MISMATCH")
@@ -841,8 +881,39 @@ def probe_debug_server() -> Dict[str, object]:
     critical = manifest.get("critical_assets", {}) if isinstance(manifest.get("critical_assets"), dict) else {}
     for path, expected_hash in critical.items():
         if resources.get(str(path), {}).get("sha256") != expected_hash: errors.append(f"ASSET_HASH_MISMATCH:{path}")
-    report: Dict[str, object] = {"schema_version": 1, "expected_build_id": expected_build, "served_build_id": expected_build if not errors else "", "status": "PASS" if not errors else "FAIL", "errors": errors, "resources": [{key: value for key, value in item.items() if key != "text"} for item in resources.values()]}
+    report: Dict[str, object] = {"schema_version": 1, "expected_build_id": expected_build, "served_build_id": expected_build if not errors else "", "status": "PASS" if not errors else "FAIL", "errors": sorted(set(errors)), "build_root": "apps/classified-offline/dist", "resources": [{key: value for key, value in item.items() if key not in ("text", "content")} for item in resources.values()]}
     RESOURCE_PROBE.parent.mkdir(parents=True, exist_ok=True); RESOURCE_PROBE.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_report = resources["index.html"]
+    if "WPS_INDEX_RESPONSE_MISMATCH" in report["errors"]:
+        log_event(
+            "ERROR",
+            "wps.resource.index.verify.failed",
+            "插件首页响应与当前构建不一致",
+            {
+                "stage_cn": "校验 WPS 主资源",
+                "reason_cn": "资源服务返回内容被动态修改",
+                "action_cn": "检查静态资源响应逻辑，禁止动态注入或重新编码 index.html",
+                "stable_error_code": "WPS_INDEX_RESPONSE_MISMATCH",
+                "expected_bytes": len(index_expected),
+                "served_bytes": index_report.get("bytes", 0),
+                "expected_sha256_prefix": hashlib.sha256(index_expected).hexdigest()[:12] if index_expected else "",
+                "served_sha256_prefix": str(index_report.get("sha256", ""))[:12],
+                "technical_detail": f"构建长度：{len(index_expected)}；响应长度：{index_report.get('bytes', 0)}；构建摘要：{hashlib.sha256(index_expected).hexdigest()[:12] if index_expected else '无'}；响应摘要：{str(index_report.get('sha256', ''))[:12]}",
+            },
+            component="debug_server",
+        )
+    elif index_expected:
+        log_event(
+            "INFO",
+            "wps.resource.index.verify.completed",
+            "插件首页响应与当前构建完全一致",
+            {
+                "result_cn": "成功",
+                "file_size": len(index_expected),
+                "file_sha256_prefix": hashlib.sha256(index_expected).hexdigest()[:12],
+            },
+            component="debug_server",
+        )
     return report
 
 

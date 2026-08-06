@@ -262,6 +262,16 @@ ERROR_CATALOG: Dict[str, Dict[str, str]] = {
         "reason_cn": "WPS 宿主命令返回失败",
         "action_cn": "查看同一请求的后续错误码并按处理建议操作",
     },
+    "WPS_INDEX_RESPONSE_MISMATCH": {
+        "stage_cn": "校验 WPS 主资源",
+        "reason_cn": "资源服务返回的 index.html 内容与当前构建不一致",
+        "action_cn": "删除首页响应阶段的动态注入或文本替换后重新启动",
+    },
+    "WPS_BUILD_ASSET_CHANGED": {
+        "stage_cn": "校验资源构建",
+        "reason_cn": "服务中的关键资源在启动后发生变化",
+        "action_cn": "停止当前资源服务并重新生成唯一调试包",
+    },
     "WEB_WORKER_UNSUPPORTED": {
         "stage_cn": "检测工作线程能力",
         "reason_cn": "当前 WPS 不支持 classic Worker",
@@ -480,9 +490,18 @@ def format_event(raw: Dict[str, Any]) -> str:
             if value and len(fields) < 6:
                 fields.append(f"{label}：{value}")
     else:
-        for label, value in (("命令", event.command_name), ("结果", event.result_cn), ("耗时", f"{event.duration_ms:g}毫秒" if event.duration_ms is not None else ""), ("请求", event.request_id), ("构建", event.build_id), ("事件码", event.event_code)):
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+        extra_fields = (
+            ("文件", data.get("resource_path")),
+            ("大小", f"{data.get('file_size')}字节" if isinstance(data.get("file_size"), (int, float)) else ""),
+            ("摘要", data.get("file_sha256_prefix")),
+            ("来源", data.get("source_address")),
+            ("端口", data.get("port")),
+        )
+        values = (("命令", event.command_name), ("结果", event.result_cn), ("耗时", f"{event.duration_ms:g}毫秒" if event.duration_ms is not None else ""), ("请求", event.request_id), *extra_fields, ("构建", event.build_id), ("事件码", event.event_code))
+        for label, value in values:
             if value and len(fields) < 6:
-                fields.append(f"{label}：{value}")
+                fields.append(f"{label}：{redact_text(str(value), 160)}")
     if event.technical_detail and len(fields) < 7:
         fields.append(f"技术详情：{event.technical_detail}")
     line = f"{event.timestamp} [{LEVEL_LABELS[event.level]}] [{event.component}] {message}"

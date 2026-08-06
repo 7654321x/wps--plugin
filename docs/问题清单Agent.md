@@ -528,3 +528,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：在固定次数轮询中重复执行 `Get-Process`/`Get-CimInstance`；只增加超时时间；把所有状态读取错误转换为空对象；跳过 PID、路径、命令行、创建时间或哈希校验；用单一 `LOCAL_JOB_BROKER_READY_TIMEOUT` 覆盖具体原因。
 - 正确方案：先严格读取 `status.json` 并执行只读内存/文件的快速就绪检查；快速检查通过后最多执行一次进程身份查询；启动期间使用本次 `Popen.poll()` 和 PID 判断退出；使用 `time.monotonic()` 的 10 秒预算；按状态缺失/损坏、心跳、版本、哈希、合同、PID、进程路径、命令行和创建时间返回稳定错误码，并把阶段、原因、建议和必要期望/实际摘要写入唯一 `wps-plugin.log`。
 - 自动验证门槛：快速检查不调用 PowerShell/CIM；快速检查失败不查询进程；快速检查通过后进程身份查询最多一次；状态缺失、损坏、心跳过期、版本/hash/合同不一致、进程提前退出和身份不一致均返回具体错误码；模拟慢查询时启动预算仍由单调时钟控制；相同 readiness 原因不刷屏；Broker 入口记录启动、runtime 校验、状态文件和就绪/失败阶段。
+
+## P062 WPS 主资源响应被热更新脚本动态改写
+
+- 症状：WPS 调试器报告 `Main resource content verification failed`；`3889/index.html` 返回 200，但响应比构建文件更长并额外包含 `/hot-update-inject.js`。
+- 根因：静态资源服务在 HTTP 响应阶段把磁盘字节解码成文本并插入热更新脚本，再重新编码返回；WPS 校验的是响应原始字节，因此与 `dist/index.html` 不一致。
+- 禁止：对 WPS 主页面执行 `read_text().decode().encode()`、字符串替换、模板拼接、SPA 首页回退或为了热更新改写响应；不得关闭或绕过 WPS 主资源校验。
+- 正确方案：资源服务启动时绑定唯一当前构建目录；`index.html` 和关键 JavaScript 使用 `read_bytes()` 原样响应，并设置实际字节长度、`text/html`/JavaScript Content-Type、no-cache；不存在的 `.js` 直接返回 404。启动探针同时比较状态码、Content-Type、Content-Length、字节长度、SHA-256 和完整字节内容。
+- 自动验证门槛：临时首页包含中文、换行、BOM 或特殊字符时响应字节与原文件完全相同；响应中没有动态注入；`/missing.js` 为非 HTML 404；一致时记录 `wps.resource.index.verify.completed`，不一致时记录 `WPS_INDEX_RESPONSE_MISMATCH`；真实 WPS 未运行时只能记为 `NOT RUN`。
