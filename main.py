@@ -937,7 +937,7 @@ def update_server_owner_metadata() -> None:
     WPSJS_PROCESS.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def register_addin() -> None:
+def register_addin(*, force_restart: bool = False) -> None:
     if is_port_open(WPSJS_PORT):
         report = probe_debug_server()
         metadata = read_json(WPSJS_PROCESS)
@@ -947,7 +947,7 @@ def register_addin() -> None:
         # the port owner PID is not required to equal the recorded Popen PID.
         # The package directory and command kind are the safety boundary.
         managed_owner = Path(str(metadata.get("cwd", ""))).resolve() == DEBUG_PACKAGE.resolve() and bool(owner.get("pid")) and str(DEBUG_PACKAGE) in command_line
-        if report.get("status") == "PASS" and managed_owner and "wps_debug_server.py" in command_line:
+        if not force_restart and report.get("status") == "PASS" and managed_owner and "wps_debug_server.py" in command_line:
             metadata["expected_build_id"] = read_json(DEBUG_MANIFEST).get("build_id", "")
             WPSJS_PROCESS.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
             log_event("INFO", "debug_server.reused", "WPS 资源服务已验证并复用", {"result_cn": "成功"})
@@ -955,6 +955,8 @@ def register_addin() -> None:
         if managed_owner and ("wps_debug_server.py" in command_line or "http.server" in command_line):
             pid = str(owner.get("pid", ""))
             if pid.isdigit():
+                if force_restart:
+                    log_event("INFO", "debug_server.restart", "当前构建已完成，重启 WPS 资源服务", {"stage_cn": "同步当前构建"})
                 subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 for _ in range(20):
                     if not is_port_open(WPSJS_PORT):
@@ -1109,9 +1111,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.action == "start":
             prepare()
-            ensure_control_server()
-            register_addin()
             verify()
+            run_step("同步最终 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "最终 WPS 调试包已同步。", timeout=60)
+            ensure_control_server()
+            register_addin(force_restart=True)
             print_status()
             if wps_is_running() and not plugin_page_loaded([str(item.get("event", "")) for item in diagnostic_events()]):
                 print("启动完成，但当前 WPS 尚未重新加载本次构建。请先正常保存并关闭脱敏测试文档，再完全退出 WPS 后重新打开；不要重复点击旧功能区。", flush=True)

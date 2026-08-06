@@ -536,3 +536,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：对 WPS 主页面执行 `read_text().decode().encode()`、字符串替换、模板拼接、SPA 首页回退或为了热更新改写响应；不得关闭或绕过 WPS 主资源校验。
 - 正确方案：资源服务启动时绑定唯一当前构建目录；`index.html` 和关键 JavaScript 使用 `read_bytes()` 原样响应，并设置实际字节长度、`text/html`/JavaScript Content-Type、no-cache；不存在的 `.js` 直接返回 404。启动探针同时比较状态码、Content-Type、Content-Length、字节长度、SHA-256 和完整字节内容。
 - 自动验证门槛：临时首页包含中文、换行、BOM 或特殊字符时响应字节与原文件完全相同；响应中没有动态注入；`/missing.js` 为非 HTML 404；一致时记录 `wps.resource.index.verify.completed`，不一致时记录 `WPS_INDEX_RESPONSE_MISMATCH`；真实 WPS 未运行时只能记为 `NOT RUN`。
+
+## P063 验证脚本重建 build-info 后复用旧资源服务进程
+
+- 症状：`main.py start` 的 HTTP 首页字节校验通过，但 `wps.resource.index.requested/served` 日志仍显示上一次资源服务进程缓存的 build_id；`dist/ui/build-info.js` 已经是更晚的 build。
+- 根因：启动流程先注册资源服务，再执行 `verify:local-direct`；该验证脚本末尾会重新构建 classified 产物，调试包文件变新而已启动的 Python 资源服务进程仍保留旧 build_id。
+- 禁止：只比较当前磁盘文件的字节就复用资源服务；把 `WPSJS_PROCESS.expected_build_id` 的后写值当作资源服务进程实际 build_id；用旧服务日志证明当前构建已加载。
+- 正确方案：启动时先完成会重建产物的验证，再同步最终调试包；控制服务和资源服务必须在最终 build 确定后启动，资源服务在新启动流程中强制重启，确保进程缓存 build_id 与调试包一致。
+- 自动验证门槛：一次 `main.py start --once` 后，`apps/classified-offline/ui/build-info.js`、`.runtime/wps-debug-package/debug-package.json`、资源服务日志的 build_id 三者一致；首页字节、长度和 SHA-256 仍完全一致；旧受管理资源服务被重启，未知端口进程不被结束。

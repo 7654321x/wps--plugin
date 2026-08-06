@@ -147,3 +147,13 @@ def test_probe_has_hard_index_byte_gate(tmp_path: Path, monkeypatch: pytest.Monk
     report = main.probe_debug_server()
     assert report["status"] == "FAIL"
     assert "WPS_INDEX_RESPONSE_MISMATCH" in report["errors"]
+
+
+def test_start_finalizes_build_before_resource_service() -> None:
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    start = source.index('if args.action == "start":')
+    end = source.index('elif args.action == "prepare":', start)
+    block = source[start:end]
+    assert block.index("verify()") < block.index("同步最终 WPS 调试包")
+    assert block.index("同步最终 WPS 调试包") < block.index("ensure_control_server()")
+    assert "register_addin(force_restart=True)" in block

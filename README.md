@@ -1,4 +1,4 @@
-# Docxtool WPS Control Plane v1.5.2
+# Docxtool WPS Control Plane v1.5.3
 
 本目录是独立于现有 Web 服务的 WPS 加载项工程。第一阶段已建立本地识别适配、脱敏协议、统一命令服务、声明式命令校验、Mock WPS 执行器和两个发行版装配。
 
@@ -7,6 +7,8 @@
 运行期诊断统一写入仓库根目录 `wps-plugin.log`，采用 UTF-8 中文文本格式。错误行包含阶段、原因、处理建议和稳定错误码；连续相同事件只保留一条，日志超限只裁剪历史完整行，不生成轮转副本。运行日志、用户 DOCX、临时运行产物和本机配置均不提交 GitHub。
 
 3889 WPS 资源服务只读取当前构建调试包的静态文件，`index.html` 按原始字节返回，不注入热更新脚本、不重新编码，也不把缺失的 `.js` 请求回退到首页。启动探针会比较首页的状态码、Content-Type、Content-Length、字节长度和 SHA-256；不一致时返回 `WPS_INDEX_RESPONSE_MISMATCH` 并写入同一份中文日志。
+
+`main.py start` 会先完成最终验证和构建，再生成调试包并重启受管理的资源服务，避免验证脚本重新生成 `build-info.js` 后继续复用缓存旧 build_id 的资源服务进程。
 
 常用验证：
 
