@@ -68,6 +68,12 @@ export interface WpsApplicationLike {
   FileSystem?: WpsFileSystemApi;
   OAAssist?: { ShellExecute?: (path: string, args: string) => unknown };
 }
+export interface LocalRecognitionBrokerOptions {
+  brokerVersion?: string;
+  brokerExecutablePathHash?: string;
+  brokerExecutableSha256?: string;
+  queueContractVersion?: number;
+}
 
 const CONTRACT_TYPE_BY_WHEEL_TYPE: Record<string, RecognitionParagraph["recognized_type"]> = {
   title: "main_title", title_cont: "title_continuation", addressing: "recipient",
@@ -306,6 +312,7 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
     private readonly pollMs = 100,
     private readonly maxResultBytes = 20 * 1024 * 1024,
     private readonly diagnostics?: DiagnosticReporter,
+    private readonly broker: LocalRecognitionBrokerOptions = {},
   ) {}
 
   async recognize(snapshot: LocalDocumentSnapshot): Promise<WheelRecognitionPlan> {
@@ -322,6 +329,12 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
     const heartbeat = typeof status.heartbeat_at === "string" ? Date.parse(status.heartbeat_at) : NaN;
     if (status.state !== "READY" && status.state !== "RUNNING") throw new Error("LOCAL_JOB_BROKER_NOT_RUNNING");
     if (!Number.isFinite(heartbeat) || Date.now() - heartbeat > 3_000) throw new Error("LOCAL_JOB_BROKER_STALE");
+    if (this.broker.brokerVersion && (typeof status.pid !== "number" || status.pid <= 0 || typeof status.broker_instance_id !== "string" || !status.broker_instance_id || typeof status.process_created_at !== "string" || !status.process_created_at)) throw new Error("LOCAL_JOB_BROKER_IDENTITY_MISMATCH");
+    if (this.broker.brokerVersion && status.broker_version !== this.broker.brokerVersion) throw new Error("LOCAL_JOB_BROKER_VERSION_MISMATCH");
+    if (this.broker.brokerExecutablePathHash && status.broker_executable_path_hash !== this.broker.brokerExecutablePathHash) throw new Error("LOCAL_JOB_BROKER_IDENTITY_MISMATCH");
+    if (this.broker.brokerExecutableSha256 && status.broker_executable_sha256 !== this.broker.brokerExecutableSha256) throw new Error("LOCAL_JOB_BROKER_HASH_MISMATCH");
+    const queueContractVersion = this.broker.queueContractVersion ?? Number(current.queue_contract_version ?? current.broker_contract_version ?? 1);
+    if (status.contract_version !== Number(current.contract_version ?? 1) || Number(status.queue_contract_version ?? status.contract_version) !== queueContractVersion) throw new Error("LOCAL_JOB_BROKER_CONTRACT_MISMATCH");
     if (status.runtime_version !== current.runtime_version || status.runtime_sha256 !== current.executable_sha256) throw new Error("LOCAL_JOB_BROKER_RUNTIME_MISMATCH");
     const requestId = uuidV4();
     const jobDir = joinPath(joinPath(appData, "Docxtool\\jobs"), requestId);
@@ -349,13 +362,12 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
       },
     };
     const queuedPath = joinPath(jobDir, "queued.json");
-    const queued = { schema_version: 1, job_id: requestId, contract_version: 1, runtime_version: String(current.runtime_version ?? ""), runtime_sha256: String(current.executable_sha256 ?? ""), created_at: new Date().toISOString(), build_id: "legacy-recognize" };
+    const queued = { schema_version: 1, job_id: requestId, contract_version: queueContractVersion, runtime_version: String(current.runtime_version ?? ""), runtime_sha256: String(current.executable_sha256 ?? ""), created_at: new Date().toISOString(), build_id: "legacy-recognize" };
     fs.mkdir(jobDir); fs.writeText(requestPath, JSON.stringify(request)); fs.writeText(queuedPath, JSON.stringify(queued));
     const started = Date.now();
     this.diagnostics?.writeForComponent("recognition-client", "INFO", "host.recognition.job.queued", "本地识别任务已写入文件队列", { request_id: requestId, paragraph_count: snapshot.paragraphs.length, launch_mode: "file_queue_broker" });
     try {
       while (Date.now() - started <= this.timeoutMs) {
-        if (fs.exists(joinPath(jobDir, "cancel.json"))) throw new Error("RECOGNITION_CANCELLED");
         if (fs.exists(resultPath) && fs.exists(finishedPath)) {
           const raw = fs.readText(resultPath);
           if (new TextEncoder().encode(raw).byteLength > this.maxResultBytes) throw new Error("LOCAL_RECOGNITION_RESULT_TOO_LARGE");
@@ -366,6 +378,7 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
           return plan as WheelRecognitionPlan;
         }
         if (fs.exists(errorPath) && fs.exists(finishedPath)) throw new Error(processError(fs.readText(errorPath)));
+        if (fs.exists(joinPath(jobDir, "cancel.json"))) throw new Error("RECOGNITION_CANCELLED");
         await delay(this.pollMs);
       }
       throw new Error("LOCAL_RECOGNITION_TIMEOUT");
@@ -373,7 +386,7 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
       for (const path of [requestPath, resultPath, errorPath]) {
         try { fs.removeFile(path); } catch { /* cleanup must not hide the real error */ }
       }
-      for (const path of [queuedPath, joinPath(jobDir, "claimed.json"), joinPath(jobDir, "launched.json"), joinPath(jobDir, "heartbeat.json"), finishedPath]) {
+      for (const path of [queuedPath, joinPath(jobDir, "claimed.json"), joinPath(jobDir, "claim.lock"), joinPath(jobDir, "launched.json"), joinPath(jobDir, "heartbeat.json"), finishedPath]) {
         try { fs.removeFile(path); } catch { /* cleanup must not hide the real error */ }
       }
       try { fs.removeDirectory(jobDir); } catch { /* cleanup must not hide the real error */ }

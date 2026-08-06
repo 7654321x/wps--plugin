@@ -21,8 +21,12 @@ WPS 线程解耦正在按 Looper 微任务推进。真实 WPS 已确认支持同
 
 ### Local Job Broker
 
-识别进程通过 `main.py` 管理的 `docxtool-job-broker.exe` 启动。WPS Host 只在 `%APPDATA%\Docxtool\jobs\<uuid-v4>\` 写入 `request.json` 与 `queued.json`，Broker 原子领取任务，从受校验的 runtime 清单取得 recognizer 路径和 SHA-256，再以参数数组、`shell=False` 启动识别程序。Broker 只监听文件队列，不开放 HTTP、WebSocket 或 TCP 端口，也不读取 DOCX 正文或处理格式命令。
+识别进程通过 `main.py` 管理的 `docxtool-job-broker.exe` 启动。WPS Host 只在 `%APPDATA%\Docxtool\jobs\<uuid-v4>\` 写入 `request.json` 与 `queued.json`，Broker 使用独占 `claim.lock` 领取任务，从受校验的 runtime 清单取得 recognizer 路径和 SHA-256，再以参数数组、`shell=False` 启动识别程序。Broker 只监听文件队列，不开放 HTTP、WebSocket 或 TCP 端口，也不读取 DOCX 正文或处理格式命令。
 
-Broker 状态位于 `%APPDATA%\Docxtool\broker\status.json`，包含 PID、版本、runtime hash 和心跳；Host 会拒绝未运行、过期或 runtime 不匹配的 Broker。`npm run verify:local-direct` 会验证双 EXE 清单、安装 hash，并通过受管理脱敏 fixture 做一次真实 Broker → recognizer → result smoke。
+Broker 状态位于 `%APPDATA%\Docxtool\broker\status.json`，包含 `broker_instance_id`、PID、进程创建时间、Broker/runtime 版本与 SHA-256、queue contract 和心跳；Host 与 `main.py` 会拒绝身份、版本、hash、合同或生命周期不匹配的 Broker。claim 具有 15 秒租约，失主且过期时写 `recovery.json` 后重新排队；已 launched/result/error 的任务不会重复启动。`npm run verify:local-direct` 会验证双 EXE 清单、安装 hash，并通过受管理脱敏 fixture 做一次真实 Broker → recognizer → result smoke。
+
+### v1.3.2 Preview Mode
+
+线程预览使用三态配置：`disabled` 拒绝线程识别，`diagnostic` 只允许 Worker snapshot 与 Broker 识别并禁止批注/格式写入，`enabled` 才允许现有 Preview Batch。当前默认是 `diagnostic`，`threadedPreviewEnabled` 仍为 `false`；真实 WPS 20/200/1000 识别、正式预览、取消、文档切换和保存后 OOXML 尚未验收，因此不得标记真实通过或进入 T12–T17。
 
 P0 与 T8–T10 已完成：快照批次使用 Host duration 调整，诊断日志有界采样；识别 launch/probe/cancel、Worker 内命令生成和分批预览批注均有自动测试。当前正式线程预览识别启动边界已切换到无端口 Local Job Broker，旧 ShellExecute 识别链不再使用；Broker 独立冒烟和自动门禁通过。`threadedPreviewEnabled` 仍保持 `false`，因为真实 WPS 20/200/1000 识别与正式预览尚未验收，不能提前写 PASS，也不回退旧同步预览。正式 format_document 尚未切换，T12–T17 按停止条件未开始。开发影子快照也已改为只能显式启动，不再自动读取普通打开文档。详细进度见 `.runtime/looper-local-job-broker.md`（本机状态文件，不提交）。

@@ -1,7 +1,7 @@
 import { HOST_RPC_OPERATIONS, type HostRpcOperation, type HostRpcResult, type JsonValue, type PipelineCommand, type PipelineJob, type PipelineWorkerEvent, type WorkerHostRequest, type WorkerToHostMessage } from "./protocol.js";
 
 const ID = /^[A-Za-z0-9_.:-]{1,160}$/;
-const COMMANDS = new Set<PipelineCommand>(["snapshot_shadow", "recognize", "preview", "format", "clear_preview", "cancel"]);
+const COMMANDS = new Set<PipelineCommand>(["snapshot_shadow", "diagnostic", "recognize", "preview", "format", "clear_preview", "cancel"]);
 const OPERATIONS = new Set<HostRpcOperation>(HOST_RPC_OPERATIONS);
 
 function record(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }

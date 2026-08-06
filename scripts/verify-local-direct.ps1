@@ -60,8 +60,9 @@ try {
   $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
   $current = Get-Content -LiteralPath $currentPath -Raw | ConvertFrom-Json
   if ($manifest.schema_version -ne 1 -or $manifest.contract_version -ne 1) { throw "LOCAL_RUNTIME_MANIFEST_INVALID" }
-  if ($manifest.broker_executable -ne "docxtool-job-broker.exe" -or $manifest.broker_contract_version -ne 1) { throw "LOCAL_JOB_BROKER_MANIFEST_INVALID" }
+  if ($manifest.broker_executable -ne "docxtool-job-broker.exe" -or $manifest.broker_contract_version -ne 1 -or $manifest.queue_contract_version -ne 1 -or [string]$manifest.broker_version -ne "1.3.2") { throw "LOCAL_JOB_BROKER_MANIFEST_INVALID" }
   if ($current.schema_version -ne 1 -or $current.contract_version -ne 1) { throw "LOCAL_RUNTIME_CURRENT_INVALID" }
+  if ([string]::IsNullOrWhiteSpace([string]$current.broker_version) -or [string]$current.broker_version -ne [string]$manifest.broker_version -or $current.queue_contract_version -ne 1 -or [string]::IsNullOrWhiteSpace([string]$current.broker_executable_path_hash)) { throw "LOCAL_JOB_BROKER_CURRENT_INVALID" }
   $installedExe = [string]$current.executable_path
   if (-not (Test-Path -LiteralPath $installedExe)) { throw "LOCAL_RUNTIME_CURRENT_PATH_MISSING" }
   if ([string]$installedExe -notmatch [regex]::Escape($env:APPDATA)) { throw "LOCAL_RUNTIME_CURRENT_PATH_MISMATCH" }
@@ -72,7 +73,20 @@ try {
   $installedBroker = [string]$current.broker_executable_path
   if (-not (Test-Path -LiteralPath $installedBroker)) { throw "LOCAL_JOB_BROKER_CURRENT_PATH_MISSING" }
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installedBroker).Hash.ToLowerInvariant() -ne $brokerHash) { throw "LOCAL_JOB_BROKER_SHA256_MISMATCH" }
+  $pathHashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $pathHashInput = [System.Text.Encoding]::UTF8.GetBytes($installedBroker.ToLowerInvariant().Replace('/', '\'))
+    $pathHash = ([System.BitConverter]::ToString($pathHashAlgorithm.ComputeHash($pathHashInput))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $pathHashAlgorithm.Dispose()
+  }
+  if ($pathHash -ne [string]$current.broker_executable_path_hash) { throw "LOCAL_JOB_BROKER_IDENTITY_MISMATCH" }
   if ([string]$manifest.recognition_package_version -ne [string]$current.recognition_package_version) { throw "LOCAL_RUNTIME_PACKAGE_VERSION_MISMATCH" }
+  $statusPath = [string]$current.broker_status_path
+  if (-not (Test-Path -LiteralPath $statusPath)) { throw "LOCAL_JOB_BROKER_STATUS_MISSING" }
+  $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+  if ($status.state -notin @("READY", "RUNNING") -or [int]$status.pid -le 0 -or [string]::IsNullOrWhiteSpace([string]$status.broker_instance_id) -or [string]::IsNullOrWhiteSpace([string]$status.process_created_at)) { throw "LOCAL_JOB_BROKER_IDENTITY_MISMATCH" }
+  if ([string]$status.broker_version -ne [string]$current.broker_version -or [string]$status.broker_executable_path_hash -ne [string]$current.broker_executable_path_hash -or [string]$status.broker_executable_sha256 -ne [string]$current.broker_sha256 -or $status.queue_contract_version -ne [int]$current.queue_contract_version) { throw "LOCAL_JOB_BROKER_STATUS_MISMATCH" }
 
   $python = Join-Path $root ".venv\Scripts\python.exe"
   & $python (Join-Path $root "scripts\verify-local-recognizer-smoke.py") (Join-Path $root "tests\fixtures\wps-e2e-baseline.docx")

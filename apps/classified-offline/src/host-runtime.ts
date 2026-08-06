@@ -213,12 +213,14 @@ export class LocalApplicationRuntime {
   private async documentIdentity(): Promise<string> { const document = this.app.ActiveDocument; if (!document) throw new Error("ACTIVE_DOCUMENT_NOT_FOUND"); return hash(`${document.FullName ?? "unsaved"}|${document.Paragraphs?.Count ?? 0}`); }
   private async recognize(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const recognition = await this.composition().recognizeUseCase.execute(); const models = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review })); const review = models.filter((item) => item.needs_review).length; this.store.update({ document_identity_hash: identity, paragraph_recognition_models: models, recognition_summary: `总段落 ${models.length}；需要复核 ${review}`, active_view: "recognition" }); return "识别完成"; }
   private async preview(_result: CommandResult): Promise<string> {
-    if (this.config.threadedPreviewEnabled !== true) throw new Error("THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED");
-    const receipt = this.pipelineStart?.("preview");
+    const mode = this.config.threadedPreviewMode ?? (this.config.threadedPreviewEnabled === true ? "enabled" : "disabled");
+    if (mode === "disabled") throw new Error("THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED");
+    const command = mode === "diagnostic" ? "diagnostic" : "preview";
+    const receipt = mode === "diagnostic" ? this.pipelineStart?.("diagnostic") : this.pipelineStart?.("preview");
     if (!receipt) throw new Error("PIPELINE_WORKER_NOT_READY");
     if (!receipt.accepted) throw new Error(receipt.reason ?? "PIPELINE_START_REJECTED");
-    this.store.update({ active_view: "preview", formatting_progress: "预览任务已提交，正在后台处理", preview_comment_status: "等待后台识别和批注", latest_error: "" });
-    return "预览任务已提交";
+    this.store.update({ active_view: mode === "diagnostic" ? "recognition" : "preview", formatting_progress: mode === "diagnostic" ? "诊断识别任务已提交，后台仅读取不写入" : "预览任务已提交，正在后台处理", preview_comment_status: mode === "diagnostic" ? "诊断模式：不会写入批注或格式" : "等待后台识别和批注", latest_error: "" });
+    return mode === "diagnostic" ? "诊断识别任务已提交" : "预览任务已提交";
   }
   /** @deprecated Retained only for legacy equivalence tests; production routing never calls it. */
   private async legacyPreview(result: CommandResult): Promise<string> {
@@ -291,6 +293,8 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
   if (!adapter.exists(normalizedManifestPath)) return null;
   const manifest = parse<Record<string, unknown>>(adapter.readText(normalizedManifestPath));
   if (!manifest) return null;
+  const currentPath = expandAppDataPath(application, "%APPDATA%\\Docxtool\\runtime\\current.json");
+  const current = currentPath && adapter.exists(currentPath) ? parse<Record<string, unknown>>(adapter.readText(currentPath)) : null;
   const executablePath = typeof manifest.executable_path === "string"
     ? manifest.executable_path
     : typeof manifest.executable === "string" && manifest.executable.includes("\\")
@@ -305,6 +309,10 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
     runtimeSha256: typeof manifest.executable_sha256 === "string" ? manifest.executable_sha256 : typeof manifest.sha256 === "string" ? manifest.sha256 : "",
     recognitionPackageVersion: typeof manifest.recognition_package_version === "string" ? manifest.recognition_package_version : typeof manifest.recognitionPackageVersion === "string" ? manifest.recognitionPackageVersion : undefined,
     contractVersion: typeof manifest.contract_version === "number" ? manifest.contract_version : typeof manifest.contractVersion === "number" ? manifest.contractVersion : undefined,
+    brokerVersion: typeof current?.broker_version === "string" ? current.broker_version : typeof manifest.broker_version === "string" ? manifest.broker_version : undefined,
+    brokerExecutablePathHash: typeof current?.broker_executable_path_hash === "string" ? current.broker_executable_path_hash : undefined,
+    brokerExecutableSha256: typeof current?.broker_sha256 === "string" ? current.broker_sha256 : typeof manifest.broker_sha256 === "string" ? manifest.broker_sha256 : undefined,
+    queueContractVersion: typeof current?.queue_contract_version === "number" ? current.queue_contract_version : typeof manifest.queue_contract_version === "number" ? manifest.queue_contract_version : typeof manifest.broker_contract_version === "number" ? manifest.broker_contract_version : undefined,
     runtimeManifestPath: normalizedManifestPath,
     diagnosticLogPath: typeof manifest.diagnostic_log_path === "string" ? normalizeWpsPath(manifest.diagnostic_log_path) : undefined,
   };
@@ -317,7 +325,9 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
   if (manifestPath) {
     const manifest = readRuntimeManifest(application, manifestPath);
     if (manifest) {
-      manifest.threadedPreviewEnabled = direct.threadedPreviewEnabled === true;
+      const directMode = direct.threadedPreviewMode;
+      manifest.threadedPreviewMode = directMode === "disabled" || directMode === "diagnostic" || directMode === "enabled" ? directMode : direct.threadedPreviewEnabled === true ? "enabled" : "disabled";
+      manifest.threadedPreviewEnabled = manifest.threadedPreviewMode === "enabled";
       manifest.launchProbeExecutablePath = typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined;
       manifest.brokerStatusPath = typeof direct.brokerStatusPath === "string" ? expandAppDataPath(application, direct.brokerStatusPath) : manifest.brokerStatusPath;
       manifest.brokerJobsPath = typeof direct.brokerJobsPath === "string" ? expandAppDataPath(application, direct.brokerJobsPath) : manifest.brokerJobsPath;
@@ -338,6 +348,11 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
       runtimeManifestPath: manifestPath || direct.runtimeManifestPath,
       diagnosticLogPath: direct.diagnosticLogPath,
       threadedPreviewEnabled: direct.threadedPreviewEnabled === true,
+      threadedPreviewMode: direct.threadedPreviewMode === "disabled" || direct.threadedPreviewMode === "diagnostic" || direct.threadedPreviewMode === "enabled" ? direct.threadedPreviewMode : direct.threadedPreviewEnabled === true ? "enabled" : "disabled",
+      brokerVersion: direct.brokerVersion,
+      brokerExecutablePathHash: direct.brokerExecutablePathHash,
+      brokerExecutableSha256: direct.brokerExecutableSha256,
+      queueContractVersion: direct.queueContractVersion,
     };
     application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(value));
     return value;
@@ -386,11 +401,18 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   const onPipelineEvent = (event: PipelineWorkerEvent) => {
     if (event.type === "pipeline.ready") { hostLog("INFO", "pipeline.worker.ready", "后台线程状态机已就绪", { build_id: event.build_id }); return; }
     if (event.type === "pipeline.diagnostic") { hostLog("DEBUG", event.event, "后台线程快照阶段事件", event.data); return; }
-    if (event.type === "pipeline.progress") { store.update({ formatting_progress: event.detail }); hostLog("DEBUG", activePipelineCommand === "preview" ? "pipeline.preview.progress" : "worker.snapshot.shadow.progress", event.detail, { stage: event.stage, completed: event.completed, total: event.total, batch_size: event.batch_size }); return; }
+    if (event.type === "pipeline.progress") { store.update({ formatting_progress: event.detail }); hostLog("DEBUG", activePipelineCommand === "preview" ? "pipeline.preview.progress" : activePipelineCommand === "diagnostic" ? "pipeline.diagnostic.progress" : "worker.snapshot.shadow.progress", event.detail, { stage: event.stage, completed: event.completed, total: event.total, batch_size: event.batch_size }); return; }
     const mainThreadMaxDrift = stopHeartbeat();
     pipelineBusy = false; hostWindow.DocxtoolCommandBusy = running; invalidate();
     const current = store.read().active_command;
-    if (event.type === "pipeline.completed" && event.command === "preview" && event.recognition_result && event.formatting_commands && event.preview_result) {
+    if (event.type === "pipeline.completed" && event.command === "diagnostic" && event.recognition_result) {
+      const recognition = event.recognition_result;
+      const recognitionModels = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review }));
+      const unresolved = recognition.unresolved_blocks?.length ?? 0;
+      const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index)).size;
+      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "诊断识别完成（未写入）", finished_at: now() } : null, active_view: "recognition", recognition_summary: `总段落 ${recognitionModels.length + unresolved}；需要复核 ${recognitionModels.filter((item) => item.needs_review).length + unresolved}`, paragraph_recognition_models: recognitionModels, formatting_preview_models: [], preview_comment_status: "诊断模式：未写入批注或格式", formatting_progress: "诊断识别完成", formatting_result: "诊断模式未生成格式命令", latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
+      hostLog("INFO", "pipeline.diagnostic.complete", "后台线程诊断识别完成（未写入）", { ...event.snapshot_summary, recognized_paragraph_count: recognition.paragraphs.length, unresolved_block_count: unresolved, mixed_paragraph_count: mixed, main_thread_max_drift_ms: mainThreadMaxDrift });
+    } else if (event.type === "pipeline.completed" && event.command === "preview" && event.recognition_result && event.formatting_commands && event.preview_result) {
       const recognition = event.recognition_result; const commands = event.formatting_commands; const grouped = new Map<number, FormattingCommandSet["commands"]>();
       for (const command of commands.commands) { const values = grouped.get(command.target.source_paragraph_index) ?? []; values.push(command); grouped.set(command.target.source_paragraph_index, values); }
       const recognitionModels = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review }));
@@ -404,7 +426,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     activePipelineCommand = null;
   };
   const debugProbeEnabled = ["127.0.0.1", "localhost"].includes(hostWindow.location.hostname);
-  const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, brokerStatusPath: config.brokerStatusPath, brokerJobsPath: config.brokerJobsPath, brokerRuntimeVersion: config.runtimeVersion, brokerRuntimeSha256: config.runtimeSha256, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
+  const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, brokerStatusPath: config.brokerStatusPath, brokerJobsPath: config.brokerJobsPath, brokerRuntimeVersion: config.runtimeVersion, brokerRuntimeSha256: config.runtimeSha256, brokerVersion: config.brokerVersion, brokerExecutablePathHash: config.brokerExecutablePathHash, brokerExecutableSha256: config.brokerExecutableSha256, brokerQueueContractVersion: config.queueContractVersion, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
   hostWindow.DocxtoolNativeLaunchProbe = async () => {
     if (!debugProbeEnabled) throw new Error("HOST_DEBUG_PROBE_DISABLED");
     const response = await hostBridge.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: id("launch-probe"), job_id: id("launch-probe-job"), build_id: build.build_id, payload: {} });

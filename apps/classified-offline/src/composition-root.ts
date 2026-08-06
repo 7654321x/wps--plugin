@@ -19,6 +19,11 @@ export interface ClassifiedRuntimeConfig {
   runtimeManifestPath?: string;
   diagnosticLogPath?: string;
   threadedPreviewEnabled?: boolean;
+  threadedPreviewMode?: "disabled" | "diagnostic" | "enabled";
+  brokerVersion?: string;
+  brokerExecutablePathHash?: string;
+  brokerExecutableSha256?: string;
+  queueContractVersion?: number;
 }
 
 type ProfileWindow = typeof globalThis & {
@@ -54,6 +59,7 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
       100,
       20 * 1024 * 1024,
       diagnostics,
+      { brokerVersion: config.brokerVersion, brokerExecutablePathHash: config.brokerExecutablePathHash, brokerExecutableSha256: config.brokerExecutableSha256, queueContractVersion: config.queueContractVersion },
     ),
   );
   const commands = new LocalFormatCommandGenerator(readDefaultProfile());

@@ -119,7 +119,7 @@ export class SnapshotPipelineWorkerRuntime {
     try { job = parsePipelineJob(message.job); }
     catch { return; }
     if (job.build_id !== this.buildId) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUILD_MISMATCH", message: "PIPELINE_BUILD_MISMATCH" } }); return; }
-    if (!["snapshot_shadow", "recognize", "preview"].includes(job.command)) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_COMMAND_NOT_IMPLEMENTED", message: "PIPELINE_COMMAND_NOT_IMPLEMENTED" } }); return; }
+    if (!["snapshot_shadow", "diagnostic", "recognize", "preview"].includes(job.command)) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_COMMAND_NOT_IMPLEMENTED", message: "PIPELINE_COMMAND_NOT_IMPLEMENTED" } }); return; }
     if (this.active) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUSY", message: "PIPELINE_BUSY" } }); return; }
     const context: SnapshotJobContext = { job, stage: "idle", cancelled: false, descriptor: null, paragraphs: [], started_at_ms: performance.now(), batch: new AdaptiveBatchController(), batch_sizes: [], host_rpc_durations: [], worker_roundtrip_durations: [], recognition_job_id: null, preview_session_id: null };
     this.active = context;

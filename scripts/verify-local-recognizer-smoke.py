@@ -66,7 +66,7 @@ def main() -> int:
         (job / "queued.json").write_text(json.dumps({
             "schema_version": 1,
             "job_id": job_id,
-            "contract_version": 1,
+            "contract_version": int(current.get("queue_contract_version", current.get("broker_contract_version", 1))),
             "runtime_version": current["runtime_version"],
             "runtime_sha256": current["executable_sha256"],
             "created_at": "2026-08-06T00:00:00Z",

@@ -108,6 +108,7 @@ test("classic Worker capability probe refuses unsupported hosts without fallback
 
 test("threading protocol accepts only pure-data jobs and known Host RPC operations", () => {
   assert.equal(parsePipelineJob({ job_id: "pipeline-1", command: "preview", build_id: "build-1", created_at: "2026-08-05T00:00:00.000Z" }).command, "preview");
+  assert.equal(parsePipelineJob({ job_id: "pipeline-diagnostic", command: "diagnostic", build_id: "build-1", created_at: "2026-08-05T00:00:00.000Z" }).command, "diagnostic");
   const request = parseWorkerHostRequest({ type: "host.rpc.request", operation: "host.read_paragraph_batch", rpc_id: "rpc-1", job_id: "pipeline-1", build_id: "build-1", document_token: "doc-1", payload: { start_index: 0, batch_size: 5 } });
   assert.equal(request.operation, "host.read_paragraph_batch");
   assert.throws(() => parseWorkerHostRequest({ ...request, payload: { application: { call() {} } } }), /INVALID_HOST_RPC_REQUEST/);
@@ -1102,6 +1103,15 @@ test("production preview is safely blocked unless the threaded launch gate is ex
   assert.deepEqual(calls, []);
 });
 
+test("diagnostic preview uses the Worker recognition path without writing preview", async () => {
+  const mocks = hostMocks(); const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
+  const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a", threadedPreviewMode: "diagnostic" }); const calls = [];
+  runtime.attachPipelineStarter((command) => { calls.push(command); return { accepted: true, command_id: "diagnostic-worker-1", command_name: command }; });
+  const result = await runtime.run("preview_document", "ribbon", "diagnostic-request-1", "build-a");
+  assert.equal(result.status, "PASS"); assert.equal(result.summary, "诊断识别任务已提交"); assert.deepEqual(calls, ["diagnostic"]);
+});
+
 test("development recognition launch probe reuses the production Worker command without invoking preview", async () => {
   const source = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
   const marker = source.slice(source.indexOf("if (developmentE2E &&"), source.indexOf("void runAutomaticHostAcceptance"));
@@ -1200,6 +1210,7 @@ test("production preview starts only the Worker while legacy preview remains unr
   const shadowBlock = host.slice(host.indexOf("hostWindow.DocxtoolRunSnapshotShadow ="), host.indexOf("hostWindow.DocxtoolCancelSnapshotShadow ="));
 
   assert.match(previewBlock, /this\.pipelineStart\?\.\("preview"\)/);
+  assert.match(previewBlock, /this\.pipelineStart\?\.\("diagnostic"\)/);
   assert.equal(previewBlock.includes("previewUseCase.execute"), false);
   assert.equal(previewBlock.includes("readSnapshot"), false);
   assert.match(legacyPreviewBlock, /this\.composition\(\)\.previewUseCase\.execute/);

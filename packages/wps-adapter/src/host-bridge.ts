@@ -17,6 +17,10 @@ export interface WpsHostBridgeOptions {
   brokerJobsPath?: string;
   brokerRuntimeVersion?: string;
   brokerRuntimeSha256?: string;
+  brokerVersion?: string;
+  brokerExecutablePathHash?: string;
+  brokerExecutableSha256?: string;
+  brokerQueueContractVersion?: number;
   probeExecutablePath?: string;
   enableDebugProbes?: boolean;
 }
@@ -41,7 +45,7 @@ export class WpsHostBridge {
   private readonly recognitionJobs: WpsRecognitionJobService | null;
   private readonly previewBatches: WpsPreviewBatchService;
   constructor(private readonly application: WpsObject, private readonly diagnostics?: DiagnosticReporter, private readonly options: WpsHostBridgeOptions = {}) {
-    this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics, { statusPath: options.brokerStatusPath, jobsPath: options.brokerJobsPath, runtimeVersion: options.brokerRuntimeVersion, runtimeSha256: options.brokerRuntimeSha256, contractVersion: options.recognitionContractVersion }) : null;
+    this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics, { statusPath: options.brokerStatusPath, jobsPath: options.brokerJobsPath, runtimeVersion: options.brokerRuntimeVersion, runtimeSha256: options.brokerRuntimeSha256, contractVersion: options.recognitionContractVersion, queueContractVersion: options.brokerQueueContractVersion, brokerVersion: options.brokerVersion, brokerExecutablePathHash: options.brokerExecutablePathHash, brokerExecutableSha256: options.brokerExecutableSha256 }) : null;
     this.previewBatches = new WpsPreviewBatchService(application);
   }
 

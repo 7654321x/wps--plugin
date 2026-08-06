@@ -438,8 +438,8 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 症状：PyInstaller one-file Broker 会由启动器产生实际工作 PID；构建重装时旧 EXE 可能占用安装文件，若只记录 `Popen` 父 PID，`main.py stop` 不能准确停止实际 Broker。
 - 根因：Windows one-file 启动器 PID 与状态文件中的实际运行 PID 可能不同；未经归属校验的进程结束会扩大影响范围。
 - 禁止：结束所有同名 Python/EXE、用未知 PID 重启、复制覆盖被运行 Broker 锁定的 EXE、把 stale 状态直接当成可杀进程。
-- 正确方案：`main.py` 只接受 `current.json` 中的 Broker 路径与 hash；以 WMI 精确匹配 executable path 后停止，启动后以 Broker `status.json` 的实际 PID 更新受管理元数据；安装脚本同样只停止旧清单指向的精确路径。
-- 自动验证门槛：Broker `--help`、`--once`、PyInstaller 构建、安装后 hash、healthy reuse、stale restart 和未知 PID 不结束均有自动门槛；任务完成不删除用户文档或未知进程。
+- 正确方案：`main.py` 只接受 `current.json` 中的 Broker 路径与 hash；优先以 WMI 精确匹配 executable path 停止，PyInstaller one-file 暴露空路径时再同时要求受信 `status.json` 的 path hash、PID 创建时间和同一启动树父/子关系；安装脚本使用同一范围。PowerShell 时间解析必须明确按 UTC 处理。
+- 自动验证门槛：Broker `--help`、`--once`、PyInstaller 构建、安装后 hash、healthy reuse、stale restart、运行中重装和未知 PID 不结束均有自动门槛；任务完成不删除用户文档或未知进程，不得使用 `$PID` 作为自定义变量。
 
 ## P049 WPS 原生启动探针误带 Params 参数
 
@@ -448,3 +448,35 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：在单参数探针中传空字符串、`undefined`、参数数组或任何命令行；不要把探针直接接入正式识别或打开生产线程预览。
 - 正确方案：探针只调用 `OAAssist.ShellExecute(probeExecutablePath)`，由独立 EXE 原子写入 `%APPDATA%\Docxtool\launch-probe\process-started.json` 后退出；仅 localhost debug RPC 可触发，真实通过前保持 `threadedPreviewEnabled=false`。
 - 自动验证门槛：Node 测试断言 `ShellExecute` 参数数组长度为 1；Python 探针测试和 PyInstaller EXE 启动均生成 `schema_version=1`、`argv_count=1` 标记；真实 WPS 记录 Host 返回耗时和 5 秒内标记文件是否出现。
+
+## P052 Broker 身份不能只依赖 PID 和 heartbeat
+
+- 症状：旧 Broker 可能继续写出新鲜 heartbeat，或 PID 被系统复用；只读 `status.json` 的 READY、PID 和 heartbeat 会把错误进程当成当前 Broker。
+- 根因：PID 与时间上的进程身份不是稳定身份，runtime/Broker 文件替换后还可能留下旧 status。
+- 禁止：只要 status 存在就复用；只要 PID 存活就停止或启动；只用 heartbeat 判断 Broker 健康。
+- 正确方案：同时校验 `broker_instance_id`、PID 对应进程创建时间、精确 EXE 路径、Broker EXE SHA-256、runtime 版本/SHA-256、Broker 版本、queue contract 和未过期 heartbeat；不匹配时返回稳定身份/版本/hash/contract 错误，不误杀未知进程。
+- 自动验证门槛：status identity 字段、旧版本 status、路径/hash/版本/contract 不匹配、PyInstaller 父子 PID、healthy reuse 和 stale restart 均有测试或本地门禁；`npm run verify:local-direct` 必须通过。
+
+## P053 文件队列 claim 必须 exactly-once，并具备租约恢复
+
+- 症状：只用 `os.replace(queued.json, claimed.json)` 无法表达两个 Broker 的独占领取；Broker 在 claim 后崩溃可能让任务永久卡住或重复启动。
+- 根因：rename 不是跨实例的 claim ownership 合同，也没有失主判断、租约和崩溃恢复边界。
+- 禁止：覆盖已有 claim；按 mtime 抢占；owner 仍存活时回收；已 launched/result/error 的任务重新排队；只凭单次扫描宣称 exactly-once。
+- 正确方案：每个 UUID v4 任务先用 `claim.lock` 的 `O_CREAT|O_EXCL` 独占创建，写入 Broker instance/PID/创建时间和 15 秒 lease；lease 过期且 owner 已失效才写 `recovery.json`、清理失效 claim 并重新排队；有效 result 优先于 error/cancel，Worker 清理终态目录不产生伪造失败。
+- 自动验证门槛：双 Broker 竞争只能有一个 Popen；存活 claim 不回收；失主过期 claim 可恢复；launched/result/error 不重复启动；Worker 清理 result 后 Broker 不写 `LOCAL_RECOGNITION_RESULT_MISSING`。
+
+## P054 threaded preview 必须三态控制
+
+- 症状：单一 `threadedPreviewEnabled` 布尔值无法区分关闭、只诊断识别和允许正式批注预览的风险等级。
+- 根因：识别链稳定性验收与正式 WPS 文档写入被同一个开关绑定，容易在真实证据不足时误开启 Preview Batch。
+- 禁止：全局硬编码 `true`；诊断失败回退旧同步预览；diagnostic 模式写批注或格式；未完成真实 20/200/1000 识别就开启 enabled。
+- 正确方案：`disabled` 拒绝线程识别，`diagnostic` 只跑 Worker snapshot/Broker recognition 与 blocks/binding 校验，`enabled` 才调用现有 Preview Batch；任何模式都不回退同步旧链。v1.3.2 默认保持 `diagnostic` + `threadedPreviewEnabled=false`。
+- 自动验证门槛：Node 测试覆盖三态、diagnostic 零写入、enabled 走 Preview Batch 和无同步 fallback；真实 WPS 20/200/1000 证据完成前 Looper 状态必须保持 `READY_FOR_REAL_WPS_VALIDATION`。
+
+## P055 Worker 清理终态任务与 Broker reap 存在竞态
+
+- 症状：Worker 已读到有效 `result.json` 并删除任务目录，Broker 下一轮 reap 找不到目录，却把任务写成 `LOCAL_RECOGNITION_RESULT_MISSING`。
+- 根因：Worker 的终态清理可能先于 Broker 读取 result；Broker 把“结果已被消费”的缺失目录误判为“识别器没有结果”。
+- 禁止：任务目录消失后重新创建 heartbeat/error；用 status 的旧 `last_error_code` 代替当前任务结果；在 Worker 已收到有效 result 后覆盖为失败。
+- 正确方案：active recognizer 的任务目录消失时等待进程退出并关闭 active，不重建目录、不生成伪造错误；成功 result 清空当前 Broker 错误码；所有客户端清理必须同时清除 `claim.lock`。
+- 自动验证门槛：Python 回归覆盖 result 后目录清理；安装后的 Broker smoke 通过且 status `last_error_code` 为空；TypeScript recognition-client 和 WPS adapter 清理列表包含 `claim.lock`。

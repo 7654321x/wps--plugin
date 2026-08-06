@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -186,16 +187,36 @@ def process_is_alive(pid: object) -> bool:
         return False
 
 
-def managed_broker_process(pid: object, executable: Path) -> bool:
+def process_metadata(pid: object) -> Dict[str, object]:
     if not process_is_alive(pid):
-        return False
-    script = f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; if($p){{$p.ExecutablePath; $p.CommandLine}}"
+        return {}
+    script = f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; if($p){{[pscustomobject]@{{pid=$p.ProcessId; executable_path=$p.ExecutablePath; command_line=$p.CommandLine; process_created_at=$p.CreationDate.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress}}"
     try:
         output = subprocess.check_output(["pwsh", "-NoProfile", "-Command", script], cwd=str(ROOT), text=True, encoding="utf-8", errors="replace", timeout=10)
-        value = output.lower()
-        return str(executable).lower() in value and "docxtool-job-broker" in value
-    except (OSError, subprocess.SubprocessError, ValueError):
+        value = json.loads(output) if output.strip() else {}
+        return value if isinstance(value, dict) else {}
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def timestamps_match(left: object, right: object) -> bool:
+    try:
+        first = datetime.fromisoformat(str(left).replace("Z", "+00:00")).astimezone(timezone.utc)
+        second = datetime.fromisoformat(str(right).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return abs((first - second).total_seconds()) <= 2
+    except (TypeError, ValueError, OverflowError):
         return False
+
+
+def managed_broker_process(pid: object, executable: Path, expected_created_at: object = None) -> bool:
+    value = process_metadata(pid)
+    if not value:
+        return False
+    if str(value.get("executable_path", "")).lower() != str(executable).lower():
+        return False
+    if "docxtool-job-broker" not in str(value.get("command_line", "")).lower():
+        return False
+    return expected_created_at is not None and timestamps_match(value.get("process_created_at"), expected_created_at)
 
 
 def broker_healthy(current: Dict[str, object], status: Dict[str, object]) -> bool:
@@ -206,7 +227,23 @@ def broker_healthy(current: Dict[str, object], status: Dict[str, object]) -> boo
         heartbeat_ms = calendar.timegm(time.strptime(heartbeat[:19], "%Y-%m-%dT%H:%M:%S"))
     except (ValueError, OverflowError):
         return False
-    return time.time() - heartbeat_ms <= 3 and process_is_alive(status.get("pid")) and status.get("runtime_version") == current.get("runtime_version") and status.get("runtime_sha256") == current.get("executable_sha256")
+    if time.time() - heartbeat_ms > 3:
+        return False
+    if not status.get("broker_instance_id") or not status.get("process_created_at"):
+        return False
+    if status.get("broker_version") != current.get("broker_version"):
+        return False
+    if status.get("broker_executable_path_hash") != current.get("broker_executable_path_hash"):
+        return False
+    if status.get("broker_executable_sha256") != current.get("broker_sha256"):
+        return False
+    if status.get("queue_contract_version") != current.get("queue_contract_version", current.get("broker_contract_version")):
+        return False
+    if status.get("contract_version") != current.get("contract_version"):
+        return False
+    if status.get("runtime_version") != current.get("runtime_version") or status.get("runtime_sha256") != current.get("executable_sha256"):
+        return False
+    return managed_broker_process(status.get("pid"), Path(str(current.get("broker_executable_path", ""))), status.get("process_created_at"))
 
 
 def stop_job_broker() -> None:
@@ -214,7 +251,7 @@ def stop_job_broker() -> None:
     executable = Path(str(current.get("broker_executable_path", "")))
     metadata = read_json(JOB_BROKER_PROCESS)
     pid = metadata.get("pid")
-    if not pid or not managed_broker_process(pid, executable):
+    if not pid or not managed_broker_process(pid, executable, metadata.get("process_created_at")):
         return
     subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     for _ in range(20):
@@ -241,11 +278,13 @@ def ensure_job_broker() -> Dict[str, object]:
     status = broker_status()
     if broker_healthy(current, status):
         JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
-        JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+        JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"本地任务 Broker 已复用（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
         return status
     stale_pid = status.get("pid")
-    if stale_pid and managed_broker_process(stale_pid, executable):
+    if stale_pid and process_is_alive(stale_pid) and not managed_broker_process(stale_pid, executable, status.get("process_created_at")):
+        raise StepFailed("启动本地任务 Broker", "Broker 身份校验", "LOCAL_JOB_BROKER_IDENTITY_MISMATCH")
+    if stale_pid and managed_broker_process(stale_pid, executable, status.get("process_created_at")):
         subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     log_path = ROOT / ".runtime" / "logs" / "local-job-broker.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,12 +295,12 @@ def ensure_job_broker() -> Dict[str, object]:
     process = subprocess.Popen([str(executable), "run"], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT, creationflags=creationflags, close_fds=True)
     log_handle.close()
     JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
-    JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, ensure_ascii=False, indent=2), encoding="utf-8")
+    JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "process_created_at": process_metadata(process.pid).get("process_created_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
     for _ in range(50):
         time.sleep(0.1)
         status = broker_status()
         if broker_healthy(current, status):
-            JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"本地任务 Broker 已就绪（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
             return status
         if process.poll() is not None:

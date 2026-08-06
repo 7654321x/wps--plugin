@@ -5,7 +5,17 @@ import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 
 type WpsObject = Record<string, any>;
 interface StoredJob { handle: RecognitionJobHandle; request_id: string; job_dir: string; terminal: RecognitionJobStatus | null; }
-export interface RecognitionBrokerOptions { statusPath?: string; jobsPath?: string; runtimeVersion?: string; runtimeSha256?: string; contractVersion?: number; }
+export interface RecognitionBrokerOptions {
+  statusPath?: string;
+  jobsPath?: string;
+  runtimeVersion?: string;
+  runtimeSha256?: string;
+  contractVersion?: number;
+  queueContractVersion?: number;
+  brokerVersion?: string;
+  brokerExecutablePathHash?: string;
+  brokerExecutableSha256?: string;
+}
 
 function joinPath(left: string, right: string): string { return left.replace(/[\\/]+$/, "") + "\\" + right.replace(/^[\\/]+/, ""); }
 function parseObject(raw: string, errorCode: string): Record<string, unknown> {
@@ -62,7 +72,7 @@ export class WpsRecognitionJobService {
     const cancelPath = joinPath(jobDir, "cancel.json");
     const handle: RecognitionJobHandle = { recognition_job_id: requestId, queued_at: new Date().toISOString(), request_path: requestPath, result_path: resultPath, error_path: errorPath, cancel_path: cancelPath, launch_mode: "file_queue_broker" };
     const request = { schema_version: 1, request_id: requestId, source_path: snapshot.localDocxPath, result_path: resultPath, error_path: errorPath, host_snapshot: { host_type: "wps", document_identity: snapshot.documentId, document_revision: snapshot.revision, text_contract_version: HOST_TEXT_CONTRACT_VERSION, paragraphs: snapshot.paragraphs.map((item) => ({ host_paragraph_index: item.sourceParagraphIndex, raw_text: item.text, story_type: "main", is_in_table: item.isInTable })) } };
-    const queued = { schema_version: 1, job_id: requestId, contract_version: this.broker.contractVersion ?? 1, runtime_version: this.broker.runtimeVersion ?? "", runtime_sha256: this.broker.runtimeSha256 ?? "", created_at: handle.queued_at, build_id: "wps-host" };
+    const queued = { schema_version: 1, job_id: requestId, contract_version: this.broker.queueContractVersion ?? this.broker.contractVersion ?? 1, runtime_version: this.broker.runtimeVersion ?? "", runtime_sha256: this.broker.runtimeSha256 ?? "", created_at: handle.queued_at, build_id: "wps-host" };
     const started = performance.now();
     try {
       fs.mkdir(jobDir);
@@ -83,12 +93,6 @@ export class WpsRecognitionJobService {
     if (job.terminal) return job.terminal;
     const fs = new WpsLocalFileSystem(this.application.FileSystem);
     const finishedPath = joinPath(job.job_dir, "finished.json");
-    if (fs.exists(job.handle.error_path) && fs.exists(finishedPath)) {
-      const code = processError(fs.readText(job.handle.error_path));
-      job.terminal = { state: code === "RECOGNITION_CANCELLED" ? "cancelled" : "failed", ...(code === "RECOGNITION_CANCELLED" ? {} : { error: { code, message: code } }) } as RecognitionJobStatus;
-      this.cleanup(job);
-      return job.terminal;
-    }
     if (fs.exists(job.handle.result_path) && fs.exists(finishedPath)) {
       const raw = fs.readText(job.handle.result_path);
       if (new TextEncoder().encode(raw).byteLength > this.maxResultBytes) throw new Error("LOCAL_RECOGNITION_RESULT_TOO_LARGE");
@@ -99,6 +103,13 @@ export class WpsRecognitionJobService {
       job.terminal = { state: "completed", recognition_plan: plan as JsonValue };
       this.cleanup(job);
       this.diagnostics?.writeForComponent("wps-recognition-broker", "INFO", "recognition.result.ready", "本地识别结果已就绪", { recognition_job_id: recognitionJobId });
+      return job.terminal;
+    }
+    if (fs.exists(job.handle.error_path) && fs.exists(finishedPath)) {
+      const code = processError(fs.readText(job.handle.error_path));
+      const cancelled = ["RECOGNITION_CANCELLED", "CANCELLED_BEFORE_LAUNCH", "CANCELLED_DURING_RECOGNITION"].includes(code);
+      job.terminal = { state: cancelled ? "cancelled" : "failed", ...(cancelled ? {} : { error: { code, message: code } }) } as RecognitionJobStatus;
+      this.cleanup(job);
       return job.terminal;
     }
     if (fs.exists(joinPath(job.job_dir, "launched.json"))) return { state: "launched" };
@@ -122,14 +133,18 @@ export class WpsRecognitionJobService {
     catch { throw new Error("LOCAL_JOB_BROKER_NOT_RUNNING"); }
     if (status.state !== "READY" && status.state !== "RUNNING") throw new Error("LOCAL_JOB_BROKER_NOT_RUNNING");
     if (!isFresh(status.heartbeat_at)) throw new Error("LOCAL_JOB_BROKER_STALE");
-    if (status.broker_version !== undefined && status.contract_version !== (this.broker.contractVersion ?? 1)) throw new Error("LOCAL_JOB_BROKER_VERSION_MISMATCH");
+    if (this.broker.brokerVersion && (typeof status.pid !== "number" || status.pid <= 0 || typeof status.broker_instance_id !== "string" || !status.broker_instance_id || typeof status.process_created_at !== "string" || !status.process_created_at)) throw new Error("LOCAL_JOB_BROKER_IDENTITY_MISMATCH");
+    if (this.broker.brokerVersion && status.broker_version !== this.broker.brokerVersion) throw new Error("LOCAL_JOB_BROKER_VERSION_MISMATCH");
+    if (this.broker.brokerExecutablePathHash && status.broker_executable_path_hash !== this.broker.brokerExecutablePathHash) throw new Error("LOCAL_JOB_BROKER_IDENTITY_MISMATCH");
+    if (this.broker.brokerExecutableSha256 && status.broker_executable_sha256 !== this.broker.brokerExecutableSha256) throw new Error("LOCAL_JOB_BROKER_HASH_MISMATCH");
+    if (status.contract_version !== (this.broker.contractVersion ?? 1) || (status.queue_contract_version ?? status.contract_version) !== (this.broker.queueContractVersion ?? this.broker.contractVersion ?? 1)) throw new Error("LOCAL_JOB_BROKER_CONTRACT_MISMATCH");
     if (this.broker.runtimeVersion && status.runtime_version !== this.broker.runtimeVersion) throw new Error("LOCAL_JOB_BROKER_RUNTIME_MISMATCH");
     if (this.broker.runtimeSha256 && status.runtime_sha256 !== this.broker.runtimeSha256) throw new Error("LOCAL_JOB_BROKER_RUNTIME_MISMATCH");
   }
 
   private cleanup(job: StoredJob): void {
     const fs = new WpsLocalFileSystem(this.application.FileSystem);
-    for (const path of [job.handle.result_path, job.handle.error_path, job.handle.cancel_path, job.handle.request_path, joinPath(job.job_dir, "queued.json"), joinPath(job.job_dir, "claimed.json"), joinPath(job.job_dir, "launched.json"), joinPath(job.job_dir, "heartbeat.json"), joinPath(job.job_dir, "finished.json")]) { try { fs.removeFile(path); } catch { /* terminal cleanup is best effort */ } }
+    for (const path of [job.handle.result_path, job.handle.error_path, job.handle.cancel_path, job.handle.request_path, joinPath(job.job_dir, "queued.json"), joinPath(job.job_dir, "claimed.json"), joinPath(job.job_dir, "claim.lock"), joinPath(job.job_dir, "launched.json"), joinPath(job.job_dir, "heartbeat.json"), joinPath(job.job_dir, "finished.json")]) { try { fs.removeFile(path); } catch { /* terminal cleanup is best effort */ } }
     try { fs.removeDirectory(job.job_dir); } catch { /* terminal cleanup is best effort */ }
   }
 }

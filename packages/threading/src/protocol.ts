@@ -1,7 +1,7 @@
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
-export type PipelineCommand = "snapshot_shadow" | "recognize" | "preview" | "format" | "clear_preview" | "cancel";
+export type PipelineCommand = "snapshot_shadow" | "diagnostic" | "recognize" | "preview" | "format" | "clear_preview" | "cancel";
 
 export interface PipelineJob {
   job_id: string;

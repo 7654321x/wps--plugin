@@ -125,6 +125,11 @@ export class ClassifiedHealthChecker {
           const heartbeat = typeof status?.heartbeat_at === "string" ? Date.parse(status.heartbeat_at) : NaN;
           if (status?.state !== "READY" && status?.state !== "RUNNING") return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_NOT_RUNNING", summary: "本地任务 Broker 未就绪" };
           if (!Number.isFinite(heartbeat) || Date.now() - heartbeat > 3_000) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_STALE", summary: "本地任务 Broker 心跳已过期" };
+          if (this.config.brokerVersion && (typeof status.pid !== "number" || status.pid <= 0 || typeof status.broker_instance_id !== "string" || !status.broker_instance_id || typeof status.process_created_at !== "string" || !status.process_created_at)) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_IDENTITY_MISMATCH", summary: "本地任务 Broker 身份字段不完整" };
+          if (this.config.brokerVersion && status.broker_version !== this.config.brokerVersion) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_VERSION_MISMATCH", summary: "本地任务 Broker 版本不匹配" };
+          if (this.config.brokerExecutablePathHash && status.broker_executable_path_hash !== this.config.brokerExecutablePathHash) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_IDENTITY_MISMATCH", summary: "本地任务 Broker 路径身份不匹配" };
+          if (this.config.brokerExecutableSha256 && status.broker_executable_sha256 !== this.config.brokerExecutableSha256) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_HASH_MISMATCH", summary: "本地任务 Broker EXE 校验值不匹配" };
+          if (this.config.queueContractVersion && status.queue_contract_version !== this.config.queueContractVersion) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_CONTRACT_MISMATCH", summary: "本地任务 Broker 队列合同不匹配" };
           if (this.config.runtimeVersion && status.runtime_version !== this.config.runtimeVersion) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_RUNTIME_MISMATCH", summary: "本地任务 Broker 与 runtime 版本不匹配" };
           if (this.config.runtimeSha256 && status.runtime_sha256 !== this.config.runtimeSha256) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_RUNTIME_MISMATCH", summary: "本地任务 Broker 与 runtime 校验值不匹配" };
           return { status: "PASS", summary: "本地任务 Broker 已就绪；文件队列；无网络端口" };
