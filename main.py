@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from wps_logging import UnifiedLogWriter, read_log_events
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -36,17 +38,29 @@ def utc_now() -> str:
 
 ROOT = Path(__file__).resolve().parent
 WPSJS_PORT = 3889
-WPS_LOG = ROOT / "wps-plugin-debug.log"
-# All plugin diagnostics are deliberately kept in the repository root.  The
-# former AppData path is no longer used for user-facing logs.
-WPS_EARLY_LOG = WPS_LOG
+WPS_LOG = ROOT / "wps-plugin.log"
+LOG_WRITER = UnifiedLogWriter(WPS_LOG)
 DEBUG_PACKAGE = ROOT / ".runtime" / "wps-debug-package"
 DEBUG_MANIFEST = DEBUG_PACKAGE / "debug-package.json"
-WPSJS_LOG = ROOT / ".runtime" / "logs" / "wpsjs-debug.log"
 WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
 JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
 CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
+
+
+def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None) -> None:
+    event_value: Dict[str, object] = {
+        "timestamp": utc_now(),
+        "level": level,
+        "component": "main",
+        "event": event,
+        "message": message,
+        "data": data or {},
+    }
+    if error is not None:
+        event_value["error"] = {"name": type(error).__name__, "message": str(error)}
+    for line in LOG_WRITER.append([event_value]):
+        print(line, flush=True)
 
 
 class StepFailed(RuntimeError):
@@ -90,16 +104,16 @@ def useful_error(output: str) -> str:
 
 
 def run_step(title: str, command: str, success: str, *, cwd: Path = ROOT, timeout: int = 180) -> str:
-    print(f"正在{title}……", flush=True)
+    log_event("INFO", "launcher.step.start", f"开始{title}", {"stage_cn": title})
     try:
         output = run_command(command, cwd=cwd, timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        print(f"{title}超时。", flush=True)
+        log_event("ERROR", "launcher.step.failed", f"{title}超时", {"stage_cn": title, "reason_cn": "外部命令在规定时间内没有完成", "action_cn": "检查当前步骤的运行状态后重试", "stable_error_code": "LAUNCHER_STEP_TIMEOUT"}, error)
         raise StepFailed(title, command, str(error)) from error
     except StepFailed as error:
-        print(f"{title}失败：{useful_error(error.output)}", flush=True)
+        log_event("ERROR", "launcher.step.failed", f"{title}失败", {"stage_cn": title, "reason_cn": "外部命令返回失败", "action_cn": "查看当前步骤的错误码并修复后重试", "technical_detail": useful_error(error.output)}, error)
         raise
-    print(success, flush=True)
+    log_event("INFO", "launcher.step.success", success, {"stage_cn": title, "result_cn": "成功"})
     return output
 
 
@@ -203,7 +217,7 @@ def ensure_control_server() -> Dict[str, object]:
         previous = read_json(CONTROL_SERVER_PROCESS)
         if previous.get("pid") == healthy.get("pid") and str(previous.get("manifest_path", "")) == str(manifest_path):
             CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": healthy.get("pid"), "manifest_path": str(manifest_path), "started_at": healthy.get("heartbeat_at", ""), "process_created_at": healthy.get("process_created_at", ""), "instance_id": healthy.get("instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"WPS Control Server 已复用（127.0.0.1:{healthy.get('port')}，实例 {str(healthy.get('instance_id', ''))[:8]}）。", flush=True)
+        log_event("INFO", "control_server.reused", "WPS 控制服务已复用", {"result_cn": "成功", "technical_detail": f"127.0.0.1:{healthy.get('port')}"})
         return healthy
     metadata = read_json(CONTROL_SERVER_PROCESS)
     process_id = metadata.get("pid")
@@ -219,19 +233,16 @@ def ensure_control_server() -> Dict[str, object]:
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    log_path = ROOT / ".runtime" / "logs" / "control-server.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
+    log_event("INFO", "control_server.start", "开始启动 WPS 控制服务", {"stage_cn": "启动本地控制服务"})
     process = subprocess.Popen(
         [sys.executable, str(ROOT / "control-server" / "run.py"), "start", "--manifest", str(manifest_path), "--port", "0"],
         cwd=str(ROOT),
         stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         creationflags=creationflags,
         close_fds=True,
     )
-    log_handle.close()
     CONTROL_SERVER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
     CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": process.pid, "manifest_path": str(manifest_path), "started_at": utc_now(), "process_created_at": process_metadata(process.pid).get("process_created_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
     for _ in range(40):
@@ -239,7 +250,7 @@ def ensure_control_server() -> Dict[str, object]:
         healthy = control_server_health()
         if healthy:
             CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": healthy.get("pid"), "manifest_path": str(manifest_path), "started_at": healthy.get("heartbeat_at", ""), "process_created_at": healthy.get("process_created_at", ""), "instance_id": healthy.get("instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"WPS Control Server 已就绪（127.0.0.1:{healthy.get('port')}）。", flush=True)
+            log_event("INFO", "control_server.ready", "WPS 控制服务已就绪", {"result_cn": "成功", "technical_detail": f"127.0.0.1:{healthy.get('port')}"})
             return healthy
         if process.poll() is not None:
             raise StepFailed("启动 WPS Control Server", "control-server/run.py", "CONTROL_SERVER_EXITED")
@@ -410,21 +421,18 @@ def ensure_job_broker() -> Dict[str, object]:
     if broker_healthy(current, status):
         JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
         JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"本地任务 Broker 已复用（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
+        log_event("INFO", "broker.reused", "本地任务代理已复用", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
         return status
     stale_pid = status.get("pid")
     if stale_pid and process_is_alive(stale_pid) and not managed_broker_process(stale_pid, executable, status.get("process_created_at")):
         raise StepFailed("启动本地任务 Broker", "Broker 身份校验", "LOCAL_JOB_BROKER_IDENTITY_MISMATCH")
     if stale_pid and managed_broker_process(stale_pid, executable, status.get("process_created_at")):
         subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    log_path = ROOT / ".runtime" / "logs" / "local-job-broker.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
-    process = subprocess.Popen([str(executable), "run"], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT, creationflags=creationflags, close_fds=True)
-    log_handle.close()
+    log_event("INFO", "broker.start", "开始启动本地任务代理", {"stage_cn": "启动本地任务代理"})
+    process = subprocess.Popen([str(executable), "run", "--log-path", str(WPS_LOG)], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags, close_fds=True)
     JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
     JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "process_created_at": process_metadata(process.pid).get("process_created_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
     for _ in range(50):
@@ -432,7 +440,7 @@ def ensure_job_broker() -> Dict[str, object]:
         status = broker_status()
         if broker_healthy(current, status):
             JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"本地任务 Broker 已就绪（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
+            log_event("INFO", "broker.ready", "本地任务代理已就绪", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
             return status
         if process.poll() is not None:
             raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_EXITED")
@@ -504,7 +512,7 @@ def register_addin() -> None:
         if report.get("status") == "PASS" and managed_owner and "wps_debug_server.py" in command_line:
             metadata["expected_build_id"] = read_json(DEBUG_MANIFEST).get("build_id", "")
             WPSJS_PROCESS.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-            print("WPS 调试服务已验证并复用。", flush=True)
+            log_event("INFO", "debug_server.reused", "WPS 资源服务已验证并复用", {"result_cn": "成功"})
             return
         if managed_owner and ("wps_debug_server.py" in command_line or "http.server" in command_line):
             pid = str(owner.get("pid", ""))
@@ -523,22 +531,19 @@ def register_addin() -> None:
     registration_value = json.loads(registration_raw)
     if not registration_value.get("registration_matches_current_server"):
         raise StepFailed("检查 WPS 注册信息", "inspect-wps-registration.ps1", "WPS_REGISTRATION_MISMATCH")
-    print("正在后台启动 WPS 插件资源……", flush=True)
+    log_event("INFO", "debug_server.start", "开始启动 WPS 资源服务", {"stage_cn": "启动本地资源服务"})
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     command = [sys.executable, "-u", str(ROOT / "scripts" / "wps_debug_server.py"), "--root", str(DEBUG_PACKAGE), "--port", str(WPSJS_PORT), "--log", str(WPS_LOG)]
-    WPSJS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = WPSJS_LOG.open("a", encoding="utf-8", buffering=1)
     process = subprocess.Popen(
         command,
         cwd=str(DEBUG_PACKAGE),
         stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         creationflags=creationflags,
     )
-    log_handle.close()
     write_process_metadata(process, read_json(DEBUG_MANIFEST), command)
     for _ in range(30):
         if is_port_open(WPSJS_PORT):
@@ -546,8 +551,8 @@ def register_addin() -> None:
             if report.get("status") != "PASS":
                 raise StepFailed("验证 WPS 调试资源", "HTTP resource probe", ",".join(str(item) for item in report.get("errors", [])))
             update_server_owner_metadata()
-            print("DEBUG_SERVER_READY", flush=True)
-            print("REGISTRATION_READY", flush=True)
+            log_event("INFO", "debug_server.ready", "WPS 资源服务已就绪", {"result_cn": "成功"})
+            log_event("INFO", "addin.registration.ready", "WPS 加载项注册已就绪", {"result_cn": "成功"})
             return
         if process.poll() is not None:
             raise StepFailed("注册 WPS 插件项目", "wps_debug_server.py", "WPS 插件服务启动后立即退出。")
@@ -561,19 +566,9 @@ def verify() -> None:
 
 
 def diagnostic_events() -> List[Dict[str, object]]:
-    events: List[Dict[str, object]] = []
     current_build = str(read_json(DEBUG_MANIFEST).get("build_id", ""))
-    for path in dict.fromkeys((WPS_EARLY_LOG, WPS_LOG)):
-        if not path.exists():
-            continue
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                value = json.loads(line)
-                if isinstance(value, dict) and (not current_build or value.get("build_id") == current_build): events.append(value)
-            except ValueError:
-                continue
-    events.sort(key=lambda item: str(item.get("timestamp", "")))
-    return events
+    events = read_log_events(WPS_LOG)
+    return [item for item in events if not current_build or not item.get("build_id") or item.get("build_id") == current_build]
 
 
 def plugin_page_loaded(event_names: List[str]) -> bool:
@@ -586,19 +581,19 @@ def diagnose() -> None:
     registration = json.loads(registration_raw)
     events = diagnostic_events(); names = [str(item.get("event", "")) for item in events]
     checks = [
-        ("debug server", resource.get("status") == "PASS"),
-        ("registration", bool(registration.get("registration_matches_current_server"))),
-        ("bootstrap page", plugin_page_loaded(names)),
-        ("ribbon script", "ribbon.script.loaded" in names),
-        ("ribbon onLoad", "ribbon.addin.load.success" in names),
-        ("local runtime", "application.install.success" in names),
+        ("WPS资源服务", resource.get("status") == "PASS"),
+        ("WPS注册配置", bool(registration.get("registration_matches_current_server"))),
+        ("插件页面", plugin_page_loaded(names)),
+        ("功能区脚本", "ribbon.script.loaded" in names),
+        ("功能区回调", "ribbon.addin.load.success" in names),
+        ("WPS宿主运行时", "application.install.success" in names),
     ]
     print("WPS 装载诊断：")
-    for label, passed in checks: print(f"- {label}: {'PASS' if passed else 'WAITING'}")
+    for label, passed in checks: print(f"- {label}：{'正常' if passed else '等待'}")
     last_action = next((item for item in reversed(events) if item.get("event") == "ribbon.action.received"), None)
-    last_error = next((item for item in reversed(events) if item.get("level") in ("ERROR", "FATAL")), None)
-    print(f"- last ribbon action: {last_action.get('timestamp') if last_action else '-'}")
-    print(f"- last error: {last_error.get('message') if last_error else '-'}")
+    last_error = next((item for item in reversed(events) if item.get("level") in ("错误", "致命")), None)
+    print(f"- 最近一次按钮操作：{last_action.get('timestamp') if last_action else '无'}")
+    print(f"- 最近错误：{last_error.get('message') if last_error else '无'}")
     if not plugin_page_loaded(names):
         print("WPS 尚未加载当前插件页面。请保存文档并完全关闭全部 WPS 进程后重新打开。")
 
@@ -612,10 +607,8 @@ def wps_is_running() -> bool:
 
 
 def watch_wps_log() -> None:
-    print(f"WPS 早期日志：{WPS_EARLY_LOG}", flush=True)
-    print(f"WPS 交互日志：{WPS_LOG}", flush=True)
-    print(f"插件资源日志：{WPSJS_LOG}", flush=True)
-    print("正在等待 WPS 操作日志；只显示根目录中文交互日志；按 Ctrl+C 停止监视。", flush=True)
+    print(f"WPS 统一日志：{WPS_LOG}", flush=True)
+    print("正在等待 WPS 操作日志；按 Ctrl+C 停止监视。", flush=True)
     positions = {path: path.stat().st_size if path.exists() else 0 for path in (WPS_LOG,)}
     last_fingerprint = ""
     suppressed_repeats = 0
@@ -628,28 +621,18 @@ def watch_wps_log() -> None:
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
                     handle.seek(positions[path])
                     for line in handle:
-                        try:
-                            item = json.loads(line)
-                            level = str(item.get("level", "INFO"))
-                            component = str(item.get("component", "WPS"))
-                            message = str(item.get("message", item.get("event", "收到日志")))
-                            error = item.get("error") or {}
-                            error_message = str(error.get("message", ""))
-                            stable_code = str((item.get("data") or {}).get("stable_error_code", ""))
-                            if "path cannot contains" in error_message.lower() or stable_code == "WPS_FILESYSTEM_PATH_REJECTED":
-                                error_message = "WPS 文件接口拒绝了当前路径参数"
-                            suffix = f"；错误：{error_message}" if error_message else ""
-                            fingerprint = "|".join((level, component, str(item.get("event", "")), message, error_message, stable_code))
-                            if fingerprint == last_fingerprint:
-                                suppressed_repeats += 1
-                                continue
-                            if suppressed_repeats:
-                                print(f"[提示] 上一条相同日志重复 {suppressed_repeats} 次，已自动省略。", flush=True)
-                                suppressed_repeats = 0
-                            last_fingerprint = fingerprint
-                            print(f"[{level}] {component}：{message}{suffix}", flush=True)
-                        except (ValueError, TypeError):
-                            print(f"[WPS] {line.strip()}", flush=True)
+                        rendered = line.strip()
+                        if not rendered:
+                            continue
+                        fingerprint = rendered
+                        if fingerprint == last_fingerprint:
+                            suppressed_repeats += 1
+                            continue
+                        if suppressed_repeats:
+                            print(f"重复日志已抑制 {suppressed_repeats} 次。", flush=True)
+                            suppressed_repeats = 0
+                        last_fingerprint = fingerprint
+                        print(rendered, flush=True)
                     positions[path] = handle.tell()
             time.sleep(0.5)
     except KeyboardInterrupt:
@@ -672,6 +655,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("Docxtool WPS 本地直连版", flush=True)
     print("说明：本入口启动随机 loopback WPS Control Server；不启动旧 9528/local-agent/command-service。", flush=True)
+    if args.action == "start":
+        log_event("INFO", "session.start", "新的 WPS 日志会话已开始", {"stage_cn": "启动 WPS 插件"})
 
     try:
         if args.action == "start":
@@ -711,8 +696,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.action == "reset":
             run_step("重置本地识别组件指针", "pwsh -NoProfile -File scripts/local-direct.ps1 reset", "本地识别组件指针已重置。")
         return 0
-    except StepFailed:
-        print("处理未完成。请把上面的中文错误发给我继续排查。", flush=True)
+    except StepFailed as error:
+        log_event("ERROR", "launcher.failed", "WPS 启动流程未完成", {"stage_cn": error.title, "reason_cn": "当前启动步骤失败", "action_cn": "查看统一日志中的错误码并修复后重试", "technical_detail": useful_error(error.output)}, error)
+        print("处理未完成。请查看 wps-plugin.log 中的中文错误继续排查。", flush=True)
         return 1
 
 

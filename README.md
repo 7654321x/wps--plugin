@@ -1,8 +1,10 @@
-# Docxtool WPS Control Plane v1.4.0
+# Docxtool WPS Control Plane v1.5.0
 
 本目录是独立于现有 Web 服务的 WPS 加载项工程。第一阶段已建立本地识别适配、脱敏协议、统一命令服务、声明式命令校验、Mock WPS 执行器和两个发行版装配。
 
 识别 wheel 的公开入口为 docxtool.sdk.recognize_docx，CLI 为 docxtool-recognize。它只在用户电脑上运行；DOCX 和正文不发送到命令服务。
+
+运行期诊断统一写入仓库根目录 `wps-plugin.log`，采用 UTF-8 中文文本格式。错误行包含阶段、原因、处理建议和稳定错误码；连续相同事件只保留一条，日志超限只裁剪历史完整行，不生成轮转副本。运行日志、用户 DOCX、临时运行产物和本机配置均不提交 GitHub。
 
 常用验证：
 

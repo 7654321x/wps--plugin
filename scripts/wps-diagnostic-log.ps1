@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$log = Join-Path $root "wps-plugin-debug.log"
+$log = Join-Path $root "wps-plugin.log"
 
 switch ($Action) {
   "path" {
@@ -22,20 +22,22 @@ switch ($Action) {
   }
   "summary" {
     if (-not (Test-Path -LiteralPath $log)) { Write-Output ("LOG_NOT_FOUND " + $log); exit 1 }
-    $items = @(Get-Content -LiteralPath $log | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
-    $errors = @($items | Where-Object { $_.level -in @("ERROR", "FATAL") })
+    $items = @(Get-Content -LiteralPath $log | Where-Object { $_ -match '^\d{4}-\d{2}-\d{2} ' })
+    $errors = @($items | Where-Object { $_ -match '\[(错误|致命)\]' })
     $last = @($items | Select-Object -Last 1)
     $lastError = @($errors | Select-Object -Last 1)
+    $eventCode = if ($last.Count -and $last[0] -match '事件码：([^｜]+)') { $Matches[1].Trim() } else { "" }
+    $lastErrorCode = if ($lastError.Count -and $lastError[0] -match '错误码：([^｜]+)') { $Matches[1].Trim() } else { "" }
     [pscustomobject]@{
       file = $log
       lines = $items.Count
-      first_timestamp = if ($items.Count) { $items[0].timestamp } else { "" }
-      last_timestamp = if ($last.Count) { $last[0].timestamp } else { "" }
+      first_timestamp = if ($items.Count) { $items[0].Substring(0, 23) } else { "" }
+      last_timestamp = if ($last.Count) { $last[0].Substring(0, 23) } else { "" }
       errors = $errors.Count
-      last_event = if ($last.Count) { $last[0].event } else { "" }
-      last_error_event = if ($lastError.Count) { $lastError[0].event } else { "" }
-      last_error_code = if ($lastError.Count) { $lastError[0].stable_error_code } else { "" }
-      last_error_message = if ($lastError.Count) { $lastError[0].error.message } else { "" }
+      last_event = $eventCode
+      last_error_event = if ($lastError.Count -and $lastError[0] -match '事件码：([^｜]+)') { $Matches[1].Trim() } else { "" }
+      last_error_code = $lastErrorCode
+      last_error_message = if ($lastError.Count) { $lastError[0] } else { "" }
     } | Format-List
   }
 }

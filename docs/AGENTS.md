@@ -43,7 +43,7 @@ Control Server 必须由 `main.py` 或用户级启动器在 WPS 之外启动；W
 3. 发布前运行 npm test、npm run verify:all、npm run verify:local-direct 和 git diff --check；若真实 WPS 尚未通过，只能如实写入交接文档，不能把版本标为验收通过。
 4. 确认远程必须是 `ssh://git@ssh.github.com:443/7654321x/wps--plugin.git`，提交全部受管理代码，提交消息使用 `release: vX.Y.Z ...`，然后使用 `git push origin HEAD:main` 推送；不要使用裸的 `git push HEAD:main`，因为 Git 会把 `HEAD:main` 误当成远程名称。
 5. 推送后核对远程 refs/heads/main 与本地提交一致、工作树干净，并在 `docs/交接文档.md` 记录版本、提交、推送结果和未解决问题。
-6. `.runtime/`、除根目录 `wps-plugin-debug.log` 外的日志、运行时 EXE、用户 DOCX、测试工作副本和 `local_recycle/` 不得提交；`wps-plugin-debug.log` 是用户明确允许的唯一原始日志例外，但每次发布前必须完成敏感信息扫描，扫描不通过即暂停推送。
+6. `.runtime/`、`wps-plugin.log`、`wps-plugin-debug.log` 及其他运行日志、运行时 EXE、用户 DOCX、测试工作副本和 `local_recycle/` 不得提交。运行日志只保留在本机供诊断，不以日志文件作为发布证据上传。
 
 ### 固定 GitHub 上传清单
 
@@ -55,22 +55,22 @@ Control Server 必须由 `main.py` 或用户级启动器在 WPS 之外启动；W
 - 根目录和应用目录的 `package.json`、`package-lock.json`、TypeScript/Python 配置、清单、Schema、资源模板及加载项清单。
 - 根目录的规则入口 `AGENTS.md`、`docs/AGENTS.md`、`docs/问题清单Agent.md`、`docs/交接文档.md` 和与本次变更直接相关的项目文档。
 - `agent/` 中受管理的 Agent 说明、审阅证据、流程资料和目录结构；发布到 GitHub 时必须与源码、测试和 `docs/` 一起提交。
-- 根目录 `wps-plugin-debug.log` 原始诊断日志：仅在发布前通过敏感信息扫描时提交，便于跨环境检索实际问题；不提交轮转副本或其他 `*.log` 文件。
+- 根目录 `wps-plugin.log` 是唯一运行期日志文件；它和历史 `wps-plugin-debug.log` 均为本地诊断产物，不提交、不轮转、不生成 `.1` 副本。
 - 构建脚本生成且已受 Git 管理的 `apps/classified-offline/ui/build-info.js`；必须由 `npm run build:classified` 生成，禁止手工伪造 build id。
 - 用户明确要求提供审阅证据时，可提交命名明确的 `.patch` 文件；文件必须只由指定 commit/range 生成，并在 `docs/交接文档.md` 记录路径、来源 commit、SHA-256 和用途。审阅 patch 是证据附件，不是生产源码。标准 diff 的空上下文行可能触发 whitespace 检查，禁止为了消除误报而改写 patch；有 patch 时只对其他文件执行 `git diff --check -- . ':(exclude)*.patch'`，同时做来源、哈希和禁带内容扫描。
 
 #### 必须忽略或禁止提交的内容
 
 - `.runtime/`、`node_modules/`、`.venv/`、`dist/`、`wps-addon-publish/`、`.idea/`、`.reasonix/`、`local_recycle/`。
-- 运行时 EXE、wheel、除根目录 `wps-plugin-debug.log` 外的日志、调试输出、session token、PID/status 文件、临时请求/结果文件和本地配置；包括其他 `*.log`、`*.whl`、`*.tsbuildinfo`、`__pycache__/`、`*.pyc`。
+- 运行时 EXE、wheel、所有日志、调试输出、session token、PID/status 文件、临时请求/结果文件和本地配置；包括 `*.log`、`*.whl`、`*.tsbuildinfo`、`__pycache__/`、`*.pyc`。
 - 用户 DOCX、测试工作副本、渲染副本和测试运行产物；包括 `*.docx`、`tests/e2e-work/`、`tests/*工作副本.docx`、`tests/~$*.docx` 及各类 e2e render 目录。
-- `apps/classified-offline/ui/e2e-session.js`、`wps-plugin-debug.log.1` 至轮转副本及任何包含令牌、绝对本机路径或用户数据的文件。根目录 `wps-plugin-debug.log` 仅在扫描无此类内容时例外允许提交。
+- `apps/classified-offline/ui/e2e-session.js`、`wps-plugin.log.1`、`wps-plugin-debug.log.1` 至轮转副本及任何包含令牌、绝对本机路径或用户数据的文件。
 - 任意临时 patch、截图、压缩包和审阅临时文件；只有 `agent/reviews/` 中由用户明确要求或项目发布流程生成、并完成来源/哈希/禁带扫描的审阅 patch 可以提交。
 
 #### 发布前固定顺序
 
 1. 只在 `D:\PycharmProjects\wps` 工作；读取 `docs/问题清单Agent.md`，确认 `git status --short`、当前分支和远程 URL；远程必须精确匹配上面的 WPS SSH 地址。
-2. 用 `git diff --name-only` 和 `git diff --cached --name-only` 审核文件清单；对每个新增文件执行 `git check-ignore -v`，发现禁止文件立即暂停。若 `wps-plugin-debug.log` 在清单中，必须额外扫描 credential assignment、Bearer、API token 前缀、Windows 绝对路径和带凭据 URL；任一命中即暂停。扫描完成后，除禁止项外应覆盖全部可版本化文件。
+2. 用 `git diff --name-only` 和 `git diff --cached --name-only` 审核文件清单；对每个新增文件执行 `git check-ignore -v`，发现禁止文件立即暂停。`wps-plugin.log`、`wps-plugin-debug.log` 和其他日志不得进入暂存区；扫描完成后，除禁止项外应覆盖全部可版本化文件。
 3. 代码或版本变更必须同步根 `package.json`、`package-lock.json`、`apps/classified-offline/package.json`，运行 `npm run build:classified` 生成构建信息，并在 `docs/交接文档.md` 新增当前版本条目。交接文档版本必须与实际发布版本一致；历史条目不得回改。
 4. 依次独立运行 `npm test`、`npm run verify:all`、`npm run verify:local-direct`、`git diff --check`；若提交审阅 patch，使用 `git diff --check -- . ':(exclude)*.patch'`；每个外部命令结束后立即检查退出码，前一步失败不得进入下一步或 push。
 5. 禁带扫描通过后使用 `git add --all` 暂存全部可版本化文件（Git 忽略项不会被加入），再逐项审阅 `git diff --cached --name-only`、`git diff --cached --check -- . ':(exclude)*.patch'` 和 `git diff --cached --stat`；发现任何禁止项立即取消暂存并暂停。发布提交使用 `release: vX.Y.Z ...`，纯交接/审阅附件提交使用 `docs: ...`。
@@ -86,7 +86,7 @@ pwsh -NoProfile -Command "npm test"
 pwsh -NoProfile -Command "npm run verify:all"
 pwsh -NoProfile -Command "npm run verify:local-direct"
 pwsh -NoProfile -Command "git diff --check"
-pwsh -NoProfile -Command "rg --pcre2 -n -i '(authorization|cookie|password|secret|session[_-]?token|access[_-]?token)\\s*[:=]\\s*[^\\s,;]+|bearer\\s+[A-Za-z0-9._~+/\\-]+|(?:sk|fc|agt)_[A-Za-z0-9_-]{12,}|(?<![A-Za-z])[A-Za-z]:[\\/]' wps-plugin-debug.log; if ($LASTEXITCODE -eq 0) { exit 1 } elseif ($LASTEXITCODE -ne 1) { exit $LASTEXITCODE }"
+pwsh -NoProfile -Command "rg --pcre2 -n -i '(authorization|cookie|password|secret|session[_-]?token|access[_-]?token)\\s*[:=]\\s*[^\\s,;]+|bearer\\s+[A-Za-z0-9._~+/\\-]+|(?:sk|fc|agt)_[A-Za-z0-9_-]{12,}|(?<![A-Za-z])[A-Za-z]:[\\/]' wps-plugin.log; if ($LASTEXITCODE -eq 0) { exit 1 } elseif ($LASTEXITCODE -ne 1) { exit $LASTEXITCODE }"
 pwsh -NoProfile -Command "git add --all"
 pwsh -NoProfile -Command "git diff --cached --check -- . ':(exclude)*.patch'"
 pwsh -NoProfile -Command "git commit -m 'release: vX.Y.Z <说明>'"

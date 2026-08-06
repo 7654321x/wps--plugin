@@ -3,4 +3,3 @@ export class NoOpTelemetry implements TelemetryProvider { record(_eventName: str
 export * from "./diagnostics.js";
 export * from "./diagnostic-types.js";
 export * from "./diagnostic-redaction.js";
-export * from "./loopback-diagnostic-logger.js";

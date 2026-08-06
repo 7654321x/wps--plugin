@@ -159,7 +159,6 @@ $currentPayload = @{
   broker_status_path = (Join-Path $env:APPDATA "Docxtool\broker\status.json")
   recognition_package_version = [string]$manifest.recognition_package_version
   manifest_path = $manifestPath
-  diagnostic_log_path = (Join-Path $root "wps-plugin-debug.log")
   installed_at = (Get-Date).ToUniversalTime().ToString("o")
 }
 $currentPayload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $current -Encoding utf8NoBOM

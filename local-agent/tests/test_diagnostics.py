@@ -16,6 +16,7 @@ from docxtool_local_agent.diagnostics import (  # noqa: E402
     DiagnosticLogWriter,
     validate_batch,
 )
+from wps_logging import parse_log_line  # noqa: E402
 
 
 def _call(app, method, path, body=None, *, raw=None, token="test-token"):
@@ -51,8 +52,8 @@ def _event(name="preview.failed", **extra):
     }
 
 
-def test_writer_creates_utf8_jsonl_redacts_twice_and_rotates(tmp_path):
-    path = tmp_path / "wps-plugin-debug.log"
+def test_writer_creates_utf8_chinese_lines_and_redacts_twice(tmp_path):
+    path = tmp_path / "wps-plugin.log"
     writer = DiagnosticLogWriter(path)
     events = validate_batch({
         "schema_version": 1,
@@ -77,40 +78,38 @@ def test_writer_creates_utf8_jsonl_redacts_twice_and_rotates(tmp_path):
     writer.append(events)
 
     value = path.read_text(encoding="utf-8")
-    parsed = json.loads(value)
     assert "preview.failed" in value
-    assert "诊断事件" in value
+    assert "[错误]" in value
+    assert "阶段：" in value
     assert "must-not-appear" not in value
     assert "secret paragraph" not in value
-    assert "[redacted]" in value
-    assert "stack-value" in value
+    assert "stack-value" not in value
     assert "private\\source.py" not in value
-    assert parsed["data"]["endpoint_path"] == "/v1/recognize"
-    assert parsed["data"]["endpoint_origin"] == "http://127.0.0.1:9528"
-    assert parsed["data"]["content_length"] == 12
-    assert writer.handler.maxBytes == 5 * 1024 * 1024
-    assert writer.handler.backupCount == 5
+    assert "{" not in value and "}" not in value
+    assert parse_log_line(value.strip()) is not None
+    assert writer.path_info()["file_name"] == "wps-plugin.log"
 
     rotating_path = tmp_path / "rotate.log"
-    rotating = DiagnosticLogWriter(rotating_path, max_bytes=300, backup_count=2)
+    rotating = DiagnosticLogWriter(rotating_path, max_bytes=500, backup_count=2)
     for index in range(20):
-        rotating.append([_event("rotation.{}".format(index), data={"size": "x" * 80})])
+        rotating.append([_event("rotation.{}".format(index), data={"size": "x" * 20})])
     assert rotating_path.is_file()
-    assert (tmp_path / "rotate.log.1").is_file()
+    assert rotating_path.stat().st_size <= 500
+    assert not (tmp_path / "rotate.log.1").exists()
 
 
-def test_writer_concurrent_append_never_produces_partial_json(tmp_path):
+def test_writer_concurrent_append_never_produces_partial_lines(tmp_path):
     path = tmp_path / "concurrent.log"
     writer = DiagnosticLogWriter(path)
     with ThreadPoolExecutor(max_workers=8) as executor:
         list(executor.map(lambda index: writer.append([_event("parallel.{}".format(index))]), range(100)))
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 100
-    assert all(json.loads(line)["event"].startswith("parallel.") for line in lines)
+    assert all(parse_log_line(line) is not None for line in lines)
 
 
 def test_diagnostic_endpoint_auth_status_and_server_redaction(tmp_path):
-    path = tmp_path / "wps-plugin-debug.log"
+    path = tmp_path / "wps-plugin.log"
     app = create_app("test-token", diagnostic_log_file=path)
     payload = {"schema_version": 1, "source": "host", "events": [_event(data={"raw_text": "secret paragraph", "token": "must-not-appear"})]}
 
@@ -124,7 +123,7 @@ def test_diagnostic_endpoint_auth_status_and_server_redaction(tmp_path):
 
     status, info = _call(app, "GET", "/v1/diagnostics/status")
     assert status == "200 OK"
-    assert info["file_name"] == "wps-plugin-debug.log"
+    assert info["file_name"] == "wps-plugin.log"
     assert info["exists"] is True
     assert set(info) == {"ok", "file_name", "exists", "size_bytes"}
     assert str(tmp_path) not in json.dumps(info)
@@ -132,7 +131,7 @@ def test_diagnostic_endpoint_auth_status_and_server_redaction(tmp_path):
     value = path.read_text(encoding="utf-8")
     assert "secret paragraph" not in value
     assert "must-not-appear" not in value
-    assert "[redacted]" in value
+    assert "[错误]" in value
     assert "local_agent.request.received" in value
     assert "local_agent.request.completed" in value
 

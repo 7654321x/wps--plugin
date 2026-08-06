@@ -56,6 +56,8 @@ if (-not (Test-Path -LiteralPath $exe)) {
   --noconfirm `
   --clean `
   --onefile `
+  --paths $root `
+  --hidden-import wps_logging `
   --name "docxtool-job-broker" `
   --distpath $distRoot `
   --workpath $workRoot `

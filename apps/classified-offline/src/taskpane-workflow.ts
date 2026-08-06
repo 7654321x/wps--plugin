@@ -23,6 +23,7 @@ type BridgeWindow = Window & {
 const bridgeWindow = window as BridgeWindow;
 
 const RESULT_KEY = "docxtool_classified_host_result_v1";
+const ERROR_KEY = "docxtool_classified_host_error_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
 const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 let pendingRequestId = "";
@@ -35,7 +36,7 @@ function taskpaneLog(level: DiagnosticLevel, event: string, message: string, dat
     if (diagnosticLogger) { diagnosticLogger.writeForComponent("taskpane", level, event, message, data, error); return; }
     const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "taskpane", event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) };
     taskpaneEarlyQueue.push(item);
-    if (taskpaneEarlyQueue.length > 500) taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length - 500);
+    if (taskpaneEarlyQueue.length > 100) taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length - 100);
   } catch { /* diagnostics never changes taskpane behavior */ }
 }
 taskpaneLog("INFO", "taskpane.module.loaded", "任务窗格工作流模块开始执行", { ready_state: document.readyState });
@@ -46,16 +47,17 @@ function tryInstallTaskpaneLogger(): void {
   if (diagnosticLogger) return;
   const storage = bridgeWindow.Application?.PluginStorage;
   const build = bridgeWindow.DocxtoolBuildInfo;
-  if (!storage || !build) return;
+  const diagnosticLog = bridgeWindow.DocxtoolDiagnosticLog;
+  if (!storage || !build || typeof diagnosticLog !== "function") return;
   try {
     diagnosticLogger = {
       writeForComponent(component, level, event, message, data = {}, error) {
-        taskpaneEarlyQueue.push({ timestamp: new Date().toISOString(), level, component, event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) });
-        if (taskpaneEarlyQueue.length > 500) taskpaneEarlyQueue.splice(0, taskpaneEarlyQueue.length - 500);
+        diagnosticLog(level, component, event, message, data, error);
       },
     };
     bridgeWindow.DocxtoolDiagnosticLogger = diagnosticLogger;
     bridgeWindow.DocxtoolDiagnosticLog = (level, component, event, message, data, error) => diagnosticLogger?.writeForComponent(component, level, event, message, data, error);
+    for (const item of taskpaneEarlyQueue.splice(0)) diagnosticLog(item.level, item.component, item.event, item.message, item.data, item.error);
     taskpaneLog("INFO", "taskpane.logger.installed", "任务窗格诊断日志客户端已安装", {});
   } catch (error) { taskpaneLog("ERROR", "taskpane.logger.install.failed", "任务窗格诊断日志客户端安装失败", {}, error); }
 }
@@ -125,6 +127,14 @@ function poll(): void {
   tryInstallTaskpaneLogger();
   const storage = bridgeWindow.Application?.PluginStorage; if (!storage) return;
   const state = parse<HostState>(storage.getItem(RESULT_KEY), "host_result");
+  if (!state) {
+    const fallback = parse<{ error_code?: string }>(storage.getItem(ERROR_KEY), "host_error");
+    if (fallback?.error_code) {
+      text("workflow-status", `失败：${errorMessage(fallback.error_code)}`);
+      text("issues", errorText(fallback.error_code));
+    }
+    return;
+  }
   if (state && state.updated_at !== lastUpdated) {
     lastUpdated = state.updated_at;
     taskpaneLog("DEBUG", "taskpane.host_state.changed", "任务窗格观察到 Host 状态变化", { build_id: state.build_id, command_status: state.command_status, active_view: state.active_view, stable_error_code: state.latest_error || "" });

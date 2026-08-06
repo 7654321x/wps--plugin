@@ -1,15 +1,15 @@
-"""Safe JSONL diagnostics written only by the loopback local agent."""
+"""Validated diagnostic events written as one human-readable Chinese log."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
-import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import re
-import threading
+import sys
 from typing import Any, Dict, List, Union
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from wps_logging import UnifiedLogWriter  # noqa: E402
 
 
 MAX_BATCH_EVENTS = 100
@@ -104,10 +104,11 @@ def validate_batch(payload: Any) -> List[Dict[str, Any]]:
             raise ValueError("DIAGNOSTIC_LEVEL_INVALID")
         event_name = str(raw.get("event", "")).strip()
         component = str(raw.get("component", source)).strip()
-        if not event_name or len(event_name) > 160 or not component or len(component) > 80:
+        message = raw.get("message")
+        timestamp = raw.get("timestamp")
+        if not event_name or len(event_name) > 160 or not component or len(component) > 80 or not isinstance(message, str) or not message.strip() or not isinstance(timestamp, str) or not timestamp.strip():
             raise ValueError("DIAGNOSTIC_EVENT_INVALID")
         item = _sanitize(raw)
-        item["timestamp"] = str(item.get("timestamp") or datetime.now(timezone.utc).isoformat())
         item["level"] = level
         item["component"] = component
         item["event"] = event_name
@@ -115,42 +116,9 @@ def validate_batch(payload: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-class DiagnosticLogWriter:
-    def __init__(
-        self,
-        log_file: Union[str, Path],
-        *,
-        max_bytes: int = 5 * 1024 * 1024,
-        backup_count: int = 5,
-    ) -> None:
-        self.path = Path(log_file).resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._logger = logging.getLogger("docxtool.diagnostics.{}.{}".format(self.path, id(self)))
-        self._logger.setLevel(logging.DEBUG)
-        self._logger.propagate = False
-        handler = RotatingFileHandler(
-            self.path,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        self._logger.addHandler(handler)
-        self.handler = handler
+class DiagnosticLogWriter(UnifiedLogWriter):
+    """Compatibility name for the single human-readable log writer."""
 
-    def append(self, events: List[Dict[str, Any]]) -> None:
-        with self._lock:
-            for event in events:
-                self._logger.info(
-                    json.dumps(_sanitize(event), ensure_ascii=False, separators=(",", ":"))
-                )
-            for handler in self._logger.handlers:
-                handler.flush()
-
-    def path_info(self) -> Dict[str, Any]:
-        return {
-            "file_name": self.path.name,
-            "exists": self.path.exists(),
-            "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
-        }
+    def __init__(self, log_file: Union[str, Path], *, max_bytes: int = 5 * 1024 * 1024, backup_count: int = 0) -> None:
+        del backup_count
+        super().__init__(log_file, max_bytes=max_bytes, keep_bytes=2 * 1024 * 1024)

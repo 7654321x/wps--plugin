@@ -512,3 +512,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：只凭 PID、端口或文件存在判断健康；把 token 放在 URL 查询参数或日志；服务重启后保留旧 manifest。
 - 正确方案：manifest 原子写入并定期刷新 heartbeat；客户端校验 loopback、端口、instance、PID/创建时间、server/contract version 和 token；关闭时仅清理自己 instance 的 manifest。
 - 自动验证门槛：stale manifest、版本不匹配、错误 token、实例不匹配、重启和 AbortSignal 均有 Control Client/Server 测试。
+
+## P060 运行日志分散、重复且包含机器内部信息
+
+- 症状：启动器、WPS 页面、Broker 和旧诊断服务分别写入 JSONL、`.runtime/logs`、`broker.log` 或任务级日志；轮询失败会连续刷屏，用户只能看到英文占位错误或无法判断处理阶段。
+- 根因：不同进程各自维护日志格式和落盘边界，业务调用方直接保存原始异常、路径或请求结构，旧诊断客户端还固定连接 9528。
+- 禁止：新增第二个运行日志文件、恢复 `wps-plugin-debug.log` 作为生产日志、生成 `.1` 轮转副本、把完整路径/token/Cookie/正文/堆栈写入日志；不得用空 `catch`、默认值或重复兼容路径掩盖诊断发送失败。
+- 正确方案：所有运行期事件统一交给根目录 `wps-plugin.log` 的中文格式化器；输入事件经过当前 API 合同校验和脱敏后只输出中文可读行，错误必须包含阶段、原因、处理建议和稳定错误码；连续相同事件只记录一次，状态恢复后重新记录。Broker 子进程 stdout/stderr 不另写任务日志，旧 9528 诊断客户端和 WPS FileSystem 日志缓冲器不再属于生产链。
+- 自动验证门槛：`tests/test_unified_logging.py` 覆盖中文字段、稳定错误码、重复抑制、状态恢复、敏感值/绝对路径/堆栈脱敏和超限完整行保留；local-agent 与 Broker 测试确认只写 `wps-plugin.log`；`rg` 不得在生产代码发现 `wpsjs-debug.log`、`.runtime/logs`、`broker.log`、任务级 `.log` 或旧 Loopback 诊断客户端；真实 WPS 未运行时只能记录 `NOT RUN`，不得写成通过。

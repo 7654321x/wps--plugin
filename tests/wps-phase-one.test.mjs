@@ -45,7 +45,6 @@ import { errorMessage, errorText } from "../dist/apps/classified-offline/src/err
 import { probeWorkerCapability } from "../dist/apps/classified-offline/src/worker-capability.js";
 import { PipelineWorkerClient } from "../dist/apps/classified-offline/src/pipeline-worker-client.js";
 import { AdaptiveBatchController, SnapshotPipelineWorkerRuntime, createEquivalentSnapshot, generateWorkerCommands } from "../dist/apps/classified-offline/src/pipeline-worker.js";
-import { BoundedDiagnosticFileBuffer } from "../dist/apps/classified-offline/src/diagnostic-buffer.js";
 import { LocalFormatCommandGenerator } from "../dist/packages/local-format-engine/src/index.js";
 import { DiagnosticRunner, classifyNetworkError } from "../dist/packages/diagnostics/src/index.js";
 import { parsePipelineJob, parseWorkerHostRequest } from "../dist/packages/threading/src/index.js";
@@ -149,26 +148,6 @@ test("adaptive batch uses rolling Host duration without collapsing on normal rou
   assert.ok(outlier.record(11) > 1);
   const persistent = new AdaptiveBatchController(5);
   assert.deepEqual([persistent.record(101), persistent.record(120), persistent.record(130)], [4, 3, 1]);
-});
-
-test("diagnostic buffer batches fallback rewrites and caps the file instead of rewriting per event", () => {
-  const scheduled = []; let existing = "x".repeat(1_100_000); let reads = 0; let writes = 0;
-  const adapter = { hasNativeAppend() { return false; }, exists() { return true; }, readText() { reads += 1; return existing; }, writeText(_path, value) { writes += 1; existing = value; }, appendText() { throw new Error("MUST_NOT_APPEND"); } };
-  const buffer = new BoundedDiagnosticFileBuffer({ adapter: () => adapter, path: () => "C:\\logs\\wps.log", schedule(callback, delayMs) { const item = { callback, delayMs }; scheduled.push(item); return item; }, cancel() {}, batchLimit: 50, maxFileBytes: 1_000_000 });
-  for (let index = 0; index < 49; index += 1) buffer.enqueue(`event-${index}\n`);
-  assert.equal(reads, 0); assert.equal(writes, 0);
-  buffer.enqueue("event-49\n");
-  assert.equal(scheduled.at(-1).delayMs, 0);
-  scheduled.at(-1).callback();
-  assert.equal(reads, 1); assert.equal(writes, 1); assert.equal(buffer.flushCount, 1); assert.ok(existing.length <= 1_000_000);
-});
-
-test("diagnostic buffer prefers native append and does not read existing history", () => {
-  const scheduled = []; let appends = 0; let reads = 0;
-  const adapter = { hasNativeAppend() { return true; }, exists() { return true; }, readText() { reads += 1; return "old"; }, writeText() {}, appendText(_path, value) { appends += 1; assert.match(value, /urgent/); } };
-  const buffer = new BoundedDiagnosticFileBuffer({ adapter: () => adapter, path: () => "C:\\logs\\wps.log", schedule(callback, delayMs) { const item = { callback, delayMs }; scheduled.push(item); return item; }, cancel() {} });
-  buffer.enqueue("urgent\n", true); scheduled.at(-1).callback();
-  assert.equal(appends, 1); assert.equal(reads, 0);
 });
 
 test("PipelineWorkerClient forwards current-job RPCs and rejects duplicate or late work", async () => {
@@ -1155,7 +1134,7 @@ test("development recognition launch probe reuses the production Worker command 
   assert.equal(automatic.includes("startSnapshotJob"), false);
 });
 
-test("LocalApplicationRuntime logs the original stack while public state keeps only the stable error", async () => {
+test("LocalApplicationRuntime keeps diagnostic errors concise while public state keeps the stable error", async () => {
   const mocks = hostMocks();
   const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
   const store = new HostResultStore(mocks.storage, build, "host-a");
@@ -1170,7 +1149,8 @@ test("LocalApplicationRuntime logs the original stack while public state keeps o
     assert.equal(result.error_code, "ADDIN_CONTEXT_STALE");
     const failed = events.find((values) => values[2] === "application.runtime.run.failed");
     assert.ok(failed);
-    assert.match(failed[5].stack, /ADDIN_CONTEXT_STALE/);
+    assert.equal(failed[5].stack, undefined);
+    assert.match(failed[5].message, /ADDIN_CONTEXT_STALE/);
     const publicState = mocks.storage.getItem("docxtool_classified_host_result_v1");
     assert.equal(publicState.includes("stack"), false);
     assert.equal(JSON.parse(publicState).latest_error, "ADDIN_CONTEXT_STALE");
@@ -1248,7 +1228,7 @@ test("Ribbon normalizes synchronous host results and records rejected commands",
   assert.equal(context.OnAction({ Id: "apply" }), true);
   await Promise.resolve(); await Promise.resolve();
   assert.equal(logs.some((item) => item.event === "ribbon.command.failed"), true);
-  assert.equal(JSON.parse(storage.get("docxtool_classified_host_result_v1")).latest_error, "LOCAL_APPLICATION_COMMAND_FAILED");
+  assert.equal(JSON.parse(storage.get("docxtool_classified_host_error_v1")).error_code, "LOCAL_APPLICATION_COMMAND_FAILED");
 });
 
 test("Host install lifecycle retries recoverable failures and stops only after ready or fatal", async () => {
@@ -1295,9 +1275,8 @@ test("canonical ribbon reports taskpane creation failure instead of swallowing i
   const context = { Promise, JSON, Date, String, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3889/main.html"; } } }, window: { DocxtoolBuildInfo: { build_id: "build", asset_hash: "hash" }, Application: { PluginStorage: { getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) { storage.set(key, value); } }, CreateTaskPane() { return null; } } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "preview" }), true);
-  const state = JSON.parse(storage.get("docxtool_classified_host_result_v1"));
-  assert.equal(state.latest_error, "LOCAL_APPLICATION_RUNTIME_NOT_READY");
-  assert.match(state.formatting_progress, /本地应用运行时尚未就绪/);
+  const state = JSON.parse(storage.get("docxtool_classified_host_error_v1"));
+  assert.equal(state.error_code, "LOCAL_APPLICATION_RUNTIME_NOT_READY");
 });
 
 test("taskpane exposes immediate pending feedback until host consumes request", async () => {
@@ -1380,7 +1359,7 @@ test("classified Ribbon preserves a safe error when the host queue is stale", as
   } } };
   vm.runInNewContext(source, context);
   assert.equal(context.OnAction({ Id: "unknown" }), true);
-  assert.equal(storage.get("docxtool_classified_host_result_v1") !== undefined, true);
+  assert.equal(storage.get("docxtool_classified_host_error_v1") !== undefined, true);
 });
 
 test("one-click formatting removes the tracked preview then re-recognizes the current document", async () => {

@@ -10,7 +10,8 @@ wps-addon-publish/
 *.whl
 *.log
 wps-plugin-debug.log*
-!wps-plugin-debug.log
+wps-plugin.log
+.runtime/logs/
 /*.docx
 /tests/*工作副本.docx
 /tests/~$*.docx

@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import time
-import traceback
 import uuid
 
 from docx import Document
@@ -335,7 +334,7 @@ def create_app(session_token, e2e_runtime=None, diagnostic_log_file=None):
         if diagnostic_writer:
             diagnostic_writer.append([{
                 "timestamp": datetime_now(),
-                "level": "TRACE" if quiet else "DEBUG",
+                "level": "TRACE" if quiet else "INFO",
                 "component": "local-agent",
                 "event": "local_agent.request.received",
                 "message": "本地请求已接收",
@@ -352,7 +351,7 @@ def create_app(session_token, e2e_runtime=None, diagnostic_log_file=None):
             response = _handle_request(environ, capture_start)
             if diagnostic_writer:
                 status_code = int(str(captured["status"]).split(" ", 1)[0])
-                level = "TRACE" if quiet else "WARN" if status_code == 401 else "ERROR" if status_code >= 500 else "DEBUG"
+                level = "TRACE" if quiet else "WARN" if status_code == 401 else "ERROR" if status_code >= 500 else "INFO"
                 diagnostic_writer.append([{
                     "timestamp": datetime_now(),
                     "level": level,
@@ -377,7 +376,6 @@ def create_app(session_token, e2e_runtime=None, diagnostic_log_file=None):
                     "error": {
                         "name": type(exc).__name__,
                         "message": str(exc),
-                        "stack": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
                     },
                     "data": base_data,
                 }])

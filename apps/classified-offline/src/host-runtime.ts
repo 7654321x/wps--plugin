@@ -8,8 +8,8 @@ import { WpsHostBridge } from "../../../packages/wps-adapter/src/host-bridge.js"
 import { WpsCapabilityProvider } from "../../../packages/wps-adapter/src/official-host.js";
 import { probeWorkerCapability, type WorkerCapability } from "./worker-capability.js";
 import { PipelineWorkerClient, type SnapshotCommandReceipt } from "./pipeline-worker-client.js";
-import { BoundedDiagnosticFileBuffer } from "./diagnostic-buffer.js";
 import type { PipelineCommand, PipelineWorkerEvent } from "../../../packages/threading/src/protocol.js";
+import { safeError } from "../../../packages/diagnostics/src/index.js";
 type LocalCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "probe_shell_execute_one_argument";
 type LocalCommandSource = "ribbon" | "taskpane" | "test";
 type LocalApplicationCommandName = LocalCommandName | "show_about";
@@ -55,33 +55,21 @@ type HostWindow = Window & {
 };
 const hostWindow = globalThis as unknown as HostWindow;
 hostWindow.DocxtoolBootstrapLog?.("INFO", "host.module.loaded", "Host Runtime 经典脚本已执行", { application_available: Boolean(hostWindow.Application) }, undefined, "host");
-let diagnosticLogPath = "";
 let fallbackIdCounter = 0;
-const diagnosticFileBuffer = new BoundedDiagnosticFileBuffer({
-  adapter: () => {
-    const fs = hostWindow.Application?.FileSystem;
-    return fs ? new WpsLocalFileSystem(fs) : null;
-  },
-  path: () => diagnosticLogPath,
-  schedule: (callback, delayMs) => hostWindow.setTimeout(callback, delayMs),
-  cancel: (timer) => hostWindow.clearTimeout(timer as number),
-});
 function randomId(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   if (typeof crypto.getRandomValues === "function") { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join(""); }
   fallbackIdCounter += 1; return `${Date.now().toString(36)}-${fallbackIdCounter.toString(36)}`;
 }
-function appendHostLog(item: DiagnosticEvent): void {
-  diagnosticFileBuffer.enqueue(`${JSON.stringify(item)}\n`, item.level === "ERROR" || item.level === "FATAL");
-}
 function hostLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
   try {
-    if (hostWindow.DocxtoolDiagnosticLog) { hostWindow.DocxtoolDiagnosticLog(level, "host", event, message, data, error); return; }
-    if (hostWindow.DocxtoolEarlyLog) { hostWindow.DocxtoolEarlyLog(level, "host", event, message, data, error); return; }
+    const safe = error === undefined ? undefined : safeError(error);
+    if (hostWindow.DocxtoolDiagnosticLog) { hostWindow.DocxtoolDiagnosticLog(level, "host", event, message, data, safe); return; }
+    if (hostWindow.DocxtoolEarlyLog) { hostWindow.DocxtoolEarlyLog(level, "host", event, message, data, safe); return; }
     const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "host", event, message, data };
-    queue.push(item); appendHostLog(item);
-    if (queue.length > 500) queue.splice(0, queue.length - 500);
+    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "host", event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) };
+    queue.push(item);
+    if (queue.length > 100) queue.splice(0, queue.length - 100);
     hostWindow.DocxtoolEarlyLogQueue = queue;
   } catch { /* diagnostics never changes WPS host behavior */ }
 }
@@ -314,7 +302,6 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
     brokerExecutableSha256: typeof current?.broker_sha256 === "string" ? current.broker_sha256 : typeof manifest.broker_sha256 === "string" ? manifest.broker_sha256 : undefined,
     queueContractVersion: typeof current?.queue_contract_version === "number" ? current.queue_contract_version : typeof manifest.queue_contract_version === "number" ? manifest.queue_contract_version : typeof manifest.broker_contract_version === "number" ? manifest.broker_contract_version : undefined,
     runtimeManifestPath: normalizedManifestPath,
-    diagnosticLogPath: typeof manifest.diagnostic_log_path === "string" ? normalizeWpsPath(manifest.diagnostic_log_path) : undefined,
   };
 }
 function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
@@ -348,7 +335,6 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
       recognitionPackageVersion: direct.recognitionPackageVersion,
       contractVersion: direct.contractVersion,
       runtimeManifestPath: manifestPath || direct.runtimeManifestPath,
-      diagnosticLogPath: direct.diagnosticLogPath,
       threadedPreviewEnabled: direct.threadedPreviewEnabled === true,
       threadedPreviewMode: direct.threadedPreviewMode === "disabled" || direct.threadedPreviewMode === "diagnostic" || direct.threadedPreviewMode === "enabled" ? direct.threadedPreviewMode : direct.threadedPreviewEnabled === true ? "enabled" : "disabled",
       brokerVersion: direct.brokerVersion,
@@ -384,9 +370,9 @@ function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildI
         return;
       }
       const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, build_id: build.build_id, data, ...(error === undefined ? {} : { error: { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? "" : "" } }) };
-      queue.push(item); appendHostLog(item);
-      if (queue.length > 500) queue.splice(0, queue.length - 500);
+      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, build_id: build.build_id, data, ...(error === undefined ? {} : { error: safeError(error) }) };
+      queue.push(item);
+      if (queue.length > 100) queue.splice(0, queue.length - 100);
       hostWindow.DocxtoolEarlyLogQueue = queue;
     },
   };
@@ -396,7 +382,7 @@ function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildI
 }
 function install(application: ApplicationLike, build: BuildInfo, config: ClassifiedRuntimeConfig, hostContextId: string): void {
   installDiagnosticLogger(config, build, hostContextId);
-  const store = new HostResultStore(application.PluginStorage, build, hostContextId); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const runtime = new LocalApplicationRuntime(application, panes, store, config);
+  const store = new HostResultStore(application.PluginStorage, build, hostContextId); application.PluginStorage.setItem("docxtool_classified_host_error_v1", ""); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const runtime = new LocalApplicationRuntime(application, panes, store, config);
   let heartbeatTimer: number | undefined; let heartbeatExpected = 0; let heartbeatMaxDrift = 0;
   let running = false; let pipelineBusy = false; let activePipelineCommand: PipelineCommand | null = null;
   const invalidate = () => { const ribbon = application.ribbonUI as { InvalidateControl?: (id: string) => void } | undefined; ribbon?.InvalidateControl?.("preview"); ribbon?.InvalidateControl?.("apply"); ribbon?.InvalidateControl?.("health"); };
@@ -527,7 +513,6 @@ function tryInstall(): void {
   const started = Date.now();
   try {
     hostLog("INFO", "application.install.start", "开始安装本地应用运行时", installingReadiness);
-    diagnosticLogPath = config.diagnosticLogPath ?? "";
     const hostContextId = randomId();
     install(application, build, config, hostContextId);
     installState = "ready";

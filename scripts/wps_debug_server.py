@@ -12,8 +12,12 @@ import json
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sys
 from typing import Optional
 from urllib.parse import unquote, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from wps_logging import UnifiedLogWriter  # noqa: E402
 
 
 class WpsDebugHandler(SimpleHTTPRequestHandler):
@@ -24,8 +28,8 @@ class WpsDebugHandler(SimpleHTTPRequestHandler):
         return self.server.root  # type: ignore[attr-defined]
 
     @property
-    def log_path(self) -> Path:
-        return self.server.log_path  # type: ignore[attr-defined]
+    def log_writer(self) -> UnifiedLogWriter:
+        return self.server.log_writer  # type: ignore[attr-defined]
 
     def _headers(self, content_type: str, length: Optional[int] = None) -> None:
         self.send_header("Content-Type", content_type)
@@ -60,16 +64,9 @@ class WpsDebugHandler(SimpleHTTPRequestHandler):
             value = json.loads(self.rfile.read(size).decode("utf-8", errors="replace"))
             if not isinstance(value, dict):
                 raise ValueError("diagnostic payload must be an object")
-            line = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-            message = str(value.get("message") or value.get("event") or "收到 WPS 日志")
-            level = str(value.get("level") or "INFO")
-            component = str(value.get("component") or "WPS")
-            print("[%s] %s：%s" % (level, component, message), flush=True)
+            self.log_writer.append([value])
             self._send_bytes(HTTPStatus.NO_CONTENT, b"", "text/plain; charset=utf-8")
-        except Exception as error:  # diagnostics must never break the add-in
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as error:
             self.send_response(HTTPStatus.BAD_REQUEST)
             self._headers("application/json; charset=utf-8")
             self.end_headers()
@@ -146,7 +143,7 @@ def main() -> int:
         raise SystemExit("WPS_DEBUG_PACKAGE_MISSING: %s" % root)
     server = WpsDebugServer(("127.0.0.1", args.port), WpsDebugHandler)
     server.root = root  # type: ignore[attr-defined]
-    server.log_path = args.log.resolve()  # type: ignore[attr-defined]
+    server.log_writer = UnifiedLogWriter(args.log.resolve())  # type: ignore[attr-defined]
     print("Docxtool WPS 调试资源服务已启动：127.0.0.1:%d" % args.port, flush=True)
     try:
         server.serve_forever(poll_interval=0.25)

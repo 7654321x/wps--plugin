@@ -17,7 +17,6 @@ export interface ClassifiedRuntimeConfig {
   recognitionPackageVersion?: string;
   contractVersion?: number;
   runtimeManifestPath?: string;
-  diagnosticLogPath?: string;
   threadedPreviewEnabled?: boolean;
   threadedPreviewMode?: "disabled" | "diagnostic" | "enabled";
   brokerVersion?: string;

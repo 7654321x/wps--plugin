@@ -14,9 +14,9 @@ try {
   & $python (Join-Path $root "scripts\sync-default-format-profile.py") --check
   if ($LASTEXITCODE) { throw "PROFILE_SYNC_CHECK_FAILED" }
   $env:PYTHONPATH = "$root\control-server\src;$root\command-service\src;$root\local-agent\src"
-  & $python -m pytest control-server\tests command-service\tests local-agent\tests tests\test_grid_inspector.py -q
+  & $python -m pytest control-server\tests command-service\tests local-agent\tests local-runtime\tests tests\test_grid_inspector.py tests\test_unified_logging.py -q
   if ($LASTEXITCODE) { throw "PYTHON_TEST_FAILED" }
-  & $python -m ruff check control-server command-service local-agent scripts tests
+  & $python -m ruff check control-server command-service local-agent local-runtime scripts tests wps_logging.py
   if ($LASTEXITCODE) { throw "RUFF_FAILED" }
   & npm run build:classified
   if ($LASTEXITCODE) { throw "CLASSIFIED_BUILD_FAILED" }

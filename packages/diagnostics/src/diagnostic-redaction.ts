@@ -33,13 +33,11 @@ function sensitiveKey(key: string): boolean {
 export function safeError(error: unknown): {
   name: string;
   message: string;
-  stack?: string;
 } {
   if (error instanceof Error) {
     return {
       name: clip(redactString(error.name || "Error"), 200),
       message: clip(redactString(error.message || "Unknown error")),
-      stack: error.stack ? clip(redactString(error.stack), MAX_STACK) : undefined,
     };
   }
   return { name: "NonErrorThrown", message: clip(redactString(String(error))) };

@@ -3,7 +3,7 @@ param([ValidateSet("prepare", "status", "stop", "report", "auto")][string]$Actio
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtime = Join-Path $root ".runtime\e2e"
-$diagnosticLog = Join-Path $root "wps-plugin-debug.log"
+$diagnosticLog = Join-Path $root "wps-plugin.log"
 $python = Join-Path $root ".venv\Scripts\python.exe"
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $staticPort = 3889; $agentPort = 9528; $remoteDebugPort = 9222
@@ -18,7 +18,7 @@ function Flush-DiagnosticEvents {
     try {
       $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Method Post -ContentType "application/json" -Headers @{ "X-Docxtool-Session"=$script:DiagnosticToken } -Body $payload "http://127.0.0.1:$agentPort/v1/diagnostics/logs"
       $script:PendingDiagnosticEvents = @($script:PendingDiagnosticEvents | Select-Object -Skip $batch.Count)
-    } catch { return }
+    } catch { throw ("DIAGNOSTIC_FLUSH_FAILED: " + $_.Exception.Message) }
   }
 }
 function Write-DiagnosticEvent {
@@ -31,7 +31,7 @@ function Write-DiagnosticEvent {
     message = $Message
     data = $Data
   }
-  if ($script:PendingDiagnosticEvents.Count -gt 500) { $script:PendingDiagnosticEvents = @($script:PendingDiagnosticEvents | Select-Object -Last 500) }
+  if ($script:PendingDiagnosticEvents.Count -gt 100) { $script:PendingDiagnosticEvents = @($script:PendingDiagnosticEvents | Select-Object -Last 100) }
   Flush-DiagnosticEvents
 }
 
@@ -44,7 +44,7 @@ function Test-Static {
 function Test-DiagnosticStatus {
   try {
     $value = Invoke-RestMethod -TimeoutSec 2 "http://127.0.0.1:$agentPort/v1/diagnostics/status"
-    return $value.ok -eq $true -and $value.file_name -eq "wps-plugin-debug.log"
+    return $value.ok -eq $true -and $value.file_name -eq "wps-plugin.log"
   } catch { return $false }
 }
 function Test-SessionToken([int]$Port, [string]$Path, [string]$Token) {
@@ -77,8 +77,7 @@ function Show-Status {
   } | Format-List
 }
 function Start-Managed([string]$Name, [string]$FilePath, [string[]]$Arguments) {
-  $logs = Join-Path $runtime "logs"; New-Item -ItemType Directory -Force -Path $logs | Out-Null
-  Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "$Name.out.log") -RedirectStandardError (Join-Path $logs "$Name.err.log") -PassThru
+  Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
 }
 function Find-WpsWriter {
   # WPS forwards document-open requests to the active installation.  Picking
@@ -146,8 +145,7 @@ if ($Action -eq "prepare") {
   $restartWpsjs = -not ((Test-Static) -and $registeredAtFixedPort)
   if ($restartWpsjs) {
     Stop-ManagedPort $staticPort
-    $logs = Join-Path $runtime "logs"; New-Item -ItemType Directory -Force -Path $logs | Out-Null
-    $debug = Start-Process -FilePath "npx.cmd" -ArgumentList @("--no-install", "wpsjs", "debug", "-p", "$staticPort", "-d", "-r", "$remoteDebugPort") -WorkingDirectory (Join-Path $root "apps\classified-offline") -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "wpsjs.out.log") -RedirectStandardError (Join-Path $logs "wpsjs.err.log") -PassThru
+    $debug = Start-Process -FilePath "npx.cmd" -ArgumentList @("--no-install", "wpsjs", "debug", "-p", "$staticPort", "-d", "-r", "$remoteDebugPort") -WorkingDirectory (Join-Path $root "apps\classified-offline") -WindowStyle Hidden -PassThru
     $null = $debug
   }
   Write-DiagnosticEvent "INFO" "launcher.wpsjs.start" "WPS 静态资源服务已启动或复用" @{ restarted=$restartWpsjs; port=$staticPort }

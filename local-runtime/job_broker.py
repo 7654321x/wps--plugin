@@ -25,6 +25,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from wps_logging import UnifiedLogWriter  # noqa: E402
+
 
 SCHEMA_VERSION = 1
 CONTRACT_VERSION = 1
@@ -149,6 +152,7 @@ class BrokerConfig:
     broker_version: str = BROKER_VERSION
     contract_version: int = CONTRACT_VERSION
     broker_executable_path: Optional[Path] = None
+    log_path: Optional[Path] = None
 
     @property
     def jobs_root(self) -> Path:
@@ -179,7 +183,7 @@ class JobBroker:
         self.last_error_code = ""
         self.active_job_id: Optional[str] = None
         self.active_process: Optional[subprocess.Popen] = None
-        self.active_log = None
+        self.log_writer = UnifiedLogWriter(config.log_path) if config.log_path else None
         self.last_heartbeat = 0.0
 
     def run_once(self) -> bool:
@@ -435,17 +439,14 @@ class JobBroker:
             if cancel_path.exists():
                 self._finish_cancelled(job_dir, job_id)
                 return
-            log_path = self.config.broker_root / "jobs" / f"{job_id}.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.active_log = log_path.open("ab")
             creation_flags = 0
             if sys.platform == "win32":
                 creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             process = subprocess.Popen(
                 [str(runtime["recognizer_path"]), "--request", str(request_path), "--result", str(result_path), "--error", str(error_path)],
                 stdin=subprocess.DEVNULL,
-                stdout=self.active_log,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 shell=False,
                 creationflags=creation_flags,
                 close_fds=True,
@@ -500,7 +501,8 @@ class JobBroker:
             self._log("识别完成", self.active_job_id)
         elif error_exists:
             atomic_write_json(job_dir / "finished.json", {"schema_version": SCHEMA_VERSION, "job_id": self.active_job_id, "finished_at": utc_now(), "exit_code": return_code, "state": "failed"})
-            self._log("识别失败", self.active_job_id)
+            error_payload = read_json(job_dir / "error.json")
+            self._log("识别失败", self.active_job_id, str(error_payload.get("error_code", "LOCAL_RECOGNITION_FAILED")))
         elif cancel_requested:
             self._finish_cancelled(job_dir, self.active_job_id, "CANCELLED_DURING_RECOGNITION")
         else:
@@ -548,22 +550,29 @@ class JobBroker:
         self._close_active()
 
     def _close_active(self) -> None:
-        if self.active_log is not None:
-            try:
-                self.active_log.close()
-            except OSError:
-                pass
-        self.active_log = None
         self.active_process = None
         self.active_job_id = None
 
     def _log(self, message: str, job_id: str, code: str = "") -> None:
-        # The log intentionally contains no source text or complete paths.
-        line = f"{utc_now()} [BROKER] {message} job={job_id[:8]}" + (f" code={code}" if code else "") + "\n"
-        log_path = self.config.broker_root / "broker.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+        if self.log_writer is None:
+            return
+        event_codes = {
+            "任务已领取": "broker.job.claimed",
+            "识别进程已启动": "broker.recognizer.started",
+            "识别结果已由 Worker 消费": "broker.result.consumed",
+            "识别完成": "broker.recognizer.completed",
+            "识别失败": "broker.recognizer.failed",
+            "任务已取消": "broker.job.cancelled",
+            "任务失败": "broker.job.failed",
+        }
+        self.log_writer.append([{
+            "timestamp": utc_now(),
+            "level": "ERROR" if code else "INFO",
+            "component": "broker",
+            "event": event_codes.get(message, "broker.event"),
+            "message": message,
+            "data": {"request_id": job_id[:8], "stable_error_code": code},
+        }])
 
 
 def appdata_root(value: Optional[str]) -> Path:
@@ -578,9 +587,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("action", nargs="?", choices=("run", "once"), default="run")
     parser.add_argument("--root", help="AppData Docxtool root, used by tests and diagnostics")
     parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL_SECONDS)
+    parser.add_argument("--log-path", default="", help="统一中文运行日志路径")
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else appdata_root(None)
-    config = BrokerConfig(appdata_root=root, scan_interval_seconds=max(0.1, min(0.25, args.scan_interval)))
+    config = BrokerConfig(appdata_root=root, scan_interval_seconds=max(0.1, min(0.25, args.scan_interval)), log_path=Path(args.log_path) if args.log_path else None)
     broker = JobBroker(config)
     if args.action == "once":
         broker.run_once()
