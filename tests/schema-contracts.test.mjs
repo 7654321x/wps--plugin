@@ -10,6 +10,9 @@ const names = [
   "formatting-command-set-1.2.schema.json",
   "client-capabilities.schema.json",
   "execution-result.schema.json",
+  "control-job-request.schema.json",
+  "control-job-result.schema.json",
+  "control-endpoint-manifest.schema.json",
 ];
 const schemas = await Promise.all(names.map(async (name) => JSON.parse(
   await readFile(new URL("../schemas/" + name, import.meta.url), "utf8"),
@@ -75,4 +78,16 @@ test("command request schema rejects plaintext and absolute-path fields", () => 
     product_version: "0.1.0", authorization_scope: "classified-offline", local_path: "C:/secret.docx",
   };
   assert.equal(validate(unsafe), false);
+});
+
+test("control-plane schemas keep the endpoint and job envelope bounded", () => {
+  const requestSchema = ajv.getSchema("https://docxtool.local/schemas/control-job-request.schema.json");
+  const resultSchema = ajv.getSchema("https://docxtool.local/schemas/control-job-result.schema.json");
+  const endpointSchema = ajv.getSchema("https://docxtool.local/schemas/control-endpoint-manifest.schema.json");
+  const request = { schema_version: 1, request_id: "preview-12345678", mode: "preview", document_token: "doc-1", document_revision: "rev-1", snapshot_sha256: "a".repeat(64), snapshot: { paragraphs: [] } };
+  assert.equal(requestSchema(request), true);
+  assert.equal(requestSchema({ ...request, executable: "bad.exe" }), false);
+  assert.equal(resultSchema({ schema_version: 1, job_id: "22222222-2222-4222-8222-222222222222", request_id: request.request_id, document_token: request.document_token, snapshot_sha256: request.snapshot_sha256, recognition_result: {}, formatting_plan: { commands: [] }, warnings: [] }), true);
+  assert.equal(endpointSchema({ schema_version: 1, instance_id: "11111111-1111-4111-8111-111111111111", pid: 1, process_created_at: "now", host: "127.0.0.1", port: 43127, base_url: "http://127.0.0.1:43127", session_token: "t".repeat(32), server_version: "1.4.0", contract_version: 1, started_at: "now", heartbeat_at: "now" }), true);
+  assert.equal(endpointSchema({ schema_version: 1, instance_id: "11111111-1111-4111-8111-111111111111", pid: 1, process_created_at: "now", host: "127.0.0.1", port: 9528, base_url: "http://127.0.0.1:9528", session_token: "t".repeat(32), server_version: "1.4.0", contract_version: 1, started_at: "now", heartbeat_at: "now" }), false);
 });

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docxtool.local/schemas/control-endpoint-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "instance_id", "pid", "process_created_at", "host", "port", "base_url", "session_token", "server_version", "contract_version", "started_at", "heartbeat_at"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "instance_id": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" },
+    "pid": { "type": "integer", "minimum": 1 },
+    "process_created_at": { "type": "string", "minLength": 1 },
+    "host": { "const": "127.0.0.1" },
+    "port": { "type": "integer", "minimum": 1024, "maximum": 65535, "not": { "const": 9528 } },
+    "base_url": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]+$" },
+    "session_token": { "type": "string", "minLength": 32 },
+    "server_version": { "type": "string", "minLength": 1 },
+    "contract_version": { "const": 1 },
+    "started_at": { "type": "string", "minLength": 1 },
+    "heartbeat_at": { "type": "string", "minLength": 1 }
+  }
+}

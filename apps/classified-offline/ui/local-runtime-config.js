@@ -4,6 +4,7 @@ window.DocxtoolLocalRuntimeConfig = {
   brokerStatusPath: "%APPDATA%\\Docxtool\\broker\\status.json",
   brokerJobsPath: "%APPDATA%\\Docxtool\\jobs",
   launchProbeExecutablePath: "%APPDATA%\\Docxtool\\launch-probe\\docxtool-launch-probe.exe",
+  controlServerEnabled: false,
   threadedPreviewEnabled: false,
   threadedPreviewMode: "diagnostic"
 };

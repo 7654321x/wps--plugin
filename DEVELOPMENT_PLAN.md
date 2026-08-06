@@ -1,5 +1,11 @@
 # Docxtool WPS 插件总体架构规划
 
+## 2026-08-06 Control Server 迁移状态（v1.4.0）
+
+已完成 C0–C4、C6、C7 的基础设施：`control-server/` 提供随机 loopback HTTP、Bearer token、endpoint manifest、instance/PID/创建时间/版本/合同/心跳校验、单 active + 单 queued Job Store、取消和超时；`packages/control-client` 提供 Dedicated Worker 使用的 Local HTTP ControlTransport；Worker 可通过显式 `control_endpoint` 配置进入控制面路径。C5 的受校验 runtime RecognitionPort 尚未接入，服务会如实报告该能力未配置。
+
+当前不自动打开 `controlServerEnabled`，也未切换正式 preview/format。原因是生产 RecognitionPort 必须继续复用受校验的 `docxtool-recognize.exe`/Broker，并先完成 C5 shadow、C14 diagnostic 20/200/1000 与真实 WPS 保存证据。下一步严格顺序：C5 RecognitionPort → C6 FormattingPort 联调 → C7 shadow 对照 → C8–C13 Worker/Host/自动门禁 → C14–C16 真实 WPS。
+
 ## 一、产品目标
 
 WPS 插件负责读取当前打开的文档，在用户电脑上完成文档识别，再向命令服务请求排版命令，最后通过 WPS API 直接修改当前文档。

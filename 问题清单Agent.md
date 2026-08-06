@@ -316,7 +316,7 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 
 - 症状：虽然识别 EXE 和命令生成器都在本地，Ribbon 仍执行 `HostEnqueue → LocalCommandBus → HostCommandRouter`，让本地直调看起来像另一套服务链。
 - 根因：早期为了异步调度和 TaskPane 共用而增加了 Host 队列层，后来正式 Application Use Case 已稳定，但入口没有同步收口。
-- 禁止：生产 Ribbon 使用 HostEnqueue/HostDispatch；为预览或排版另写队列执行器；回退 HTTP、9528、local-agent 或 command-service。
+- 禁止：生产 Ribbon 使用 HostEnqueue/HostDispatch；为预览或排版另写队列执行器；回退旧 9528/local-agent/command-service HTTP 链，或让 Ribbon/Host 直接调用 Control Server。
 - 正确方案：唯一全局入口为 `DocxtoolRunLocalCommand`，直接进入 `LocalApplicationRuntime` 和正式用例；用一个执行中互斥锁阻止重复点击。TaskPane 也调用同一入口。
 - 自动门槛：生产入口扫描不得出现 `DocxtoolHostEnqueue`、`DocxtoolHostDispatch`、`HostCommandRouter` 或 `LocalCommandBus`；Ribbon 测试证明四个按钮直接调用同一 Runtime；verify-local-direct 必须 PASS。
 
@@ -373,7 +373,7 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 
 - 症状：Host Runtime 的一个长 Promise 同时负责快照、识别等待、命令生成、批注和排版，Ribbon busy 生命周期与长调用栈绑定，无法可靠取消。
 - 根因：业务流程状态机、纯计算和不可替代的 WPS JSAPI 位于同一页面线程装配中。
-- 禁止：Worker 访问 `window/Application`；TaskPane 冒充 Worker；恢复任何业务 HTTP 服务；未真实验收就写 PASS。
+- 禁止：Worker 访问 `window/Application`；TaskPane 冒充 Worker；恢复旧 9528/local-agent/command-service 业务 HTTP；未真实验收就写 PASS。
 - 正确方案：Worker-Orchestrated WPS Host Bridge。消息只允许经运行时校验的纯 JSON；所有 RPC 带 job/rpc/build/document 标识；Host 只执行有限批次，Worker 控制进度、超时、取消和迟到结果。
 - 自动验证门槛：classic Worker 真实宿主探针 PASS；Worker 产物无 WPS API；Host RPC 有硬批次上限；生产 Host 不再直接调用 PreviewDocumentUseCase/FormatDocumentUseCase；取消和事务分批回滚通过真实 WPS 验收。
 
@@ -480,3 +480,35 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：任务目录消失后重新创建 heartbeat/error；用 status 的旧 `last_error_code` 代替当前任务结果；在 Worker 已收到有效 result 后覆盖为失败。
 - 正确方案：active recognizer 的任务目录消失时等待进程退出并关闭 active，不重建目录、不生成伪造错误；成功 result 清空当前 Broker 错误码；所有客户端清理必须同时清除 `claim.lock`。
 - 自动验证门槛：Python 回归覆盖 result 后目录清理；安装后的 Broker smoke 通过且 status `last_error_code` 为空；TypeScript recognition-client 和 WPS adapter 清理列表包含 `claim.lock`。
+
+## P056 Control Server 端口策略与旧无端口规则冲突
+
+- 症状：新控制面需要本机 HTTP 编排，但旧规范把所有新增业务端口一概视为禁止，导致实现被错误阻断或偷偷回到文件合同。
+- 根因：旧 Broker 的“无端口识别执行”边界被误写成“整个产品不得有控制端口”；控制面传输与识别执行传输是两个职责不同的边界。
+- 禁止：恢复固定 `9528` 作为生产控制面；监听 `0.0.0.0`、局域网或公网地址；让 WPS UI 主线程启动服务或同步等待 HTTP；把旧 `local-agent`/`command-service` 重新接回生产链。
+- 正确方案：Control Server 由 `main.py` 或用户级启动器在 WPS 外启动，只监听 `127.0.0.1` 的随机高位端口；通过 endpoint manifest 暴露 instance、PID、创建时间、Bearer token、版本、合同版本和心跳；识别仍通过受校验的 `docxtool-recognize.exe` runtime/Broker 执行。
+- 自动验证门槛：启动测试确认端口不是固定 `9528` 且绑定地址为 `127.0.0.1`；无 token/错误 token/非 loopback Host 被拒绝；manifest 字段完整；生产扫描确认 WPS UI 无服务启动和 HTTP 等待。
+
+## P057 Control Server 事件循环承载业务计算
+
+- 症状：HTTP 请求线程在识别、排版规划或大 JSON 转换期间长时间不响应，健康检查和取消请求被拖住。
+- 根因：路由处理器直接调用识别/格式实现，缺少有界 Job Store 和可取消后台协调器。
+- 禁止：在路由中同步等待识别完成；建立无界线程池或无界任务队列；仅增加 HTTP timeout 掩盖 CPU/子进程阻塞。
+- 正确方案：POST 只入队并立即返回 `202`；Coordinator 只允许一个 active job 和一个 queued job，识别与规划通过独立 Port 执行，取消和超时使用显式 CancellationToken，迟到结果丢弃。
+- 自动验证门槛：提交立即返回；重复 `request_id` 幂等；第三个任务被拒绝；queued/recognizing/planning 各阶段可取消；超时产生稳定错误码且 `/v1/health` 仍可响应。
+
+## P058 Control Server 接收任意执行指令
+
+- 症状：请求 JSON 可以指定模块、函数、EXE 路径、命令行或脚本，控制面变成任意代码执行入口。
+- 根因：把适配器选择和业务参数暴露给网络合同，而不是在服务端固定本地白名单。
+- 禁止：`eval`、动态 import、任意 `executable`/`command`/`script` 字段；服务器直接操作 WPS Application、Range 或 COM。
+- 正确方案：请求只包含版本化 HostSnapshot 和模式；RecognitionPort/FormattingPlannerPort 由本地固定装配注册，服务器只返回严格 JSON；WPS API 仍只由 Worker/HostBridge 本地执行。
+- 自动验证门槛：合同测试拒绝危险字段、任意命令和非法模式；源码扫描无 `eval`/`new Function`；Control Server 日志不含正文、路径、token 或完整结果 JSON。
+
+## P059 Control Server endpoint manifest 被陈旧进程冒认
+
+- 症状：只凭 endpoint 文件或 PID 复用旧服务，客户端连接到错误版本、错误实例或已轮换 token 的进程。
+- 根因：manifest 没有稳定 instance、进程创建时间、版本、合同和心跳联合校验。
+- 禁止：只凭 PID、端口或文件存在判断健康；把 token 放在 URL 查询参数或日志；服务重启后保留旧 manifest。
+- 正确方案：manifest 原子写入并定期刷新 heartbeat；客户端校验 loopback、端口、instance、PID/创建时间、server/contract version 和 token；关闭时仅清理自己 instance 的 manifest。
+- 自动验证门槛：stale manifest、版本不匹配、错误 token、实例不匹配、重启和 AbortSignal 均有 Control Client/Server 测试。

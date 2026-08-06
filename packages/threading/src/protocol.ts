@@ -139,6 +139,8 @@ export interface PipelineWorkerConfig {
   profile: JsonValue;
   client_capabilities: import("../../contracts/src/index.js").ClientCapabilities;
   authorization_scope: "classified-offline";
+  /** Optional C7 control-plane endpoint; absent keeps the proven local path. */
+  control_endpoint?: import("../../control-client/src/contracts.js").ControlEndpointManifest;
 }
 export interface PipelineInitMessage { type: "pipeline.init"; build_id: string; config?: PipelineWorkerConfig; }
 export interface PipelineStartMessage { type: "pipeline.start"; job: PipelineJob; }

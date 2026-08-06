@@ -731,6 +731,39 @@ test("recognition Worker owns polling and returns the mapped RecognitionResult",
   const result = await terminal; assert.equal(result.type, "pipeline.completed"); assert.equal(result.command, "recognize"); assert.equal(result.recognition_result.recognition_engine_version, "4.0"); assert.equal(probes, 2);
 });
 
+test("control-enabled Worker submits and polls through ControlTransport without Host recognition RPC", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = []; let submitted = null;
+  globalThis.fetch = async (url, options) => {
+    const endpoint = new URL(String(url)); calls.push(endpoint.pathname);
+    if (endpoint.pathname === "/v1/jobs" && options.method === "POST") {
+      submitted = JSON.parse(options.body);
+      return new Response(JSON.stringify({ job_id: "33333333-3333-4333-8333-333333333333", request_id: submitted.request_id, status: "queued" }), { status: 202 });
+    }
+    if (endpoint.pathname === "/v1/jobs/33333333-3333-4333-8333-333333333333") return new Response(JSON.stringify({ schema_version: 1, job_id: "33333333-3333-4333-8333-333333333333", request_id: submitted.request_id, status: "completed", stage: "completed", created_at: new Date().toISOString() }), { status: 200 });
+    if (endpoint.pathname.endsWith("/result")) return new Response(JSON.stringify({ schema_version: 1, job_id: "33333333-3333-4333-8333-333333333333", request_id: submitted.request_id, document_token: submitted.document_token, snapshot_sha256: submitted.snapshot_sha256, recognition_result: { schema_version: "1.2", recognition_engine_version: "control-test", document_id: "doc-1", document_revision: "rev-1", source_sha256: submitted.snapshot_sha256, document_mode: "normal", document_mode_confidence: 1, paragraphs: [] }, formatting_plan: {}, warnings: [] }), { status: 200 });
+    throw new Error("UNEXPECTED_CONTROL_ENDPOINT");
+  };
+  try {
+    const bridge = {
+      async handle(request) {
+        if (request.operation === "host.capture_document_descriptor") return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: { document_token: "doc-1", saved: true, local_docx_path: "C:\\fixture.docx", local_docx_path_hash: SHA, paragraph_count: 1, section_count: 1, extension: ".docx" } };
+        if (request.operation === "host.read_paragraph_batch") return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: [{ host_paragraph_index: 0, raw_text: "脱敏段落", is_in_table: false, range_start: 0, range_end: 4 }] };
+        throw new Error("HOST_RECOGNITION_RPC_MUST_NOT_RUN");
+      },
+    };
+    class LoopbackWorker { onmessage = null; onerror = null; onmessageerror = null; scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) }; runtime = new SnapshotPipelineWorkerRuntime(this.scope); postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); } terminate() {} }
+    const endpoint = { schema_version: 1, instance_id: "11111111-1111-4111-8111-111111111111", pid: 1, process_created_at: new Date().toISOString(), host: "127.0.0.1", port: 43127, base_url: "http://127.0.0.1:43127", session_token: "t".repeat(48), server_version: "1.4.0", contract_version: 1, started_at: new Date().toISOString(), heartbeat_at: new Date().toISOString() };
+    const terminal = new Promise((resolve) => { const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerConfig: { profile: {}, client_capabilities: { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: [] }, authorization_scope: "classified-offline", control_endpoint: endpoint }, workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } }); assert.equal(client.start("recognize").accepted, true); });
+    const result = await terminal;
+    assert.equal(result.type, "pipeline.completed");
+    assert.equal(result.recognition_result.recognition_engine_version, "control-test");
+    assert.deepEqual(calls, ["/v1/jobs", "/v1/jobs/33333333-3333-4333-8333-333333333333", "/v1/jobs/33333333-3333-4333-8333-333333333333/result"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Worker command generation is field-equivalent to the legacy local format generator", async () => {
   const text = "xxxx"; const textHash = hashText(text);
   const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "4.0", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: textHash, physical_text_sha256: textHash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields(text) }] };
@@ -1395,6 +1428,7 @@ test("classified UI error messages localize stable WPS error codes", () => {
   assert.match(errorMessage("DOCUMENT_MUST_BE_SAVED"), /当前文档尚未保存/);
   assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先在 WPS 中保存为本地 \.docx 文件/);
   assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /错误码：DOCUMENT_MUST_BE_SAVED/);
+  assert.match(errorMessage("CONTROL_SERVER_NOT_RUNNING"), /Control Server 未运行/);
 });
 
 test("diagnostic runner blocks dependent checks and identifies the first root cause", async () => {

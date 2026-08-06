@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,10 @@ if sys.platform == "win32":
         pass
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 ROOT = Path(__file__).resolve().parent
 WPSJS_PORT = 3889
 WPS_LOG = ROOT / "wps-plugin-debug.log"
@@ -41,6 +46,7 @@ WPSJS_LOG = ROOT / ".runtime" / "logs" / "wpsjs-debug.log"
 WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
 JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
+CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
 
 
 class StepFailed(RuntimeError):
@@ -125,7 +131,10 @@ def print_status() -> None:
     print(f"- 本地任务 Broker：{'已就绪' if broker_healthy(current, status) else '未就绪'}")
     print(f"- Broker PID：{status.get('pid', '未知')}")
     print(f"- Broker 版本：{status.get('broker_version', '未知')}")
-    print("- Broker 通信：文件队列；网络端口：无")
+    control = control_server_health()
+    print(f"- WPS Control Server：{'已就绪' if control.get('status') == 'ready' else '未就绪'}")
+    print(f"- Control Server 端口：{control.get('port', '未知')}（仅 127.0.0.1 随机端口）")
+    print("- Broker 通信：文件队列；识别执行不开放网络端口")
     print(f"- 旧 local-agent：{'未使用' if values.get('local_agent') == 'NOT_USED' else '异常运行中'}")
     print(f"- 旧 command-service：{'未使用' if values.get('command_service') == 'NOT_USED' else '异常运行中'}")
     print(f"- 旧 9528 端口：{'已关闭' if values.get('port_9528') == 'CLOSED' else '仍在监听'}")
@@ -140,6 +149,116 @@ def prepare() -> None:
     run_step("构建 WPS 插件", "npm run build:classified", "WPS 插件构建完成。")
     run_step("检查 WPS 插件结构", "npm run verify:addin -- classified-offline", "WPS 插件结构检查已完成。")
     run_step("生成 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "WPS 调试包已生成。")
+
+
+def control_manifest_path() -> Path:
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if not root:
+        raise StepFailed("检查 WPS Control Server", "LOCALAPPDATA/APPDATA", "CONTROL_SERVER_APPDATA_UNAVAILABLE")
+    return Path(root) / "DocxToolWps" / "control" / "endpoint.json"
+
+
+def control_server_health() -> Dict[str, object]:
+    manifest_path = control_manifest_path()
+    manifest = read_json(manifest_path)
+    base_url = str(manifest.get("base_url", ""))
+    token = str(manifest.get("session_token", ""))
+    port = manifest.get("port")
+    heartbeat = manifest.get("heartbeat_at")
+    if not base_url or not token or manifest.get("host") != "127.0.0.1" or not isinstance(port, int) or port == 9528:
+        return {}
+    if not isinstance(manifest.get("pid"), int) or not isinstance(manifest.get("instance_id"), str) or not isinstance(manifest.get("process_created_at"), str) or not isinstance(manifest.get("server_version"), str) or manifest.get("contract_version") != 1:
+        return {}
+    if not process_is_alive(manifest.get("pid")):
+        return {}
+    metadata = process_metadata(manifest.get("pid"))
+    if metadata and not timestamps_match(metadata.get("process_created_at"), manifest.get("process_created_at")):
+        return {}
+    try:
+        heartbeat_time = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - heartbeat_time).total_seconds() > 10:
+            return {}
+        endpoint = urllib.parse.urlsplit(base_url)
+        if endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1" or endpoint.port != port:
+            return {}
+        request = urllib.request.Request(
+            base_url.rstrip("/") + "/v1/health",
+            headers={"Authorization": "Bearer " + token, "Host": "127.0.0.1"},
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            value = json.loads(response.read().decode("utf-8"))
+        if not isinstance(value, dict) or value.get("status") != "ready":
+            return {}
+        if value.get("pid") != manifest.get("pid") or value.get("instance_id") != manifest.get("instance_id") or value.get("server_version") != manifest.get("server_version") or value.get("contract_version") != manifest.get("contract_version") or value.get("process_created_at") != manifest.get("process_created_at"):
+            return {}
+        return {**value, "port": port, "manifest_path": str(manifest_path), "instance_id": manifest.get("instance_id", "")}
+    except (OSError, ValueError, TypeError, urllib.error.URLError):
+        return {}
+
+
+def ensure_control_server() -> Dict[str, object]:
+    manifest_path = control_manifest_path()
+    healthy = control_server_health()
+    if healthy:
+        previous = read_json(CONTROL_SERVER_PROCESS)
+        if previous.get("pid") == healthy.get("pid") and str(previous.get("manifest_path", "")) == str(manifest_path):
+            CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": healthy.get("pid"), "manifest_path": str(manifest_path), "started_at": healthy.get("heartbeat_at", ""), "process_created_at": healthy.get("process_created_at", ""), "instance_id": healthy.get("instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"WPS Control Server 已复用（127.0.0.1:{healthy.get('port')}，实例 {str(healthy.get('instance_id', ''))[:8]}）。", flush=True)
+        return healthy
+    metadata = read_json(CONTROL_SERVER_PROCESS)
+    process_id = metadata.get("pid")
+    if process_id and process_is_alive(process_id):
+        # Do not terminate an unknown process merely because the manifest is
+        # stale.  Only a process recorded by this launcher can be replaced.
+        if str(metadata.get("manifest_path", "")) == str(manifest_path) and managed_control_server_process(process_id, manifest_path, metadata.get("process_created_at")):
+            try:
+                subprocess.run(["taskkill", "/PID", str(int(process_id)), "/T", "/F"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    log_path = ROOT / ".runtime" / "logs" / "control-server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
+    process = subprocess.Popen(
+        [sys.executable, str(ROOT / "control-server" / "run.py"), "start", "--manifest", str(manifest_path), "--port", "0"],
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    log_handle.close()
+    CONTROL_SERVER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": process.pid, "manifest_path": str(manifest_path), "started_at": utc_now(), "process_created_at": process_metadata(process.pid).get("process_created_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+    for _ in range(40):
+        time.sleep(0.1)
+        healthy = control_server_health()
+        if healthy:
+            CONTROL_SERVER_PROCESS.write_text(json.dumps({"pid": healthy.get("pid"), "manifest_path": str(manifest_path), "started_at": healthy.get("heartbeat_at", ""), "process_created_at": healthy.get("process_created_at", ""), "instance_id": healthy.get("instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"WPS Control Server 已就绪（127.0.0.1:{healthy.get('port')}）。", flush=True)
+            return healthy
+        if process.poll() is not None:
+            raise StepFailed("启动 WPS Control Server", "control-server/run.py", "CONTROL_SERVER_EXITED")
+    raise StepFailed("启动 WPS Control Server", "control-server/run.py", "CONTROL_SERVER_READY_TIMEOUT")
+
+
+def stop_control_server() -> None:
+    metadata = read_json(CONTROL_SERVER_PROCESS)
+    process_id = metadata.get("pid")
+    manifest_path = control_manifest_path()
+    if process_id and process_is_alive(process_id) and str(metadata.get("manifest_path", "")) == str(manifest_path) and managed_control_server_process(process_id, manifest_path, metadata.get("process_created_at")):
+        try:
+            subprocess.run(["taskkill", "/PID", str(int(process_id)), "/T", "/F"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except (OSError, ValueError):
+            pass
+    try:
+        CONTROL_SERVER_PROCESS.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def is_port_open(port: int) -> bool:
@@ -206,6 +325,18 @@ def timestamps_match(left: object, right: object) -> bool:
         return abs((first - second).total_seconds()) <= 2
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def managed_control_server_process(pid: object, manifest_path: Path, expected_created_at: object = None) -> bool:
+    value = process_metadata(pid)
+    if not value:
+        return False
+    command_line = str(value.get("command_line", "")).lower().replace("/", "\\")
+    expected_launcher = str(ROOT / "control-server" / "run.py").lower().replace("/", "\\")
+    expected_manifest = str(manifest_path).lower().replace("/", "\\")
+    if expected_launcher not in command_line or expected_manifest not in command_line:
+        return False
+    return expected_created_at is not None and timestamps_match(value.get("process_created_at"), expected_created_at)
 
 
 def managed_broker_process(pid: object, executable: Path, expected_created_at: object = None) -> bool:
@@ -533,18 +664,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         "action",
         nargs="?",
         default="start",
-        choices=("start", "prepare", "status", "diagnose", "logs", "stop", "reset", "verify"),
-        help="start=完整启动；prepare=准备构建；status=查看状态；diagnose=装载诊断；logs=交互日志；verify=功能检测",
+        choices=("start", "prepare", "status", "diagnose", "logs", "stop", "reset", "verify", "control-status", "control-stop"),
+        help="start=完整启动；prepare=准备构建；status=查看状态；control-status/control-stop=控制服务状态；diagnose=装载诊断；logs=交互日志；verify=功能检测",
     )
     parser.add_argument("--once", action="store_true", help="启动完成后立即返回，不持续监视 WPS 日志")
     args = parser.parse_args(argv)
 
     print("Docxtool WPS 本地直连版", flush=True)
-    print("说明：本入口不启动 9528，不启动 local-agent，不启动 command-service。", flush=True)
+    print("说明：本入口启动随机 loopback WPS Control Server；不启动旧 9528/local-agent/command-service。", flush=True)
 
     try:
         if args.action == "start":
             prepare()
+            ensure_control_server()
             register_addin()
             verify()
             print_status()
@@ -566,8 +698,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.action == "logs":
             watch_wps_log()
         elif args.action == "stop":
+            stop_control_server()
             stop_job_broker()
             run_step("停止本入口管理的开发资源", "pwsh -NoProfile -File scripts/local-direct.ps1 stop", "已停止。本操作不会关闭 WPS。")
+        elif args.action == "control-status":
+            value = control_server_health()
+            print(json.dumps(value or {"status": "not_ready"}, ensure_ascii=False, indent=2))
+            return 0 if value else 1
+        elif args.action == "control-stop":
+            stop_control_server()
+            print("已停止本入口管理的 WPS Control Server。", flush=True)
         elif args.action == "reset":
             run_step("重置本地识别组件指针", "pwsh -NoProfile -File scripts/local-direct.ps1 reset", "本地识别组件指针已重置。")
         return 0

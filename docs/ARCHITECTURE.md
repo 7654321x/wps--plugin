@@ -1,5 +1,20 @@
 # 第一阶段架构
 
+## WPS Control Plane（v1.4.0，C1–C7）
+
+```text
+WPS Stable Shell → Dedicated Pipeline Worker → Local Control Server
+       │                         │                    ├─ RecognitionPort
+       └─ bounded WpsHostBridge ─┘                    └─ FormattingPlannerPort
+```
+
+- WPS UI 只执行短时 Host RPC，不启动服务器，也不等待 HTTP。
+- Dedicated Worker 是唯一的控制面 HTTP 调用方；`packages/control-client` 统一处理 endpoint manifest、Bearer token、超时、轮询和取消。
+- Control Server 只绑定 `127.0.0.1` 随机端口，使用 endpoint manifest 的 instance/PID/创建时间/版本/合同/心跳联合身份校验；它不持有 WPS 对象、不返回代码、不执行 WPS API。
+- 识别执行仍由受校验的本地 runtime/Broker 边界负责，格式规则仍由既有纯命令生成核心负责。C1–C4、C6、C7 不删除旧 Broker，也不自动切换正式预览或排版；C5 Runtime RecognitionPort 接入仍待 shadow 对照。
+
+真实 WPS diagnostic 20/200/1000、preview、format、取消、文档切换与保存后 OOXML 验收仍是后续 C14–C16 门槛。
+
 识别在客户端本地完成，DOCX 和正文均不上传。现有 docxtool.sdk.recognize_docx 是唯一识别入口；WPS 客户端适配器只把它的文本脱敏识别计划映射为版本化 RecognitionResult。
 
 命令服务的纯核心接收脱敏 CommandRequest 并生成声明式 FormattingCommandSet。本地和云端均使用同一个核心和同一个 HTTP API；差异仅限认证、监听、配置和模板来源。WPS API 仍只允许在客户端执行。本阶段由 MockDocumentExecutor 代替真实 WPS API。

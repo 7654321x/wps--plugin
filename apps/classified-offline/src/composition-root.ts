@@ -24,6 +24,8 @@ export interface ClassifiedRuntimeConfig {
   brokerExecutablePathHash?: string;
   brokerExecutableSha256?: string;
   queueContractVersion?: number;
+  controlServerEnabled?: boolean;
+  controlEndpointManifest?: import("../../../packages/control-client/src/contracts.js").ControlEndpointManifest;
 }
 
 type ProfileWindow = typeof globalThis & {

@@ -331,6 +331,8 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
       manifest.launchProbeExecutablePath = typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined;
       manifest.brokerStatusPath = typeof direct.brokerStatusPath === "string" ? expandAppDataPath(application, direct.brokerStatusPath) : manifest.brokerStatusPath;
       manifest.brokerJobsPath = typeof direct.brokerJobsPath === "string" ? expandAppDataPath(application, direct.brokerJobsPath) : manifest.brokerJobsPath;
+      manifest.controlServerEnabled = direct.controlServerEnabled === true;
+      manifest.controlEndpointManifest = direct.controlEndpointManifest;
       application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(manifest));
       return manifest;
     }
@@ -353,6 +355,8 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
       brokerExecutablePathHash: direct.brokerExecutablePathHash,
       brokerExecutableSha256: direct.brokerExecutableSha256,
       queueContractVersion: direct.queueContractVersion,
+      controlServerEnabled: direct.controlServerEnabled === true,
+      controlEndpointManifest: direct.controlEndpointManifest,
     };
     application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(value));
     return value;
@@ -433,7 +437,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     if (!response.ok) throw new Error(response.error?.code ?? "LOCAL_LAUNCH_PROBE_FAILED");
     return response.value as { returned_in_ms: number };
   };
-  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline" }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
+  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline", ...(config.controlServerEnabled && config.controlEndpointManifest ? { control_endpoint: config.controlEndpointManifest } : {}) }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
   const startPipeline = (command: PipelineCommand) => { const receipt = pipeline.start(command); if (receipt.accepted) { activePipelineCommand = command; pipelineBusy = true; hostWindow.DocxtoolCommandBusy = true; startHeartbeat(); invalidate(); hostWindow.setTimeout(() => { const active = store.read().active_command; if (active) store.update({ command_status: "RUNNING", active_command: { ...active, status: "RUNNING", stage: "pipeline", summary: "后台线程处理中", finished_at: "" } }); }, 0); } return receipt; };
   runtime.attachPipelineStarter(startPipeline);
   hostWindow.DocxtoolLocalApplication = { runtime, panes, store, build, pipeline };

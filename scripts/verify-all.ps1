@@ -13,10 +13,10 @@ try {
   if ($LASTEXITCODE) { throw "TYPESCRIPT_TEST_FAILED" }
   & $python (Join-Path $root "scripts\sync-default-format-profile.py") --check
   if ($LASTEXITCODE) { throw "PROFILE_SYNC_CHECK_FAILED" }
-  $env:PYTHONPATH = "$root\command-service\src;$root\local-agent\src"
-  & $python -m pytest command-service\tests local-agent\tests tests\test_grid_inspector.py -q
+  $env:PYTHONPATH = "$root\control-server\src;$root\command-service\src;$root\local-agent\src"
+  & $python -m pytest control-server\tests command-service\tests local-agent\tests tests\test_grid_inspector.py -q
   if ($LASTEXITCODE) { throw "PYTHON_TEST_FAILED" }
-  & $python -m ruff check command-service local-agent scripts tests
+  & $python -m ruff check control-server command-service local-agent scripts tests
   if ($LASTEXITCODE) { throw "RUFF_FAILED" }
   & npm run build:classified
   if ($LASTEXITCODE) { throw "CLASSIFIED_BUILD_FAILED" }
@@ -24,7 +24,7 @@ try {
   if ($LASTEXITCODE) { throw "ONLINE_BUILD_FAILED" }
   & npm run verify:addin
   if ($LASTEXITCODE) { throw "ADDIN_VERIFY_FAILED" }
-  $forbidden = rg -n "\beval\(|new Function\(" apps packages command-service local-agent schemas scripts -g '!**/node_modules/**' -g '!**/dist/**'
+  $forbidden = rg -n "\beval\(|new Function\(" apps packages command-service control-server local-agent schemas scripts -g '!**/node_modules/**' -g '!**/dist/**'
   if ($LASTEXITCODE -eq 0) { throw "SECURITY_SCAN_FAILED" }
   if ($LASTEXITCODE -ne 1) { throw "SECURITY_SCAN_ERROR" }
   Write-Output "VERIFY_ALL_PASS"

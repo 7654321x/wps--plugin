@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docxtool-wps-control-server"
+version = "1.4.0"
+description = "Loopback-only orchestration server for the DocxTool WPS plugin"
+requires-python = ">=3.8,<3.13"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

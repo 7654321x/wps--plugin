@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docxtool.local/schemas/control-job-request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "mode", "document_token", "document_revision", "snapshot_sha256", "snapshot"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$" },
+    "mode": { "enum": ["preview", "format", "recognize_only"] },
+    "document_token": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "document_revision": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "snapshot_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "snapshot": { "type": "object", "maxProperties": 1000 },
+    "profile_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "profile_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "client_capabilities": { "type": "object", "maxProperties": 256 }
+  }
+}

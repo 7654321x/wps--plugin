@@ -12,10 +12,23 @@
 
 每次修改 WPS 插件前后，必须阅读并执行根目录 `问题清单Agent.md`。发现新的可复发问题时，必须在本轮结束前补充该清单，写清症状、根因、禁止做法、正确方案和自动验证门槛；不得只在聊天或交接文档中临时说明。
 
-本机链路分为两类，不得混用：
+本机链路分为三类，职责不得混用：
 
-1. 本地直连生产链路：识别必须通过 `docxtool-recognize.exe` 本地 runtime；缺失时明确报错，不得回退到 `9528`。
-2. 旧 E2E/诊断链路：仅在脚本或用户明确要求时使用 `3889` 静态加载项和 `9528` 本地统一服务；不得重新引入第二个本机业务端口。
+1. WPS Control Server 生产编排链路：只监听 `127.0.0.1` 的随机高位端口；endpoint manifest 必须包含 instance、PID、进程创建时间、Bearer token、版本、合同版本和心跳，不能使用固定 `9528`，不能监听 `0.0.0.0`。该链路承载远程/受控部署形态的 `RemoteHttpsTransport`，识别结果必须经 Schema、版本、能力和 Hash 四重校验后才能进入命令生成。
+2. 本地识别执行链路：识别仍必须通过 `docxtool-recognize.exe` 本地 runtime；Control Server/Worker 通过受校验的任务合同调用，不得接受任意 EXE、脚本或命令行；runtime 缺失时明确报错。该链路承载本机直连部署形态的 `LocalFileQueueTransport`：由 `main.py` 管理的无端口 Job Broker 文件队列领取任务，禁止从 Worker/Host 直接 `ShellExecute` 启动识别。
+3. 旧 E2E/诊断链路：仅在脚本或用户明确要求时使用 `3889` 静态加载项和 `9528` 本地统一服务；不得让旧服务替代生产 Control Server，也不得把旧 `local-agent` 或 `command-service` 语义重新接回生产链。
+
+生产执行链的识别提交按部署形态二选一：本机直连使用 `LocalFileQueueTransport`（第 2 条），远程/受控编排使用 `RemoteHttpsTransport`（第 1 条 Control Server）；两者都是受校验合同，生产链同一时刻只启用其一，任何一条都不得混入 9528 旧链路。
+
+Control Server 必须由 `main.py` 或用户级启动器在 WPS 之外启动；WPS UI 主线程不得现场启动 Python、EXE、PowerShell 或等待 HTTP。所有生产 HTTP 请求由 Dedicated Worker 的 `ControlTransport` 发出，服务端只负责编排和 JSON 合同，不直接访问 WPS API。识别快照由主线程按批采集纯数据后交给 Worker；Worker 负责分批读取快照、document_token/revision/snapshot_hash 计算、识别协调和命令批次控制，分批调用 `WpsCommandExecutor`，每个待写目标执行前必须做局部 Hash 核验；Worker 不得访问或接收 `Application`、`Document`、`Range` 等宿主对象。
+
+## 正式执行链（format_document 一键排版）
+
+用户点击"一键排版"后，生产执行链固定为：检查活动文档、只读状态、保护状态和保存路径 → 保存当前文档 → Worker 分批读取识别快照 → 计算 document_token、revision、snapshot_hash → 按部署形态提交给 `LocalFileQueueTransport` 或 `RemoteHttpsTransport` → docxtool 返回 `RecognitionResult` JSON → Schema、版本、能力和 Hash 四重校验 → 重新读取核验快照并确认文档未变化 → 本地 `LocalFormatCommandGenerator` 生成命令 → Worker 分批调用 `WpsCommandExecutor`，每个目标执行前局部 Hash 核验 → 全部执行成功后执行后检查 → 自动保存当前文档。
+
+- 识别后、执行前的文档变化判定以正文 SHA-256、段落数、段落顺序、节数和文档身份为准，不得因批注导致的格式指纹变化误报 `DOCUMENT_CHANGED`。
+- 禁止批次间全文 `activeRevision()` 扫描；每批命令有硬上限；目标变化拒绝、写入读回、失败分批回滚。
+- 自动保存后必须重新读取 DOCX/OOXML 复查，不能只靠即时读回；未完成真实 WPS 保存后验收前不得写 PASS。
 
 除非服务异常、构建必须重载或用户明确要求，不得在任务结束时停止或重复 prepare；若 session token 被轮换，必须同步完整重启 WPS 宿主，禁止让旧 WebView 继续使用旧 token。
 

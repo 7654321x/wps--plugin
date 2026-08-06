@@ -71,6 +71,17 @@ const ERROR_MESSAGES: Record<string, string> = {
   LOCAL_RECOGNITION_INVALID_JSON: "本地识别程序返回了无效结果。请重新安装与插件版本匹配的识别组件。",
   LOCAL_RECOGNITION_REQUEST_ID_MISMATCH: "本地识别结果与当前请求不匹配，已拒绝使用。",
   THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED: "线程预览启动链尚未通过真实 WPS 验证，当前已安全关闭。",
+  CONTROL_SERVER_NOT_RUNNING: "WPS Control Server 未运行。请运行 main.py start 后重新尝试。",
+  CONTROL_SERVER_STALE: "WPS Control Server 心跳已过期。请运行 main.py start 重新检查本地控制服务。",
+  CONTROL_SERVER_VERSION_MISMATCH: "WPS Control Server 版本或合同不匹配。请重新安装并启动当前版本。",
+  CONTROL_SERVER_UNAUTHORIZED: "WPS Control Server 身份验证失败。请关闭 WPS 后重新运行 main.py start。",
+  CONTROL_SERVER_UNREACHABLE: "无法连接 WPS Control Server。请确认本地控制服务已启动。",
+  CONTROL_SERVER_JOB_REJECTED: "Control Server 当前任务队列已满。请等待当前任务完成后重试。",
+  CONTROL_SERVER_JOB_TIMEOUT: "Control Server 任务超时，已停止使用迟到结果。请检查本地识别组件。",
+  CONTROL_SERVER_JOB_FAILED: "Control Server 未能完成本地任务。请查看本地控制服务日志。",
+  CONTROL_SERVER_RESULT_INVALID: "Control Server 返回结果不符合安全合同，已拒绝执行。",
+  CONTROL_SERVER_RECOGNITION_ADAPTER_NOT_CONFIGURED: "本地 Control Server 尚未完成识别适配，当前不会切换生产识别。",
+  CONTROL_SERVER_FORMATTING_ADAPTER_NOT_CONFIGURED: "本地 Control Server 尚未完成排版计划适配。",
 };
 
 export function errorMessage(code: string | undefined | null): string {

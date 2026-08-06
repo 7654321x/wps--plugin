@@ -5,6 +5,7 @@ import { LocalFormatCommandGenerator, type LocalFormatProfile } from "../../../p
 import { COMMAND_REQUEST_VERSION, assertFormattingCommandSet, type CommandRequest, type FormattingCommandSet, type RecognitionResult } from "../../../packages/contracts/src/index.js";
 import type { PipelineWorkerConfig } from "../../../packages/threading/src/protocol.js";
 import { createPreviewPlan, type PreviewPlanItem } from "../../../packages/wps-adapter/src/preview-comments.js";
+import { LocalHttpControlTransport, StaticControlEndpointProvider, assertControlJobResult, type ControlJobRequest, type ControlJobResult } from "../../../packages/control-client/src/index.js";
 
 type WorkerScopeLike = { postMessage: (value: unknown) => void; onmessage: ((event: { data: unknown }) => void) | null };
 type SnapshotStage = "idle" | "capturing_descriptor" | "reading_paragraphs" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "generating_commands" | "writing_preview" | "completed" | "failed" | "cancelled";
@@ -13,6 +14,7 @@ interface SnapshotJobContext {
   paragraphs: HostParagraphData[]; started_at_ms: number; batch: AdaptiveBatchController; batch_sizes: number[];
   host_rpc_durations: number[]; worker_roundtrip_durations: number[];
   recognition_job_id: string | null;
+  control_job_id: string | null;
   preview_session_id: string | null;
 }
 interface PendingRpc { resolve: (value: RpcResponse<JsonValue>) => void; reject: (error: Error) => void; job_id: string; started_at_ms: number; timer: ReturnType<typeof setTimeout>; }
@@ -121,7 +123,7 @@ export class SnapshotPipelineWorkerRuntime {
     if (job.build_id !== this.buildId) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUILD_MISMATCH", message: "PIPELINE_BUILD_MISMATCH" } }); return; }
     if (!["snapshot_shadow", "diagnostic", "recognize", "preview"].includes(job.command)) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_COMMAND_NOT_IMPLEMENTED", message: "PIPELINE_COMMAND_NOT_IMPLEMENTED" } }); return; }
     if (this.active) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUSY", message: "PIPELINE_BUSY" } }); return; }
-    const context: SnapshotJobContext = { job, stage: "idle", cancelled: false, descriptor: null, paragraphs: [], started_at_ms: performance.now(), batch: new AdaptiveBatchController(), batch_sizes: [], host_rpc_durations: [], worker_roundtrip_durations: [], recognition_job_id: null, preview_session_id: null };
+    const context: SnapshotJobContext = { job, stage: "idle", cancelled: false, descriptor: null, paragraphs: [], started_at_ms: performance.now(), batch: new AdaptiveBatchController(), batch_sizes: [], host_rpc_durations: [], worker_roundtrip_durations: [], recognition_job_id: null, control_job_id: null, preview_session_id: null };
     this.active = context;
     void this.run(context);
   }
@@ -131,11 +133,18 @@ export class SnapshotPipelineWorkerRuntime {
     try {
       const built = await this.buildSnapshot(context);
       assertNotCancelled(context);
-      const recognition = context.job.command === "snapshot_shadow" ? undefined : await this.recognize(context, built.snapshot);
+      const controlResult = context.job.command === "snapshot_shadow" ? null : await this.controlJob(context, built.snapshot);
+      const recognition = context.job.command === "snapshot_shadow" ? undefined : (controlResult?.recognition_result as RecognitionResult | undefined) ?? await this.recognize(context, built.snapshot);
       let commands: FormattingCommandSet | undefined; let previewResult: { session_id: string; comment_count: number; plan_count: number } | undefined;
       if (context.job.command === "preview") {
         if (!this.config) throw new Error("PIPELINE_WORKER_CONFIG_REQUIRED");
-        context.stage = "generating_commands"; commands = await generateWorkerCommands(recognition!, context.job.job_id, this.config);
+        context.stage = "generating_commands";
+        if (controlResult) {
+          commands = controlResult.formatting_plan as unknown as FormattingCommandSet;
+          assertFormattingCommandSet(commands, context.job.job_id);
+        } else {
+          commands = await generateWorkerCommands(recognition!, context.job.job_id, this.config);
+        }
         this.diagnostic(context, "pipeline.commands.complete", { command_count: commands.commands.length });
         const plan = createPreviewPlan(built.snapshot, recognition!, commands, "all");
         previewResult = await this.writePreview(context, plan);
@@ -145,11 +154,66 @@ export class SnapshotPipelineWorkerRuntime {
     } catch (error) {
       const code = errorCode(error);
       if (context.preview_session_id) await this.clearPreview(context).catch(() => undefined);
-      if (code === "PIPELINE_CANCELLED") { context.stage = "cancelled"; if (context.recognition_job_id) await this.rpc<JsonValue>(context, "host.cancel_recognition", { recognition_job_id: context.recognition_job_id }).catch(() => undefined); this.post({ type: "pipeline.cancelled", job_id: context.job.job_id, build_id: context.job.build_id }); }
+      if (code === "PIPELINE_CANCELLED") {
+        context.stage = "cancelled";
+        const control = this.createControlTransport();
+        if (context.control_job_id && control) await control.cancel(context.control_job_id).catch(() => undefined);
+        if (context.recognition_job_id) await this.rpc<JsonValue>(context, "host.cancel_recognition", { recognition_job_id: context.recognition_job_id }).catch(() => undefined);
+        this.post({ type: "pipeline.cancelled", job_id: context.job.job_id, build_id: context.job.build_id });
+      }
       else { context.stage = "failed"; this.post({ type: "pipeline.failed", job_id: context.job.job_id, build_id: context.job.build_id, error: { code, message: code } }); }
     } finally {
       this.rejectPendingForJob(context.job.job_id, "PIPELINE_JOB_FINISHED");
       if (this.active === context) this.active = null;
+    }
+  }
+
+  private createControlTransport(): LocalHttpControlTransport | null {
+    const endpoint = this.config?.control_endpoint;
+    if (!endpoint) return null;
+    return new LocalHttpControlTransport(new StaticControlEndpointProvider(endpoint));
+  }
+
+  private async controlJob(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot): Promise<ControlJobResult | null> {
+    const transport = this.createControlTransport();
+    if (!transport || !context.descriptor) return null;
+    const mode = context.job.command === "preview" ? "preview" : context.job.command === "format" ? "format" : "recognize_only";
+    const request: ControlJobRequest = {
+      schema_version: 1,
+      request_id: context.job.job_id,
+      mode,
+      document_token: context.descriptor.document_token,
+      document_revision: snapshot.revision,
+      snapshot_sha256: snapshot.sourceSha256,
+      snapshot: snapshot as unknown as import("../../../packages/control-client/src/contracts.js").JsonRecord,
+      profile_id: "default",
+      profile_version: "1.0",
+      client_capabilities: this.config?.client_capabilities as unknown as import("../../../packages/control-client/src/contracts.js").JsonRecord,
+    };
+    context.stage = "launching_recognition";
+    this.diagnostic(context, "control.job.submit", { mode });
+    const submitted = await transport.submit(request);
+    context.control_job_id = submitted.job_id;
+    let intervalMs = 100;
+    const started = performance.now();
+    for (;;) {
+      assertNotCancelled(context);
+      if (performance.now() - started > 120_000) {
+        await transport.cancel(submitted.job_id).catch(() => undefined);
+        throw new Error("CONTROL_SERVER_JOB_TIMEOUT");
+      }
+      const status = await transport.status(submitted.job_id);
+      if (status.status === "completed") {
+        const result = await transport.result(submitted.job_id, undefined, request);
+        assertControlJobResult(result, request);
+        this.diagnostic(context, "control.job.complete", { mode, status: status.status });
+        return result;
+      }
+      if (status.status === "failed") throw new Error(status.error?.code ?? "CONTROL_SERVER_JOB_FAILED");
+      if (status.status === "cancelled") throw new Error("PIPELINE_CANCELLED");
+      context.stage = status.status === "planning" ? "generating_commands" : status.status === "recognizing" ? "waiting_recognition" : "launching_recognition";
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      intervalMs = Math.min(500, intervalMs + 25);
     }
   }
 
