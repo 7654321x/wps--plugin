@@ -18,3 +18,16 @@
 2. 旧 E2E/诊断链路：仅在脚本或用户明确要求时使用 `3889` 静态加载项和 `9528` 本地统一服务；不得重新引入第二个本机业务端口。
 
 除非服务异常、构建必须重载或用户明确要求，不得在任务结束时停止或重复 prepare；若 session token 被轮换，必须同步完整重启 WPS 宿主，禁止让旧 WebView 继续使用旧 token。
+
+## 自动版本与 GitHub 发布
+
+用户已明确授权：每次完成“大改”后自动更新版本并推送 GitHub，不再等待单独的提交提示。这里“大改”包括新功能、协议/合同变化、线程架构变化、正式执行链变化和影响用户体验的 WPS 宿主修复。
+
+发布规则：
+
+1. 普通修复或文档/测试改动递增补丁号；新功能、协议或架构改动递增次版本号；大版本号只能在用户明确确认后递增。
+2. 根项目 package.json 与 apps/classified-offline/package.json 的版本号必须同步；构建信息由构建脚本重新生成，不能手工伪造 build id。
+3. 发布前运行 npm test、npm run verify:all、npm run verify:local-direct 和 git diff --check；若真实 WPS 尚未通过，只能如实写入交接文档，不能把版本标为验收通过。
+4. 确认远程必须是 ssh://git@ssh.github.com:443/7654321x/wps--plugin.git，提交全部受管理代码，提交消息使用 release: vX.Y.Z ...，然后推送 HEAD:main。
+5. 推送后核对远程 refs/heads/main 与本地提交一致、工作树干净，并在交接文档.md 记录版本、提交、推送结果和未解决问题。
+6. .runtime/、日志、运行时 EXE、用户 DOCX、测试工作副本和 local_recycle/ 不得提交；发现发布风险文件或门禁失败时暂停推送并报告。
