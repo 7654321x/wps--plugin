@@ -1,0 +1,64 @@
+import type { JsonValue } from "../../threading/src/protocol.js";
+import type { PreviewPlanItem } from "./preview-comments.js";
+import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
+
+type WpsObject = Record<string, any>;
+interface PreviewSession { session_id: string; document_token: string; created: WpsObject[]; user_fingerprint: string; }
+export const HOST_PREVIEW_BATCH_LIMIT = 5;
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
+}
+function normalize(value: unknown): string { return stripWpsImplicitParagraphTerminator(value); }
+function commentContent(comment: WpsObject): string { return [comment.Content?.Text, comment.Content, comment.Text, comment.Range?.Text].filter((value) => typeof value === "string").join("\n"); }
+function fingerprint(comments: WpsObject, excluded = new Set<WpsObject>()): string {
+  const values: string[] = [];
+  for (let index = 1; index <= Number(comments.Count ?? 0); index += 1) { const item = comments.Item(index) as WpsObject; if (!excluded.has(item)) values.push(`${String(item.Author ?? "")}:${String(item.Initial ?? "")}:${commentContent(item).replace(/\s+/g, " ").trim()}`); }
+  return values.sort().join("|");
+}
+
+export class WpsPreviewBatchService {
+  private active: PreviewSession | null = null;
+  constructor(private readonly application: WpsObject) {}
+
+  async apply(documentToken: string, sessionId: string, items: PreviewPlanItem[]): Promise<JsonValue> {
+    if (!Array.isArray(items) || items.length < 1 || items.length > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
+    const document = this.application.ActiveDocument as WpsObject | undefined; const comments = document?.Comments as WpsObject | undefined;
+    if (!document || !comments || typeof comments.Add !== "function" || typeof comments.Item !== "function") throw new Error("COMMENT_PREVIEW_UNSUPPORTED");
+    if (!this.active) this.active = { session_id: sessionId, document_token: documentToken, created: [], user_fingerprint: fingerprint(comments) };
+    if (this.active.session_id !== sessionId || this.active.document_token !== documentToken) throw new Error("PREVIEW_SESSION_MISMATCH");
+    const results: JsonValue[] = [];
+    for (const item of items) {
+      const target = item.target; const paragraph = document.Paragraphs?.Item(target.host_paragraph_index + 1) as WpsObject | undefined; const paragraphRange = paragraph?.Range as WpsObject | undefined;
+      if (!paragraphRange) throw new Error("TARGET_NOT_FOUND");
+      const hostRaw = normalize(paragraphRange.Text);
+      if (await sha256(hostRaw) !== target.host_raw_text_sha256) throw new Error("PARAGRAPH_CHANGED");
+      const fragment = rawSliceUtf16(hostRaw, target.host_raw_start_utf16, target.host_raw_end_utf16);
+      if (fragment === null || await sha256(fragment) !== target.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
+      const start = Number(paragraphRange.Start) + target.host_raw_start_utf16; const end = Number(paragraphRange.Start) + target.host_raw_end_utf16;
+      const bodyRange = document.Range(start, end) as WpsObject;
+      if (await sha256(normalize(bodyRange.Text)) !== target.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
+      const countBefore = Number(comments.Count ?? 0); const returned = comments.Add(bodyRange, item.comment_text) as WpsObject | undefined;
+      let comment = returned && typeof returned === "object" ? returned : undefined;
+      for (let attempt = 0; !comment && attempt < 10; attempt += 1) { const countAfter = Number(comments.Count ?? 0); if (countAfter > countBefore) comment = comments.Item(countAfter) as WpsObject; else await new Promise((resolve) => setTimeout(resolve, 10)); }
+      if (!comment) throw new Error("PREVIEW_COMMENT_READBACK_FAILED");
+      comment.Author = item.comment_author; comment.Initial = item.comment_initial;
+      if (String(comment.Author ?? "") !== item.comment_author) throw new Error("PREVIEW_COLOR_ASSIGNMENT_FAILED");
+      this.active.created.push(comment); results.push({ item_id: item.item_id, status: "PASS" });
+    }
+    return { session_id: sessionId, applied_count: results.length, total_created: this.active.created.length, results };
+  }
+
+  clear(batchSize: number): JsonValue {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
+    const session = this.active;
+    if (!session) return { session_id: "", deleted_count: 0, remaining: 0, user_comment_integrity: true };
+    const document = this.application.ActiveDocument as WpsObject; const comments = document.Comments as WpsObject;
+    let deleted = 0;
+    while (session.created.length && deleted < batchSize) { const comment = session.created.pop()!; try { comment.Delete(); } catch { throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED"); } deleted += 1; }
+    const remaining = session.created.length; const integrity = fingerprint(comments, new Set(session.created)) === session.user_fingerprint;
+    if (remaining === 0) this.active = null;
+    return { session_id: session.session_id, deleted_count: deleted, remaining, user_comment_integrity: integrity };
+  }
+}

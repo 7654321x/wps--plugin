@@ -104,6 +104,11 @@ export class LocalWheelRecognitionProvider implements RecognitionProvider {
 
   async recognize(snapshot: LocalDocumentSnapshot): Promise<RecognitionResult> {
     const plan = await this.transport.recognize(snapshot);
+    return mapWheelRecognitionPlan(snapshot, plan);
+  }
+}
+
+export async function mapWheelRecognitionPlan(snapshot: LocalDocumentSnapshot, plan: WheelRecognitionPlan): Promise<RecognitionResult> {
     if (plan.host_text_contract_version !== HOST_TEXT_CONTRACT_VERSION || plan.binding?.host_text_contract_version !== HOST_TEXT_CONTRACT_VERSION) {
       throw new Error("HOST_TEXT_CONTRACT_MISMATCH");
     }
@@ -193,7 +198,6 @@ export class LocalWheelRecognitionProvider implements RecognitionProvider {
       document_mode_confidence: plan.document_mode_confidence, paragraphs: resolved,
       ...(unresolvedBlocks.length ? { unresolved_blocks: unresolvedBlocks } : {}),
     };
-  }
 }
 
 export class HttpLocalRecognitionTransport implements LocalRecognitionTransport {

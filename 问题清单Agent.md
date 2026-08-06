@@ -352,3 +352,75 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 正确判断：先读取当前 wheel 的 `physical_paragraph_index`、`raw_start_utf16/raw_end_utf16`、`segment_count_total` 和定位状态，再与 DOCX `commentRangeStart/commentRangeEnd` 对比。当前 wheel 若已返回不重叠且完整覆盖的“标题子范围 + 正文子范围”，而 DOCX 仍只有覆盖整段的旧批注，则属于旧预览未清理或当前预览尚未重新执行，不是 WPS 丢失了已发送的子范围信号。
 - 处理规则：重新预览前必须删除本插件旧批注并重新识别；同一物理段多个角色只允许按精确子 Range 预览，正式排版继续标记“需要拆段”，不得把多个段落级样式直接应用到同一物理段。
 - 验证门槛：脱敏样本中同段一级标题和正文必须分别产生两个已验证范围，范围连续、不重叠、覆盖全部可见文字；WPS 新批注锚点必须分别等于两个范围，旧整段批注数量为 0。
+
+## P040 PreviewDocumentUseCase 在 WPS 主线程执行完整快照导致卡死
+
+- 症状：点击预览后日志停在 PreviewDocumentUseCase 开始阶段，尚未出现本地识别进程启动事件，WPS 界面失去响应。
+- 根因：生产预览在 WPS 页面线程同步遍历全部段落读取文本和表格状态，随后又逐段读取字体、段落格式及分节信息生成 formatting revision；识别 EXE 尚未启动，主线程已连续执行两轮全文宿主访问。
+- 禁止：仅在全文循环中增加 `setTimeout(0)` 并宣称完成线程解耦；把 WPS 宿主对象传给 Worker；在能力探针失败时回退同步大循环。
+- 正确方案：classic Worker 负责流程和分批调度，WpsHostBridge 每次最多读取 10 段并立即返回纯数据；哈希、快照组合和后续识别协调在 Worker 完成。
+- 自动验证门槛：生产 Ribbon 不再直接调用完整 `readSnapshot()`；Host 单批不读取 Font/ParagraphFormat、不递归下一批；0/20/200/1000 段快照语义等价，真实 WPS 可在读取期间滚动和操作。
+
+## P041 activeRevision 在格式批次之间反复扫描全文
+
+- 症状：正式排版命令越多，WPS 越慢，批次让出事件循环后仍可能长时间未响应。
+- 根因：执行开始和每个 `yieldEvery` 批次都会重新遍历全文计算 active revision，复杂度接近“段落数 × 命令批次数”。
+- 禁止：保留批次间全文 `activeRevision()`；用更大的批次掩盖重复扫描；取消完整事务回滚。
+- 正确方案：Worker 快照 revision 负责文本基线，Host 在每个待写目标前只校验文档 token、段落文本和目标 Range hash；事务只捕获实际修改目标并分批回滚。
+- 自动验证门槛：生产执行路径无批次间全文扫描；每批格式命令最多 3 条；目标变化拒绝、写入读回、失败回滚和迟到结果均有测试。
+
+## P042 流程状态机与 WPS Host API 未分离
+
+- 症状：Host Runtime 的一个长 Promise 同时负责快照、识别等待、命令生成、批注和排版，Ribbon busy 生命周期与长调用栈绑定，无法可靠取消。
+- 根因：业务流程状态机、纯计算和不可替代的 WPS JSAPI 位于同一页面线程装配中。
+- 禁止：Worker 访问 `window/Application`；TaskPane 冒充 Worker；恢复任何业务 HTTP 服务；未真实验收就写 PASS。
+- 正确方案：Worker-Orchestrated WPS Host Bridge。消息只允许经运行时校验的纯 JSON；所有 RPC 带 job/rpc/build/document 标识；Host 只执行有限批次，Worker 控制进度、超时、取消和迟到结果。
+- 自动验证门槛：classic Worker 真实宿主探针 PASS；Worker 产物无 WPS API；Host RPC 有硬批次上限；生产 Host 不再直接调用 PreviewDocumentUseCase/FormatDocumentUseCase；取消和事务分批回滚通过真实 WPS 验收。
+
+## P043 Worker 快照只通过 Mock 不能代表真实 WPS 响应性
+
+- 症状：0/20/200/1000 段单元测试全部通过，但真实 WPS 的 Host RPC 可能出现明显长尾，单凭 Mock 耗时会误判线程解耦效果。
+- 根因：Mock 不包含 WPS COM/JSAPI 跨边界成本、内嵌浏览器调度和文档宿主负载；自适应批次在真实宿主中可能快速降到 1。
+- 禁止：用 Worker 单元测试或构建扫描代替真实 WPS；只记录平均耗时；在 WPS 未完成当前 build 的 `worker.snapshot.shadow.complete` 时写 PASS。
+- 正确方案：每个模块使用脱敏 20/200/1000 段 DOCX，分别完整重载当前 build，记录批次数、最小/最大批次、Host RPC 最大值和 P95、Worker 总耗时、主线程最大漂移，并确认 WPS 进程仍为响应状态。
+- 验证命令：先运行 `npm test`、`npm run verify:addin -- classified-offline` 和 `npm run verify:local-direct`；再用 `scripts/generate-thread-shadow-fixtures.py` 生成样本并从根目录 `wps-plugin-debug.log` 读取当前 build 的脱敏完成事件。
+
+## P044 PyInstaller 产物遗漏 docxtool SDK 资源
+
+- 症状：虚拟环境直接调用 recognize_docx() 和 recognize_entry.py 均成功，打包后的 docxtool-recognize.exe 却返回 RECOGNITION_FAILED / RecognitionSdkError。
+- 根因：PyInstaller 自动收集了 Python 模块和 dist-info，但没有收集 docxtool/resources/config/default-format.json 与 SDK JSON Schemas；识别在加载默认配置时失败。
+- 禁止：只验证 EXE 的 --help；看到 RecognitionSdkError 就修改 wheel 分类规则；把源码执行成功当成打包产物成功。
+- 正确方案：runtime 构建必须显式使用 --collect-data "docxtool"，并使用真实脱敏 DOCX 请求验证生成的 EXE。
+- 自动验证门槛：构建脚本静态测试锁定资源收集参数；EXE 对同一请求退出码为 0，生成识别计划和 binding，不生成 error 文件；安装清单 SHA-256 与当前 EXE 一致。
+
+## P045 WPS ShellExecute 不是可用的微型异步启动 RPC
+
+- 症状：真实 WPS 日志出现 recognition.shell_execute.call.start，数十秒后才出现 returned；期间没有识别进程，也没有 result.json/error.json，Worker 先报 HOST_RPC_TIMEOUT。
+- 根因：官方 wps-jsapi 1.0.5 仅声明 OAAssist.ShellExecute(file, params): void，没有异步完成合同；当前 WPS 12.1.0.28043 对本地 EXE 的真实调用同步阻塞约 37.5 秒且未启动进程，不能作为 Host micro-RPC。
+- 禁止：增大 Worker timeout 掩盖主线程阻塞；在完整预览或排版中重复试错；改用非官方参数猜测；失败时回退同步 PreviewDocumentUseCase。
+- 正确方案：正式线程预览保持默认关闭，稳定返回 THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED；保留调用前、返回和失败三类脱敏事件。只有找到官方支持且真实 WPS 能立即返回并实际启动进程的机制后，才能重新开启。
+- 自动验证门槛：脱敏文档中调用前后事件成对出现；Host 调用应在微型 RPC 时限内返回；进程或最终 result/error 文件至少出现一个；Worker 不得先超时。任一条件失败都保持 BLOCKED。
+
+## P046 开发影子快照误在普通打开文档自动运行
+
+- 症状：用户只是打开 WPS 文档，日志却自动出现 worker.snapshot.shadow.start 和全文段落读取。
+- 根因：T7 的临时真实宿主验收逻辑在 localhost 且没有开发标记时自动启动 shadow job，验收开关被遗留在常规加载路径。
+- 禁止：把开发 shadow、识别探针或 E2E 自动运行绑定到普通加载；在未确认脱敏 fixture 前读取当前活动文档。
+- 正确方案：启动时只做 classic Worker 能力探针；snapshot shadow 和 recognition launch probe 只能由显式、localhost 限定的开发标记或专用开发入口启动。
+- 自动验证门槛：源码测试确认自动验收函数不含 startSnapshotJob；普通 WPS 加载只有 Worker capability probe，不出现 snapshot/recognition job；显式开发探针继续复用正式 Worker 与 Host Bridge。
+
+## P047 PowerShell 自动变量被当作普通变量
+
+- 症状：诊断命令使用 $Error 保存错误文件路径，PowerShell 报“Cannot overwrite variable Error”，并可能在仓库根生成同名临时文件。
+- 根因：$Error 是 PowerShell 只读自动变量，变量名大小写不敏感。
+- 禁止：在脚本或一次性验证命令中把 $Error、$Host、$PID、$HOME 等自动变量当作自定义变量。
+- 正确方案：使用语义明确的 $errorPath、$resultPath、$processId；命令结束后检查 git status --short，自建临时产物移入 local_recycle/。
+- 自动验证门槛：PowerShell 脚本静态检查不对常见只读自动变量赋值；验证命令退出后仓库根无异常同名文件，git status --short 只含预期源码改动。
+
+## P048 自动测试重写受 Git 管理的 DOCX fixture
+
+- 症状：全量测试全部通过，但 git status 显示多个 tests/fixtures/*.docx 被修改，二进制差异无法审阅。
+- 根因：只读 OOXML 检查测试在断言前无条件运行全量 fixture 生成器；生成器重写了与该断言无关的 4 个受管理基线，并写入变化的 ZIP 元数据和批注时间。
+- 禁止：测试为了读取一个既有 fixture 而重生成整个 fixtures 目录；把测试产生的二进制差异混入功能提交。
+- 正确方案：只读检查直接使用受管理的固定 fixture；确需生成时写入 pytest tmp_path，并只生成当前测试需要的文件。
+- 自动验证门槛：运行对应 pytest 前后，受 Git 管理的 DOCX blob 哈希不变；git status --short 不新增 tests/fixtures 二进制改动。

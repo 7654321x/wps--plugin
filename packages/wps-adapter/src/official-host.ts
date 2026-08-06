@@ -1,6 +1,7 @@
 import { CLIENT_CAPABILITIES_VERSION, EXECUTION_RESULT_VERSION, assertFormattingCommandSet, type ClientCapabilities, type ExecutionResult, type FormattingCommand, type FormattingCommandSet, type SetPageSetupArguments } from "../../contracts/src/index.js";
 import type { CapabilityProvider, DocumentExecutor, DocumentReader, FontCapability, FontCapabilityProvider, TransactionManager } from "../../application/src/ports.js";
 import type { LocalDocumentSnapshot } from "../../recognition-client/src/index.js";
+import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 import { WpsUnitConverter } from "./format-validation.js";
 import { DEFAULT_GRID_MODE, DocumentGridCapabilityProvider, GridReadbackValidator, type GridCapability, type GridMode } from "./grid.js";
 import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
@@ -58,16 +59,21 @@ async function activeRevision(): Promise<string> {
   return sourceSha256 + ":" + count;
 }
 function property(value: unknown): string { return value === undefined || value === null ? "" : String(value); }
-async function formattingRevision(document: WpsObject, count: number): Promise<string> {
+async function formattingRevision(document: WpsObject, count: number, diagnostics?: DiagnosticReporter): Promise<string> {
+  const started = Date.now();
+  diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.formatting_revision.start", "开始读取文档格式修订信息", { paragraph_count: count });
   const values: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const range = paragraphAt(document, index).Range as WpsObject;
     const font = range.Font as WpsObject | undefined; const format = range.ParagraphFormat as WpsObject | undefined;
     values.push([font?.NameAscii, font?.NameOther, font?.NameFarEast, font?.Size, font?.Bold, format?.Alignment, format?.CharacterUnitFirstLineIndent, format?.CharacterUnitLeftIndent, format?.CharacterUnitRightIndent, format?.LineUnitBefore, format?.LineUnitAfter, format?.LineSpacingRule, format?.LineSpacing, format?.PageBreakBefore, format?.OutlineLevel].map(property).join("\u001e"));
+    if ((index + 1) % 20 === 0 || index + 1 === count) diagnostics?.writeForComponent("wps-document-reader", "DEBUG", "snapshot.formatting_revision.progress", "文档格式修订读取进度", { completed: index + 1, total: count, duration_ms: Date.now() - started });
   }
   const sections = Number(document.Sections?.Count ?? 0);
   for (let index = 1; index <= sections; index += 1) { const page = document.Sections.Item(index)?.PageSetup as WpsObject | undefined; values.push([page?.PageWidth, page?.PageHeight, page?.TopMargin, page?.BottomMargin, page?.LeftMargin, page?.RightMargin, page?.Orientation].map(property).join("\u001e")); }
-  return sha256(values.join("\u001f"));
+  const revision = await sha256(values.join("\u001f"));
+  diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.formatting_revision.complete", "文档格式修订信息读取完成", { paragraph_count: count, duration_ms: Date.now() - started });
+  return revision;
 }
 
 export interface RuntimeProbeItem {
@@ -165,7 +171,10 @@ export class WpsFontCapabilityProvider implements FontCapabilityProvider {
 }
 
 export class WpsDocumentReader implements DocumentReader {
+  constructor(private readonly diagnostics?: DiagnosticReporter) {}
   async readSnapshot(options: { allowUnsaved?: boolean } = {}): Promise<LocalDocumentSnapshot> {
+    const started = Date.now();
+    this.diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.start", "开始读取 WPS 文档快照", {});
     const document = app().ActiveDocument as WpsObject | undefined;
     if (!document) throw new Error("NO_ACTIVE_DOCUMENT");
     if ((!document.Saved && !options.allowUnsaved) || typeof document.FullName !== "string" || !document.FullName.toLowerCase().endsWith(".docx")) {
@@ -173,19 +182,25 @@ export class WpsDocumentReader implements DocumentReader {
     }
     const paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable?: boolean }> = [];
     const count = Number(document.Paragraphs?.Count ?? 0);
+    const paragraphStarted = Date.now();
+    this.diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.paragraphs.start", "开始读取 WPS 段落", { paragraph_count: count });
     for (let index = 0; index < count; index += 1) {
       const range = paragraphAt(document, index).Range as WpsObject;
       paragraphs.push({ sourceParagraphIndex: index, text: normalizeText(range.Text), isInTable: Number(range.Tables?.Count ?? 0) > 0 });
+      if ((index + 1) % 20 === 0 || index + 1 === count) this.diagnostics?.writeForComponent("wps-document-reader", "DEBUG", "snapshot.paragraphs.progress", "WPS 段落读取进度", { completed: index + 1, total: count, duration_ms: Date.now() - paragraphStarted });
     }
+    this.diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.paragraphs.complete", "WPS 段落读取完成", { paragraph_count: count, duration_ms: Date.now() - paragraphStarted });
     const sourceSha256 = await sha256(paragraphs.map((item) => item.text).join("\u001f"));
     const orderHash = await sha256(paragraphs.map((item) => `${item.sourceParagraphIndex}:${item.text}`).join("\u001f"));
     const documentFullNameHash = await sha256(String(document.FullName).toLocaleLowerCase());
-    return {
+    const snapshot: LocalDocumentSnapshot = {
       documentId: "wps-" + sourceSha256.slice(0, 16),
       revision: sourceSha256 + ":" + count,
       sourceSha256, localDocxPath: document.FullName, paragraphs, paragraphOrderHash: orderHash,
-      sectionCount: Number(document.Sections?.Count ?? 0), formattingRevision: await formattingRevision(document, count), documentFullNameHash,
+      sectionCount: Number(document.Sections?.Count ?? 0), formattingRevision: await formattingRevision(document, count, this.diagnostics), documentFullNameHash,
     };
+    this.diagnostics?.writeForComponent("wps-document-reader", "INFO", "snapshot.complete", "WPS 文档快照读取完成", { paragraph_count: count, duration_ms: Date.now() - started });
+    return snapshot;
   }
 }
 

@@ -159,7 +159,7 @@ def fetch_resource(relative: str) -> Dict[str, object]:
 
 def probe_debug_server() -> Dict[str, object]:
     manifest = read_json(DEBUG_MANIFEST)
-    required = ["index.html", "main.js", "ribbon.xml", "js/bootstrap-probe.js", "js/ribbon.js", "host-runtime.js", "ui/build-info.js", "ui/local-runtime-config.js", "ui/default-format-profile.js", "ui/taskpane.html"]
+    required = ["index.html", "main.js", "ribbon.xml", "js/bootstrap-probe.js", "js/ribbon.js", "host-runtime.js", "pipeline-worker-probe.js", "pipeline-worker.js", "ui/build-info.js", "ui/local-runtime-config.js", "ui/default-format-profile.js", "ui/taskpane.html"]
     resources = {path: fetch_resource(path) for path in required}
     errors: List[str] = []
     for path, item in resources.items():
@@ -168,7 +168,7 @@ def probe_debug_server() -> Dict[str, object]:
     main_text = str(resources["main.js"].get("text", "")); ribbon_text = str(resources["js/ribbon.js"].get("text", "")); host_text = str(resources["host-runtime.js"].get("text", "")); build_text = str(resources["ui/build-info.js"].get("text", ""))
     if not all(marker in main_text for marker in ("js/bootstrap-probe.js", "js/ribbon.js", "host-runtime.js")) or "type='module'" in main_text or "dist/host-runtime.js" in main_text: errors.append("MAIN_ENTRY_MISMATCH")
     if not all(marker in ribbon_text for marker in ("DocxtoolRunLocalCommand", "window.OnAction", "ribbon.action.received")) or "DocxtoolHostEnqueue" in ribbon_text: errors.append("RIBBON_ENTRY_MISMATCH")
-    if not all(marker in host_text for marker in ("host.module.loaded", "DocxtoolRunLocalCommand")) or "import(" in host_text: errors.append("LOCAL_RUNTIME_BUNDLE_MISMATCH")
+    if not all(marker in host_text for marker in ("host.module.loaded", "DocxtoolRunLocalCommand", "pipeline.worker.probe.start")) or "import(" in host_text: errors.append("LOCAL_RUNTIME_BUNDLE_MISMATCH")
     expected_build = str(manifest.get("build_id", ""))
     if expected_build and expected_build not in build_text: errors.append("BUILD_ID_MISMATCH")
     critical = manifest.get("critical_assets", {}) if isinstance(manifest.get("critical_assets"), dict) else {}

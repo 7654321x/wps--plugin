@@ -30,7 +30,7 @@ $debugPackage = [ordered]@{
 $debugPackage | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $target "package.json") -Encoding utf8NoBOM
 
 $critical = [ordered]@{}
-foreach ($relative in @("main.js", "js/ribbon.js", "js/bootstrap-probe.js", "host-runtime.js")) {
+foreach ($relative in @("main.js", "js/ribbon.js", "js/bootstrap-probe.js", "host-runtime.js", "pipeline-worker-probe.js", "pipeline-worker.js")) {
   $file = Join-Path $target $relative
   if (-not (Test-Path -LiteralPath $file)) { throw ("WPS_DEBUG_PACKAGE_ASSET_MISSING: " + $relative) }
   $critical[$relative] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()

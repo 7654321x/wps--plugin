@@ -37,6 +37,7 @@ def test_invalid_request_writes_error(tmp_path):
     assert module.main(["--request", str(request), "--result", str(result), "--error", str(error)]) == 1
     payload = json.loads(error.read_text(encoding="utf-8"))
     assert payload["error_code"] == "INVALID_REQUEST"
+    assert payload["error_type"] == "ValueError"
 
 
 def test_success_builds_plan_and_binding(tmp_path, monkeypatch):

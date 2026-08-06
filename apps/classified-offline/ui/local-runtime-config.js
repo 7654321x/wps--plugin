@@ -1,6 +1,7 @@
 window.DocxtoolLocalRuntimeConfig = {
   runtimeVersion: "local-direct",
-  runtimeManifestPath: "%APPDATA%\\Docxtool\\runtime\\current.json"
+  runtimeManifestPath: "%APPDATA%\\Docxtool\\runtime\\current.json",
+  threadedPreviewEnabled: false
 };
 if (typeof window.DocxtoolEarlyLog === "function") {
   window.DocxtoolEarlyLog("DEBUG", "main", "bootstrap.script.loaded", "本地直连 runtime 配置脚本已执行", { asset: "ui/local-runtime-config.js" });

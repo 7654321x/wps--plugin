@@ -33,12 +33,16 @@ async function verify(edition) {
     const productionMain = await mustRead(resolve(root, "dist/main.js"), "CLASSIFIED_DIST_MAIN_MISSING");
     const productionRibbon = await mustRead(resolve(root, "dist/js/ribbon.js"), "CLASSIFIED_DIST_RIBBON_MISSING");
     const productionHost = await mustRead(resolve(root, "dist/host-runtime.js"), "CLASSIFIED_DIST_HOST_MISSING");
+    const workerProbe = await mustRead(resolve(root, "dist/pipeline-worker-probe.js"), "CLASSIFIED_WORKER_PROBE_MISSING");
+    const pipelineWorker = await mustRead(resolve(root, "dist/pipeline-worker.js"), "CLASSIFIED_PIPELINE_WORKER_MISSING");
     if (!productionMain.includes("bootstrap.main.loaded") || !productionMain.includes("js/bootstrap-probe.js")) throw new Error("CLASSIFIED_BOOTSTRAP_DIAGNOSTICS_MISSING");
     if (productionMain.includes("type='module'") || productionMain.includes("dist/host-runtime.js") || !productionMain.includes('versioned("host-runtime.js")')) throw new Error("CLASSIFIED_HOST_CLASSIC_SCRIPT_INVALID");
     if (!productionMain.includes("ui/build-info.js?v=") || !productionMain.includes("DocxtoolVersionedAsset")) throw new Error("CLASSIFIED_ASSET_VERSIONING_MISSING");
     if (!productionRibbon.includes("ribbon.action.received")) throw new Error("CLASSIFIED_RIBBON_DIAGNOSTICS_MISSING");
     if (!productionRibbon.includes("window.OnAction = OnAction") || !productionRibbon.includes("DocxtoolRunLocalCommand") || productionRibbon.includes("DocxtoolHostEnqueue") || productionRibbon.includes("DocxtoolHostDispatch")) throw new Error("CLASSIFIED_RIBBON_GLOBAL_CALLBACK_INVALID");
     if (/^\s*import\s/m.test(productionHost) || /import\s*\(/.test(productionHost)) throw new Error("CLASSIFIED_HOST_IIFE_INVALID");
+    if (!workerProbe.includes("probe.ping") || !workerProbe.includes("probe.pong") || /\b(?:window|document|Application|ActiveDocument)\b/.test(workerProbe)) throw new Error("CLASSIFIED_WORKER_PROBE_INVALID");
+    if (!pipelineWorker.includes("snapshot_shadow") || !pipelineWorker.includes("host.read_paragraph_batch") || /\b(?:window|Application|ActiveDocument|Paragraphs|Range|Comments)\b/.test(pipelineWorker)) throw new Error("CLASSIFIED_PIPELINE_WORKER_BOUNDARY_INVALID");
     for (const event of ["application.install.success", "application.runtime.run.received"]) {
       if (!productionHost.includes(event)) throw new Error("CLASSIFIED_HOST_DIAGNOSTICS_MISSING");
     }

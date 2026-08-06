@@ -1,12 +1,9 @@
 import importlib.util
 from pathlib import Path
-import subprocess
-import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "inspect-grid-ooxml.py"
-GENERATOR = ROOT / "scripts" / "generate-e2e-fixture.py"
 
 
 def _module():
@@ -17,7 +14,6 @@ def _module():
 
 
 def test_grid_inspector_reports_a_genuinely_grid_free_line_only_fixture():
-    subprocess.run([sys.executable, str(GENERATOR)], check=True)
     report = _module().inspect(ROOT / "tests" / "fixtures" / "03-grid-wps-line-only.docx")
     assert report["character_grid_enabled"] is False
     assert all(item["type"] == "none" for item in report["sections"])

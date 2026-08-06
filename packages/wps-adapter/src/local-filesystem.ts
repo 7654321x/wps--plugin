@@ -139,4 +139,8 @@ export class WpsLocalFileSystem {
     const current = this.exists(normalized) ? this.readText(normalized) : "";
     this.writeText(normalized, current + value);
   }
+
+  hasNativeAppend(): boolean {
+    return typeof this.api.AppendFile === "function" && this.api.AppendFile.length >= 2;
+  }
 }

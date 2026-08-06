@@ -15,6 +15,7 @@ export interface ClassifiedRuntimeConfig {
   contractVersion?: number;
   runtimeManifestPath?: string;
   diagnosticLogPath?: string;
+  threadedPreviewEnabled?: boolean;
 }
 
 type ProfileWindow = typeof globalThis & {
@@ -39,7 +40,7 @@ function readDefaultProfile(): LocalFormatProfile {
 /** The only production assembly used by the classified Ribbon. */
 export function createClassifiedProductionComposition(config: ClassifiedRuntimeConfig, diagnostics?: DiagnosticReporter) {
   const telemetry = new NoOpTelemetry();
-  const reader = new WpsDocumentReader();
+  const reader = new WpsDocumentReader(diagnostics);
   const application = (globalThis as ProfileWindow).Application as WpsApplicationLike | undefined;
   if (!application) throw new Error("WPS_HOST_UNAVAILABLE");
   const recognition = new LocalWheelRecognitionProvider(

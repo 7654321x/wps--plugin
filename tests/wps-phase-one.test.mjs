@@ -33,13 +33,22 @@ import {
   WpsPreviewCommentService,
   WpsLocalFileSystem,
   normalizeWpsPath,
+  WpsHostBridge,
+  HOST_PARAGRAPH_BATCH_LIMIT,
+  createPreviewPlan,
 } from "../dist/packages/wps-adapter/src/index.js";
 import { CommandValidator } from "../dist/packages/security/src/index.js";
 import { FormatDocumentUseCase, PreviewDocumentUseCase } from "../dist/packages/application/src/format-document-usecase.js";
 import { LocalApplicationRuntime, HostResultStore, TaskPaneManager } from "../dist/apps/classified-offline/src/host-runtime.js";
 import { ClassifiedHealthChecker } from "../dist/apps/classified-offline/src/health-check.js";
 import { errorMessage, errorText } from "../dist/apps/classified-offline/src/error-messages.js";
+import { probeWorkerCapability } from "../dist/apps/classified-offline/src/worker-capability.js";
+import { PipelineWorkerClient } from "../dist/apps/classified-offline/src/pipeline-worker-client.js";
+import { AdaptiveBatchController, SnapshotPipelineWorkerRuntime, createEquivalentSnapshot, generateWorkerCommands } from "../dist/apps/classified-offline/src/pipeline-worker.js";
+import { BoundedDiagnosticFileBuffer } from "../dist/apps/classified-offline/src/diagnostic-buffer.js";
+import { LocalFormatCommandGenerator } from "../dist/packages/local-format-engine/src/index.js";
 import { DiagnosticRunner, classifyNetworkError } from "../dist/packages/diagnostics/src/index.js";
+import { parsePipelineJob, parseWorkerHostRequest } from "../dist/packages/threading/src/index.js";
 
 const SHA = "a".repeat(64);
 const hashText = (value) => createHash("sha256").update(value).digest("hex");
@@ -64,6 +73,220 @@ const snapshot = {
   sourceSha256: SHA,
   paragraphs: [{ sourceParagraphIndex: 0, text: "本地正文" }],
 };
+
+test("classic Worker capability probe reports a successful ping roundtrip", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  let terminated = false;
+  class FakeWorker {
+    onmessage = null;
+    onerror = null;
+    constructor(url) { assert.equal(url, "pipeline-worker-probe.js"); }
+    postMessage(value) { assert.deepEqual(value, { type: "probe.ping" }); queueMicrotask(() => this.onmessage?.({ data: { type: "probe.pong" } })); }
+    terminate() { terminated = true; }
+  }
+  Object.defineProperty(globalThis, "Worker", { configurable: true, writable: true, value: FakeWorker });
+  try {
+    const result = await probeWorkerCapability("pipeline-worker-probe.js");
+    assert.equal(result.supported, true);
+    assert.equal(result.classic_worker, true);
+    assert.equal(result.error_code, null);
+    assert.equal(terminated, true);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "Worker", original); else delete globalThis.Worker;
+  }
+});
+
+test("classic Worker capability probe refuses unsupported hosts without fallback", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  delete globalThis.Worker;
+  try {
+    assert.deepEqual(await probeWorkerCapability("pipeline-worker-probe.js"), { supported: false, classic_worker: false, roundtrip_ms: null, error_code: "WEB_WORKER_UNSUPPORTED" });
+  } finally {
+    if (original) Object.defineProperty(globalThis, "Worker", original);
+  }
+});
+
+test("threading protocol accepts only pure-data jobs and known Host RPC operations", () => {
+  assert.equal(parsePipelineJob({ job_id: "pipeline-1", command: "preview", build_id: "build-1", created_at: "2026-08-05T00:00:00.000Z" }).command, "preview");
+  const request = parseWorkerHostRequest({ type: "host.rpc.request", operation: "host.read_paragraph_batch", rpc_id: "rpc-1", job_id: "pipeline-1", build_id: "build-1", document_token: "doc-1", payload: { start_index: 0, batch_size: 5 } });
+  assert.equal(request.operation, "host.read_paragraph_batch");
+  assert.throws(() => parseWorkerHostRequest({ ...request, payload: { application: { call() {} } } }), /INVALID_HOST_RPC_REQUEST/);
+  assert.throws(() => parseWorkerHostRequest({ ...request, operation: "host.unknown" }), /INVALID_HOST_RPC_REQUEST/);
+});
+
+test("WpsHostBridge reads only the requested paragraph batch and enforces the hard limit", async () => {
+  const accessed = [];
+  const paragraphs = ["甲", "乙", "丙", "丁"].map((text, index) => ({ Range: { Text: `${text}\r`, Tables: { Count: index === 2 ? 1 : 0 }, Start: index * 10, End: index * 10 + text.length, get Font() { throw new Error("FORMAT_MUST_NOT_BE_READ"); }, get ParagraphFormat() { throw new Error("FORMAT_MUST_NOT_BE_READ"); } } }));
+  const application = { ActiveDocument: { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: paragraphs.length, Item(index) { accessed.push(index); return paragraphs[index - 1]; } }, Sections: { Count: 2 } } };
+  const bridge = new WpsHostBridge(application);
+  const base = { type: "host.rpc.request", rpc_id: "rpc-1", job_id: "pipeline-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, operation: "host.capture_document_descriptor" });
+  assert.equal(descriptor.ok, true);
+  assert.equal(descriptor.value.paragraph_count, 4);
+  assert.deepEqual(accessed, []);
+  const batch = await bridge.handle({ ...base, rpc_id: "rpc-2", operation: "host.read_paragraph_batch", document_token: descriptor.value.document_token, payload: { start_index: 1, batch_size: 2 } });
+  assert.equal(batch.ok, true);
+  assert.deepEqual(batch.value.map((item) => item.host_paragraph_index), [1, 2]);
+  assert.deepEqual(accessed, [2, 3]);
+  assert.equal(batch.value[1].is_in_table, true);
+  const oversized = await bridge.handle({ ...base, rpc_id: "rpc-3", operation: "host.read_paragraph_batch", document_token: descriptor.value.document_token, payload: { start_index: 0, batch_size: HOST_PARAGRAPH_BATCH_LIMIT + 1 } });
+  assert.equal(oversized.ok, false);
+  assert.equal(oversized.error.code, "HOST_PARAGRAPH_BATCH_INVALID");
+  const stale = await bridge.handle({ ...base, rpc_id: "rpc-4", operation: "host.read_paragraph_batch", document_token: "doc-stale", payload: { start_index: 0, batch_size: 1 } });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error.code, "DOCUMENT_TOKEN_CHANGED");
+});
+
+test("adaptive batch uses rolling Host duration without collapsing on normal roundtrip or one outlier", () => {
+  const normal = new AdaptiveBatchController(5);
+  for (const duration of [15, 17, 13, 16, 14, 18, 12, 15]) assert.equal(normal.record(duration), 5);
+  const fast = new AdaptiveBatchController(5);
+  assert.deepEqual([fast.record(4), fast.record(5), fast.record(6)], [5, 5, 6]);
+  const outlier = new AdaptiveBatchController(5);
+  assert.equal(outlier.record(120), 4);
+  assert.ok(outlier.record(10) > 1);
+  assert.ok(outlier.record(11) > 1);
+  const persistent = new AdaptiveBatchController(5);
+  assert.deepEqual([persistent.record(101), persistent.record(120), persistent.record(130)], [4, 3, 1]);
+});
+
+test("diagnostic buffer batches fallback rewrites and caps the file instead of rewriting per event", () => {
+  const scheduled = []; let existing = "x".repeat(1_100_000); let reads = 0; let writes = 0;
+  const adapter = { hasNativeAppend() { return false; }, exists() { return true; }, readText() { reads += 1; return existing; }, writeText(_path, value) { writes += 1; existing = value; }, appendText() { throw new Error("MUST_NOT_APPEND"); } };
+  const buffer = new BoundedDiagnosticFileBuffer({ adapter: () => adapter, path: () => "C:\\logs\\wps.log", schedule(callback, delayMs) { const item = { callback, delayMs }; scheduled.push(item); return item; }, cancel() {}, batchLimit: 50, maxFileBytes: 1_000_000 });
+  for (let index = 0; index < 49; index += 1) buffer.enqueue(`event-${index}\n`);
+  assert.equal(reads, 0); assert.equal(writes, 0);
+  buffer.enqueue("event-49\n");
+  assert.equal(scheduled.at(-1).delayMs, 0);
+  scheduled.at(-1).callback();
+  assert.equal(reads, 1); assert.equal(writes, 1); assert.equal(buffer.flushCount, 1); assert.ok(existing.length <= 1_000_000);
+});
+
+test("diagnostic buffer prefers native append and does not read existing history", () => {
+  const scheduled = []; let appends = 0; let reads = 0;
+  const adapter = { hasNativeAppend() { return true; }, exists() { return true; }, readText() { reads += 1; return "old"; }, writeText() {}, appendText(_path, value) { appends += 1; assert.match(value, /urgent/); } };
+  const buffer = new BoundedDiagnosticFileBuffer({ adapter: () => adapter, path: () => "C:\\logs\\wps.log", schedule(callback, delayMs) { const item = { callback, delayMs }; scheduled.push(item); return item; }, cancel() {} });
+  buffer.enqueue("urgent\n", true); scheduled.at(-1).callback();
+  assert.equal(appends, 1); assert.equal(reads, 0);
+});
+
+test("PipelineWorkerClient forwards current-job RPCs and rejects duplicate or late work", async () => {
+  class FakeWorker {
+    onmessage = null; onerror = null; onmessageerror = null; posted = []; terminated = false;
+    postMessage(value) { this.posted.push(value); }
+    terminate() { this.terminated = true; }
+    emit(value) { this.onmessage?.({ data: value }); }
+  }
+  const worker = new FakeWorker(); const events = []; const bridged = [];
+  const bridge = { async handle(request) { bridged.push(request); return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: {} }; } };
+  const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", onEvent: (event) => events.push(event), workerFactory: () => worker });
+  const receipt = client.startSnapshotJob();
+  assert.equal(receipt.accepted, true);
+  assert.equal(client.startSnapshotJob().reason, "PIPELINE_BUSY");
+  assert.equal(worker.posted[0].type, "pipeline.init");
+  assert.equal(worker.posted[1].type, "pipeline.start");
+  const request = { type: "host.rpc.request", operation: "host.capture_document_descriptor", rpc_id: "rpc-1", job_id: receipt.command_id, build_id: "build-1", payload: {} };
+  worker.emit(request); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bridged.length, 1);
+  assert.equal(worker.posted.at(-1).type, "host.rpc.result");
+  worker.emit({ ...request, rpc_id: "rpc-late", job_id: "snapshot-old" }); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bridged.length, 1);
+  assert.equal(worker.posted.at(-1).error.code, "PIPELINE_STALE_JOB");
+  worker.emit({ type: "pipeline.completed", job_id: receipt.command_id, build_id: "build-1", snapshot_summary: { snapshot_contract_version: "worker-snapshot-v1", paragraph_count: 0, batch_count: 0, min_batch_size: 0, max_batch_size: 0, max_host_rpc_ms: 0, p95_host_rpc_ms: 0, worker_total_ms: 1, source_sha256_prefix: "00000000", order_sha256_prefix: "00000000", text_revision: "x" } });
+  assert.equal(events.at(-1).type, "pipeline.completed");
+  assert.equal(client.startSnapshotJob().accepted, true);
+});
+
+test("PipelineWorkerClient recovers after a Worker crash and ignores wrong builds", () => {
+  const workers = []; const events = [];
+  const factory = () => { const worker = { onmessage: null, onerror: null, onmessageerror: null, posted: [], terminated: false, postMessage(value) { this.posted.push(value); }, terminate() { this.terminated = true; } }; workers.push(worker); return worker; };
+  const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge: { async handle() { throw new Error("MUST_NOT_RUN"); } }, buildId: "build-1", onEvent: (event) => events.push(event), workerFactory: factory });
+  const first = client.startSnapshotJob();
+  workers[0].onmessage({ data: { type: "pipeline.failed", job_id: first.command_id, build_id: "wrong-build", error: { code: "X", message: "X" } } });
+  assert.equal(events.at(-1).error.code, "PIPELINE_BUILD_MISMATCH");
+  const second = client.startSnapshotJob();
+  assert.equal(second.accepted, true);
+  workers[1].onerror();
+  assert.equal(events.at(-1).error.code, "PIPELINE_WORKER_CRASHED");
+  assert.equal(client.startSnapshotJob().accepted, true);
+});
+
+test("snapshot worker creates text-equivalent snapshots for 0, 20, 200 and 1000 paragraphs", async () => {
+  for (const count of [0, 20, 200, 1000]) {
+    const values = Array.from({ length: count }, (_, index) => ({ host_paragraph_index: index, raw_text: index === 1 ? "" : index === 2 ? "中文段落" : index === 3 ? "超长".repeat(2000) : `段落${index}`, is_in_table: index === 4, range_start: index * 10, range_end: index * 10 + 2 }));
+    const fullName = "C:\\snapshot-fixture.docx";
+    const descriptor = { document_token: "doc-1", saved: true, local_docx_path: fullName, local_docx_path_hash: hashText(fullName.toLowerCase()), paragraph_count: count, section_count: 2, extension: ".docx" };
+    const result = await createEquivalentSnapshot(descriptor, values);
+    const expectedSource = hashText(values.map((item) => item.raw_text).join("\u001f"));
+    const expectedOrder = hashText(values.map((item) => `${item.host_paragraph_index}:${item.raw_text}`).join("\u001f"));
+    assert.equal(result.snapshotContractVersion, "worker-snapshot-v1");
+    assert.equal(result.documentId, `wps-${expectedSource.slice(0, 16)}`);
+    assert.equal(result.sourceSha256, expectedSource);
+    assert.equal(result.revision, `${expectedSource}:${count}`);
+    assert.equal(result.textRevision, result.revision);
+    assert.equal(result.paragraphOrderHash, expectedOrder);
+    assert.equal(result.paragraphs.length, count);
+    assert.equal("formattingRevision" in result, false);
+    if (count > 4) assert.equal(result.paragraphs[4].isInTable, true);
+  }
+});
+
+test("snapshot worker uses multiple bounded Host RPC batches for 1000 paragraphs", async () => {
+  const values = Array.from({ length: 1000 }, (_, index) => ({ Range: { Text: `脱敏段落${index}\r`, Tables: { Count: index % 31 === 0 ? 1 : 0 }, Start: index * 20, End: index * 20 + 8 } }));
+  const application = { ActiveDocument: { FullName: "C:\\shadow-1000.docx", Saved: true, Paragraphs: { Count: values.length, Item(index) { return values[index - 1]; } }, Sections: { Count: 1 } } };
+  const bridge = new WpsHostBridge(application); const events = [];
+  class LoopbackWorker {
+    onmessage = null; onerror = null; onmessageerror = null; terminated = false;
+    scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) };
+    runtime = new SnapshotPipelineWorkerRuntime(this.scope);
+    postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); }
+    terminate() { this.terminated = true; }
+  }
+  const terminal = new Promise((resolve) => {
+    const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerFactory: () => new LoopbackWorker(), onEvent(event) { events.push(event); if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } });
+    assert.equal(client.startSnapshotJob().accepted, true);
+  });
+  const result = await terminal;
+  assert.equal(result.type, "pipeline.completed");
+  assert.equal(result.snapshot_summary.paragraph_count, 1000);
+  assert.ok(result.snapshot_summary.batch_count > 1);
+  assert.ok(result.snapshot_summary.batch_count <= 400);
+  assert.ok(result.snapshot_summary.average_batch_size > 2);
+  assert.ok(result.snapshot_summary.max_batch_size <= 10);
+  assert.ok(result.snapshot_summary.worker_roundtrip_p95_ms >= result.snapshot_summary.host_duration_p95_ms);
+  assert.ok(events.some((item) => item.type === "pipeline.progress" && item.completed === 1000));
+});
+
+test("snapshot worker cancels after the active small RPC and rejects late results", async () => {
+  class LoopbackWorker {
+    onmessage = null; onerror = null; onmessageerror = null;
+    scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) };
+    runtime = new SnapshotPipelineWorkerRuntime(this.scope);
+    postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); }
+    terminate() {}
+  }
+  const terminal = new Promise((resolve) => {
+    const bridge = { async handle(request) { await new Promise((done) => setTimeout(done, 10)); return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: { document_token: "doc-1", saved: true, local_docx_path: "C:\\x.docx", local_docx_path_hash: SHA, paragraph_count: 20, section_count: 1, extension: ".docx" } }; } };
+    const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.cancelled", "pipeline.failed", "pipeline.completed"].includes(event.type)) resolve(event); } });
+    assert.equal(client.startSnapshotJob().accepted, true);
+    assert.equal(client.cancelActiveJob(), true);
+  });
+  assert.equal((await terminal).type, "pipeline.cancelled");
+});
+
+test("snapshot worker fails a timed-out RPC and ignores its late response", async () => {
+  const posted = [];
+  const scope = { onmessage: null, postMessage(value) { posted.push(value); } };
+  new SnapshotPipelineWorkerRuntime(scope, { rpc_timeout_ms: 5, paragraph_rpc_timeout_ms: 5 });
+  scope.onmessage({ data: { type: "pipeline.init", build_id: "build-1" } });
+  scope.onmessage({ data: { type: "pipeline.start", job: { job_id: "snapshot-timeout", command: "snapshot_shadow", build_id: "build-1", created_at: new Date().toISOString() } } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const failed = posted.find((item) => item.type === "pipeline.failed");
+  assert.equal(failed.error.code, "HOST_RPC_TIMEOUT");
+  const request = posted.find((item) => item.type === "host.rpc.request");
+  scope.onmessage({ data: { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: {} } });
+  assert.equal(posted.filter((item) => item.type === "pipeline.failed").length, 1);
+});
 function withHostBinding(snapshotValue, plan) {
   const byHash = new Map();
   for (const host of snapshotValue.paragraphs) {
@@ -447,6 +670,59 @@ test("local process recognition transport uses two-argument ShellExecute and cle
   }
 });
 
+test("WpsHostBridge separates recognition launch and probe without host-side polling", async () => {
+  const root = await createTempRoot("docxtool-recognition-job-");
+  try {
+    const sourcePath = path.join(root, "source.docx"); await writeFile(sourcePath, "fixture", "utf8");
+    const runtimeExecutablePath = "C:\\runtime\\docxtool-recognize.exe"; const reads = []; const diagnostics = []; let shellCalls = 0;
+    const application = {
+      ActiveDocument: { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1, Item() { return { Range: { Text: "脱敏段落\r", Tables: { Count: 0 }, Start: 0, End: 5 } }; } }, Sections: { Count: 1 } },
+      Env: { GetTempPath() { return root; } },
+      FileSystem: { Exists(value) { return value === runtimeExecutablePath || existsSync(value); }, mkdirSync(value, options) { return mkdirSync(value, options); }, writeFileString(value, text) { return writeFileSync(value, text, "utf8"); }, readFileString(value) { reads.push(value); return readFileSync(value, "utf8"); }, unlinkSync(value) { return unlinkSync(value); }, rmdirSync(value) { return rmdirSync(value); } },
+      OAAssist: { ShellExecute(_exe, argumentsText) { shellCalls += 1; const requestPath = argumentsText.match(/--request\s+"([^"]+)"/)?.[1] ?? argumentsText.match(/--request\s+(\S+)/)?.[1]; const resultPath = argumentsText.match(/--result\s+"([^"]+)"/)?.[1] ?? argumentsText.match(/--result\s+(\S+)/)?.[1]; const request = JSON.parse(readFileSync(requestPath, "utf8")); writeFileSync(resultPath, JSON.stringify({ request_id: request.request_id, recognition_plan: { schema_version: "1.0", engine_version: "4.0", document_mode: "normal", document_mode_confidence: 1, host_text_contract_version: "host-text-v1", blocks: [], binding: { host_text_contract_version: "host-text-v1", blocks: [] } } }), "utf8"); } },
+    };
+    const bridge = new WpsHostBridge(application, { writeForComponent(...values) { diagnostics.push(values); } }, { recognitionExecutablePath: runtimeExecutablePath, recognitionContractVersion: 1 });
+    const base = { type: "host.rpc.request", job_id: "recognize-1", build_id: "build-1", payload: {} };
+    const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-1", operation: "host.capture_document_descriptor" });
+    const workerSnapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev-1", textRevision: "rev-1", sourceSha256: SHA, localDocxPath: sourcePath, paragraphs: [{ sourceParagraphIndex: 0, text: "脱敏段落", isInTable: false }], paragraphOrderHash: SHA, sectionCount: 1, documentFullNameHash: descriptor.value.local_docx_path_hash };
+    const launched = await bridge.handle({ ...base, rpc_id: "launch-1", operation: "host.launch_recognition", document_token: descriptor.value.document_token, payload: { source_path: sourcePath, snapshot: workerSnapshot, contract_version: 1 } });
+    assert.equal(launched.ok, true); assert.equal(shellCalls, 1); assert.equal(reads.length, 0);
+    assert.deepEqual(diagnostics.filter((values) => String(values[2]).startsWith("recognition.shell_execute.call.")).map((values) => values[2]), ["recognition.shell_execute.call.start", "recognition.shell_execute.call.returned"]);
+    const probed = await bridge.handle({ ...base, rpc_id: "probe-1", operation: "host.probe_recognition", payload: { recognition_job_id: launched.value.recognition_job_id } });
+    assert.equal(probed.ok, true); assert.equal(probed.value.state, "completed"); assert.equal(probed.value.recognition_plan.engine_version, "4.0"); assert.equal(reads.length, 1);
+    const repeated = await bridge.handle({ ...base, rpc_id: "probe-2", operation: "host.probe_recognition", payload: { recognition_job_id: launched.value.recognition_job_id } });
+    assert.equal(repeated.value.state, "completed"); assert.equal(reads.length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("recognition Worker owns polling and returns the mapped RecognitionResult", async () => {
+  const paragraphs = [{ Range: { Text: "脱敏段落\r", Tables: { Count: 0 }, Start: 0, End: 5 } }]; let probes = 0;
+  const bridge = {
+    async handle(request) {
+      if (request.operation === "host.capture_document_descriptor") return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: { document_token: "doc-1", saved: true, local_docx_path: "C:\\fixture.docx", local_docx_path_hash: SHA, paragraph_count: 1, section_count: 1, extension: ".docx" } };
+      if (request.operation === "host.read_paragraph_batch") return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: paragraphs.map((item, index) => ({ host_paragraph_index: index, raw_text: item.Range.Text.slice(0, -1), is_in_table: false, range_start: 0, range_end: 5 })) };
+      if (request.operation === "host.launch_recognition") return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: { recognition_job_id: "local-rec-1", started_at: new Date().toISOString(), result_path: "C:\\result.json", error_path: "C:\\error.json", cancel_path: "C:\\cancel.json" } };
+      if (request.operation === "host.probe_recognition") { probes += 1; return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1, value: probes === 1 ? { state: "running" } : { state: "completed", recognition_plan: { schema_version: "1.0", engine_version: "4.0", document_mode: "normal", document_mode_confidence: 1, host_text_contract_version: "host-text-v1", blocks: [], binding: { host_text_contract_version: "host-text-v1", blocks: [] } } } }; }
+      throw new Error("UNEXPECTED_RPC");
+    },
+  };
+  class LoopbackWorker { onmessage = null; onerror = null; onmessageerror = null; scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) }; runtime = new SnapshotPipelineWorkerRuntime(this.scope); postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); } terminate() {} }
+  const terminal = new Promise((resolve) => { const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } }); assert.equal(client.start("recognize").accepted, true); });
+  const result = await terminal; assert.equal(result.type, "pipeline.completed"); assert.equal(result.command, "recognize"); assert.equal(result.recognition_result.recognition_engine_version, "4.0"); assert.equal(probes, 2);
+});
+
+test("Worker command generation is field-equivalent to the legacy local format generator", async () => {
+  const text = "xxxx"; const textHash = hashText(text);
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "4.0", document_id: "doc-1", document_revision: "rev-1", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "body", section_kind: "body", text_sha256: textHash, physical_text_sha256: textHash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields(text) }] };
+  const profile = { id: "default", version: "1.0", page_setup: { page_width_cm: 21, page_height_cm: 29.7, margin_top_cm: 3.7, margin_bottom_cm: 3.5, margin_left_cm: 2.8, margin_right_cm: 2.6, lines_per_page: 22, chars_per_line: 28, grid_alignment: "文字对齐字符网络", grid_mode: "line_only", normal_east_asia_font_name: "仿宋_GB2312", normal_latin_font_name: "Times New Roman", normal_font_size_pt: 16 }, styles: { body: { east_asia_font_name: "仿宋_GB2312", latin_font_name: "Times New Roman", font_size_pt: 16, bold: false, alignment: "justify", first_line_indent_chars: 2, left_indent_chars: 0, right_indent_chars: 0, space_before_lines: 0, space_after_lines: 0, line_spacing_rule: "exactly", line_spacing_pt: 28, page_break_before: false, outline_level: 10 } } };
+  const clientCapabilities = { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: ["paragraph.font", "paragraph.alignment", "paragraph.indent", "paragraph.spacing", "section.page_setup"] };
+  const requestId = "request-00000001";
+  const request = { schema_version: COMMAND_REQUEST_VERSION, request_id: requestId, recognition_result: recognition, profile_id: "default", profile_version: "1.0", client_capabilities: clientCapabilities, product_version: "1.0", authorization_scope: "classified-offline" };
+  const legacy = await new LocalFormatCommandGenerator(profile).requestCommands(request);
+  const worker = await generateWorkerCommands(recognition, requestId, { profile, client_capabilities: clientCapabilities, authorization_scope: "classified-offline" });
+  assert.deepEqual(worker, legacy);
+});
+
 function fakeWps(text = "测试段落\r") {
   const format = { Alignment: 0, CharacterUnitFirstLineIndent: 0, CharacterUnitLeftIndent: 0, CharacterUnitRightIndent: 0, LineUnitBefore: 0, LineUnitAfter: 0, LineSpacingRule: 0, LineSpacing: 0, PageBreakBefore: 0, OutlineLevel: 10, SnapToGrid: true };
   const pageSetup = { PageWidth: 600, PageHeight: 800, TopMargin: 70, BottomMargin: 70, LeftMargin: 70, RightMargin: 70, LinesPage: 22, CharsLine: 28, LayoutMode: 1, ShowGrid: true };
@@ -633,6 +909,25 @@ test("preview comments use a paragraph Range and remove only their session marke
   assert.deepEqual(globalThis.Application.Selection, selection);
 });
 
+test("Worker PreviewPlan and Host preview batches use the same comment text and preserve user comments", async () => {
+  const text = "预览段落"; const hash = hashText(text); const comments = [{ Author: "用户", Initial: "用", Range: { Text: "已有批注" }, Delete() { this.deleted = true; } }];
+  const commentCollection = { get Count() { return comments.filter((item) => !item.deleted).length; }, Item(index) { return comments.filter((item) => !item.deleted)[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() { this.deleted = true; } }; comments.push(item); return item; } };
+  const paragraphRange = { Text: text + "\r", Start: 10, End: 10 + text.length + 1, Tables: { Count: 0 } };
+  const application = { ActiveDocument: { FullName: "C:\\preview.docx", Saved: true, Sections: { Count: 1 }, Comments: commentCollection, Paragraphs: { Count: 1, Item() { return { Range: paragraphRange }; } }, Range(start, end) { return { Start: start, End: end, Text: text.slice(start - 10, end - 10) }; } } };
+  const bridge = new WpsHostBridge(application); const base = { type: "host.rpc.request", job_id: "preview-job-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-preview", operation: "host.capture_document_descriptor" });
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "4", document_id: "doc-1", document_revision: "rev", source_sha256: hash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "main_title", section_kind: "body", text_sha256: hash, physical_text_sha256: hash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields(text) }] };
+  const target = { ...commandTarget(hash, text.length), target_id: "doc-1:p:0" }; const commands = commandSet([{ command_id: "cmd-000001", kind: "paragraph.set_font", target, arguments: { east_asia_font_name: "方正小标宋简体", latin_font_name: "Times New Roman", font_size_pt: 22, bold: false }, required_capability: "paragraph.font", on_unsupported: "fail" }]);
+  const plan = createPreviewPlan({ documentId: "doc-1", revision: "rev", sourceSha256: hash, paragraphs: [{ sourceParagraphIndex: 0, text }] }, recognition, commands, "all");
+  assert.equal(plan.length, 1); assert.match(plan[0].comment_text, /识别结果：主标题/);
+  const applied = await bridge.handle({ ...base, rpc_id: "preview-apply", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-1", items: plan } });
+  assert.equal(applied.ok, true); assert.equal(applied.value.applied_count, 1); assert.equal(comments.filter((item) => !item.deleted).length, 2);
+  const oversized = await bridge.handle({ ...base, rpc_id: "preview-overflow", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-1", items: Array(6).fill(plan[0]) } });
+  assert.equal(oversized.ok, false); assert.equal(oversized.error.code, "HOST_PREVIEW_BATCH_INVALID");
+  const cleared = await bridge.handle({ ...base, rpc_id: "preview-clear", operation: "host.clear_preview_batch", document_token: descriptor.value.document_token, payload: { batch_size: 5 } });
+  assert.equal(cleared.ok, true); assert.equal(cleared.value.remaining, 0); assert.equal(cleared.value.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
+});
+
 test("preview comments anchor each mixed role to its verified UTF-16 sub-range", async () => {
   const text = "一、标题。正文内容"; const title = "一、标题。"; const body = "正文内容";
   const comments = [];
@@ -768,6 +1063,36 @@ test("LocalApplicationRuntime directly invokes pane actions and rejects unknown 
   await assert.rejects(() => runtime.run("not_registered"), /UNKNOWN_LOCAL_COMMAND/);
 });
 
+test("production preview returns after Worker submission without awaiting the pipeline", async () => {
+  const mocks = hostMocks(); const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
+  const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a", threadedPreviewEnabled: true }); const calls = [];
+  runtime.attachPipelineStarter((command) => { calls.push(command); return { accepted: true, command_id: "preview-worker-1", command_name: command }; });
+  const result = await runtime.run("preview_document", "ribbon", "preview-request-1", "build-a");
+  assert.equal(result.status, "PASS"); assert.equal(result.summary, "预览任务已提交"); assert.deepEqual(calls, ["preview"]);
+});
+
+test("production preview is safely blocked unless the threaded launch gate is explicitly enabled", async () => {
+  const mocks = hostMocks(); const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
+  const store = new HostResultStore(mocks.storage, build, "host-a"); const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a" }); const calls = [];
+  runtime.attachPipelineStarter((command) => { calls.push(command); return { accepted: true, command_id: "unexpected", command_name: command }; });
+  const result = await runtime.run("preview_document", "ribbon", "preview-request-blocked", "build-a");
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.error_code, "THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED");
+  assert.deepEqual(calls, []);
+});
+
+test("development recognition launch probe reuses the production Worker command without invoking preview", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
+  const marker = source.slice(source.indexOf("if (developmentE2E &&"), source.indexOf("void runAutomaticHostAcceptance"));
+  const automatic = source.slice(source.indexOf("async function runAutomaticHostAcceptance"), source.indexOf("function installDiagnosticLogger"));
+  assert.match(marker, /developmentE2E\.command === "recognition_launch_probe"/);
+  assert.match(marker, /startPipeline\("recognize"\)/);
+  assert.equal(marker.includes('startPipeline("preview")'), false);
+  assert.equal(automatic.includes("startSnapshotJob"), false);
+});
+
 test("LocalApplicationRuntime logs the original stack while public state keeps only the stable error", async () => {
   const mocks = hostMocks();
   const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
@@ -846,6 +1171,29 @@ test("canonical ribbon directly runs preview locally without dispatch or queue",
   assert.deepEqual(calls, [["preview_document", "ribbon"]]);
 });
 
+test("production preview starts only the Worker while legacy preview remains unreachable", async () => {
+  const host = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
+  const client = await readFile(new URL("../apps/classified-offline/src/pipeline-worker-client.ts", import.meta.url), "utf8");
+  const worker = await readFile(new URL("../apps/classified-offline/src/pipeline-worker.ts", import.meta.url), "utf8");
+  const previewBlock = host.slice(host.indexOf("private async preview("), host.indexOf("/** @deprecated Retained only for legacy equivalence tests"));
+  const legacyPreviewBlock = host.slice(host.indexOf("private async legacyPreview("), host.indexOf("private async clearPreview("));
+  const formatBlock = host.slice(host.indexOf("private async format("), host.indexOf("private async health("));
+  const shadowBlock = host.slice(host.indexOf("hostWindow.DocxtoolRunSnapshotShadow ="), host.indexOf("hostWindow.DocxtoolCancelSnapshotShadow ="));
+
+  assert.match(previewBlock, /this\.pipelineStart\?\.\("preview"\)/);
+  assert.equal(previewBlock.includes("previewUseCase.execute"), false);
+  assert.equal(previewBlock.includes("readSnapshot"), false);
+  assert.match(legacyPreviewBlock, /this\.composition\(\)\.previewUseCase\.execute/);
+  assert.match(formatBlock, /this\.composition\(\)\.formatUseCase\.execute/);
+  assert.match(shadowBlock, /startPipeline\("snapshot_shadow"\)/);
+  for (const forbidden of ["PreviewDocumentUseCase", "FormatDocumentUseCase", "readSnapshot"]) {
+    assert.equal(client.includes(forbidden), false);
+  }
+  for (const forbidden of ["window", "Application", "ActiveDocument", "Paragraphs", "Range", "Comments"]) {
+    assert.equal(worker.includes(forbidden), false);
+  }
+});
+
 test("canonical ribbon reports taskpane creation failure instead of swallowing it", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
   const storage = new Map();
@@ -900,6 +1248,13 @@ test("classified build has no environment-selected duplicate entry", async () =>
   assert.equal(config.includes("DOCXTOOL_DEVELOPMENT_E2E"), false);
   assert.equal(config.includes("main.production.js"), false);
   assert.equal(config.includes("ribbon-production.js"), false);
+});
+
+test("local recognition runtime build collects the installed docxtool resources", async () => {
+  const script = await readFile(new URL("../scripts/build-local-recognition-runtime.ps1", import.meta.url), "utf8");
+  const config = await readFile(new URL("../apps/classified-offline/ui/local-runtime-config.js", import.meta.url), "utf8");
+  assert.match(script, /--collect-data\s+"docxtool"/);
+  assert.match(config, /threadedPreviewEnabled:\s*false/);
 });
 
 test("canonical entry loads the runtime config, probe, ribbon and classic host emitted by the build", async () => {

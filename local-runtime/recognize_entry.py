@@ -89,6 +89,7 @@ def write_error(path: Path, request_id: str, error: Exception) -> None:
         "schema_version": REQUEST_SCHEMA_VERSION,
         "request_id": request_id,
         "error_code": stable_error_code(error),
+        "error_type": type(error).__name__,
     })
 
 

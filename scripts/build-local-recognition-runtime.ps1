@@ -31,6 +31,7 @@ Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
   --noconfirm `
   --clean `
   --onefile `
+  --collect-data "docxtool" `
   --name "docxtool-recognize" `
   --distpath $distRoot `
   --workpath $workRoot `

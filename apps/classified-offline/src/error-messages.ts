@@ -43,9 +43,14 @@ const ERROR_MESSAGES: Record<string, string> = {
   WPS_FILESYSTEM_MKDIR_UNAVAILABLE: "当前 WPS 无法创建识别临时目录。",
   WPS_FILESYSTEM_WRITE_UNAVAILABLE: "当前 WPS 无法写入识别请求文件。",
   WPS_FILESYSTEM_READ_UNAVAILABLE: "当前 WPS 无法读取识别结果文件。",
+  WEB_WORKER_UNSUPPORTED: "当前 WPS 不支持后台 Worker，已停止线程解耦流程。",
+  WEB_WORKER_LOAD_FAILED: "WPS 无法加载后台 Worker 资源。",
+  WEB_WORKER_CONSTRUCTION_FAILED: "WPS 无法创建后台 Worker。",
+  WEB_WORKER_PROBE_TIMEOUT: "WPS 后台 Worker 能力检测超时。",
   LOCAL_RECOGNITION_TIMEOUT: "本地识别程序运行超时。请查看本地日志并检查测试文档。",
   LOCAL_RECOGNITION_INVALID_JSON: "本地识别程序返回了无效结果。请重新安装与插件版本匹配的识别组件。",
   LOCAL_RECOGNITION_REQUEST_ID_MISMATCH: "本地识别结果与当前请求不匹配，已拒绝使用。",
+  THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED: "线程预览启动链尚未通过真实 WPS 验证，当前已安全关闭。",
 };
 
 export function errorMessage(code: string | undefined | null): string {

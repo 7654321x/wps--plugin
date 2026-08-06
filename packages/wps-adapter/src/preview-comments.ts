@@ -35,9 +35,9 @@ function fontSizeName(value: number): string {
   const names = new Map<number, string>([[42, "初号"], [36, "小初"], [26, "一号"], [24, "小一"], [22, "二号"], [18, "小二"], [16, "三号"], [15, "小三"], [14, "四号"], [12, "小四"], [10.5, "五号"], [9, "小五"], [7.5, "六号"], [6.5, "小六"], [5.5, "七号"], [5, "八号"]]);
   return names.get(value) ?? `${value} pt`;
 }
-function previewAuthor(type: string): string { return PREVIEW_AUTHOR_PREFIX + (ROLE_NAMES[type] ?? "需要复核"); }
-function previewInitial(type: string): string { return ({ main_title: "主", title_continuation: "续", heading1: "一", heading2: "二", heading3: "三", heading4: "四", body: "文", recipient: "称", attachment_note: "附", attachment_title: "附题", signature_org: "署", signature_date: "日" } as Record<string, string>)[type] ?? "复"; }
-function display(item: { recognized_type: string; confidence: number; needs_review: boolean }, commands: FormattingCommandSet["commands"]): string {
+export function previewAuthor(type: string): string { return PREVIEW_AUTHOR_PREFIX + (ROLE_NAMES[type] ?? "需要复核"); }
+export function previewInitial(type: string): string { return ({ main_title: "主", title_continuation: "续", heading1: "一", heading2: "二", heading3: "三", heading4: "四", body: "文", recipient: "称", attachment_note: "附", attachment_title: "附题", signature_org: "署", signature_date: "日" } as Record<string, string>)[type] ?? "复"; }
+export function createPreviewCommentText(item: { recognized_type: string; confidence: number; needs_review: boolean }, commands: FormattingCommandSet["commands"]): string {
   const role = ROLE_NAMES[item.recognized_type] ?? "未知";
   const font = commands.find((command) => command.kind === "paragraph.set_font"); const alignment = commands.find((command) => command.kind === "paragraph.set_alignment"); const indent = commands.find((command) => command.kind === "paragraph.set_indent"); const spacing = commands.find((command) => command.kind === "paragraph.set_spacing");
   const alignmentNames: Record<string, string> = { left: "左对齐", center: "居中", right: "右对齐", justify: "两端对齐", distributed: "分散对齐" };
@@ -52,7 +52,17 @@ function display(item: { recognized_type: string; confidence: number; needs_revi
   fields.push(`识别状态：${needsReview ? "需要复核" : "可应用"}`, `识别置信度：${Math.round(item.confidence * 100)}%`);
   return [fields.slice(0, 5), fields.slice(5, 10), fields.slice(10)].filter((group) => group.length > 0).map((group) => group.join(" ")).join("\n");
 }
-function shouldAdd(item: { recognized_type: string; needs_review: boolean }, mode: PreviewDisplayMode): boolean { return mode === "all" || (mode === "review_only" ? item.needs_review || item.recognized_type === "unknown" : SPECIAL.has(item.recognized_type)); }
+export function shouldAddPreview(item: { recognized_type: string; needs_review: boolean }, mode: PreviewDisplayMode): boolean { return mode === "all" || (mode === "review_only" ? item.needs_review || item.recognized_type === "unknown" : SPECIAL.has(item.recognized_type)); }
+export interface PreviewPlanItem {
+  item_id: string; source_paragraph_index: number; target: RecognitionResult["paragraphs"][number];
+  recognized_type: string; needs_review: boolean; comment_text: string; comment_author: string; comment_initial: string;
+}
+export function createPreviewPlan(snapshot: LocalDocumentSnapshot, recognition: RecognitionResult, commands: FormattingCommandSet, mode: PreviewDisplayMode = "all"): PreviewPlanItem[] {
+  const commandsByTarget = new Map<string, FormattingCommandSet["commands"]>();
+  for (const command of commands.commands) { const values = commandsByTarget.get(command.target.target_id) ?? []; values.push(command); commandsByTarget.set(command.target.target_id, values); }
+  const sources = new Map(snapshot.paragraphs.map((item) => [item.sourceParagraphIndex, item]));
+  return recognition.paragraphs.filter((item) => shouldAddPreview(item, mode) && Boolean(sources.get(item.host_paragraph_index)?.text)).map((item, index) => ({ item_id: `preview-${String(index + 1).padStart(6, "0")}`, source_paragraph_index: item.source_paragraph_index, target: item, recognized_type: item.recognized_type, needs_review: item.needs_review, comment_text: createPreviewCommentText(item, commandsByTarget.get(item.target_id) ?? []), comment_author: previewAuthor(item.recognized_type), comment_initial: previewInitial(item.recognized_type) }));
+}
 function textHash(snapshot: LocalDocumentSnapshot): string { return snapshot.sourceSha256; }
 function commentReference(comment: WpsObject): string {
   return [comment.Author, comment.Initial, normalizedComment(content(comment))].map((value) => String(value ?? "")).join(":");
@@ -117,7 +127,7 @@ export class WpsPreviewCommentService implements PreviewCommentService {
     const tracker = (): PreviewMutationTracker => ({ preview_session_id: session, document_id: input.snapshot.documentId, document_full_name_hash: input.snapshot.documentFullNameHash ?? "", baseline_revision: input.snapshot.revision, baseline_text_hash: textHash(input.snapshot), baseline_paragraph_count: input.snapshot.paragraphs.length, baseline_paragraph_order_hash: input.snapshot.paragraphOrderHash ?? input.snapshot.sourceSha256, baseline_formatting_revision: input.snapshot.formattingRevision ?? "", baseline_section_count: input.snapshot.sectionCount ?? 0, baseline_saved_state: Boolean(document.Saved), user_comment_fingerprint: userFingerprint, created_comment_markers: [...created], paragraph_anchors: input.recognition.paragraphs.map((item) => item.target_id.slice(-12)), created_at: new Date().toISOString() });
     try {
       for (const item of input.recognition.paragraphs) {
-        if (!shouldAdd(item, input.mode)) continue;
+        if (!shouldAddPreview(item, input.mode)) continue;
         const source = input.snapshot.paragraphs.find((value) => value.sourceParagraphIndex === item.host_paragraph_index);
         if (!source || !normalize(source.text)) continue;
         const hostParagraph = paragraph(document, item.host_paragraph_index);
@@ -133,7 +143,7 @@ export class WpsPreviewCommentService implements PreviewCommentService {
         // that UTF-16 sub-range without changing Selection.
         const bodyRange = document.Range(start, end) as WpsObject;
         if (await sha256(normalize(bodyRange.Text)) !== item.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
-        const value = display(item, commandsByTarget.get(item.target_id) ?? []);
+        const value = createPreviewCommentText(item, commandsByTarget.get(item.target_id) ?? []);
         created.push(markerRecord(item.host_paragraph_index, item.host_raw_start_utf16, item.host_raw_end_utf16, value));
         const countBefore = Number(comments.Count ?? 0); const returned = comments.Add(bodyRange, value) as WpsObject | undefined;
         let comment = returned && typeof returned === "object" ? returned : undefined;
