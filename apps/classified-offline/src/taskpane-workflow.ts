@@ -1,7 +1,7 @@
 import { errorMessage, errorText } from "./error-messages.js";
 import { safeError, type DiagnosticEvent, type DiagnosticLevel } from "../../../packages/diagnostics/src/index.js";
 
-type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about";
+type HostCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "show_about" | "probe_shell_execute_one_argument";
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface HostState {
   build_id: string; asset_hash: string; host_context_id: string; command_status: string; active_view: "recognition" | "preview" | "execution" | "issues";
@@ -151,6 +151,11 @@ for (const [elementId, command] of [["recognize-document", "recognize_document"]
 }
 node("close-taskpane").addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "关闭任务窗格按钮已点击", { control_id: "close-taskpane", command_name: "close_taskpane" }); closeTaskPane(); });
 taskpaneLog("DEBUG", "taskpane.button.bound", "关闭任务窗格按钮已绑定", { control_id: "close-taskpane", command_name: "close_taskpane" });
+const launchProbeButton = document.getElementById("launch-probe");
+if (launchProbeButton) {
+  launchProbeButton.addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "本地启动边界探针按钮已点击", { control_id: "launch-probe", command_name: "probe_shell_execute_one_argument" }); request("probe_shell_execute_one_argument"); });
+  taskpaneLog("DEBUG", "taskpane.button.bound", "本地启动边界探针按钮已绑定", { control_id: "launch-probe", command_name: "probe_shell_execute_one_argument" });
+}
 node("focus-document").addEventListener("click", () => { taskpaneLog("INFO", "taskpane.button.clicked", "返回文档按钮已点击", { control_id: "focus-document" }); focusDocument(); });
 const build = bridgeWindow.DocxtoolBuildInfo; text("plugin-version", build?.plugin_version ?? "未知"); text("build-id", build?.build_id?.slice(0, 20) ?? "未知");
 tryInstallTaskpaneLogger();

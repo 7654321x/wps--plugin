@@ -10,7 +10,7 @@ import { probeWorkerCapability, type WorkerCapability } from "./worker-capabilit
 import { PipelineWorkerClient, type SnapshotCommandReceipt } from "./pipeline-worker-client.js";
 import { BoundedDiagnosticFileBuffer } from "./diagnostic-buffer.js";
 import type { PipelineCommand, PipelineWorkerEvent } from "../../../packages/threading/src/protocol.js";
-type LocalCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane";
+type LocalCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "probe_shell_execute_one_argument";
 type LocalCommandSource = "ribbon" | "taskpane" | "test";
 type LocalApplicationCommandName = LocalCommandName | "show_about";
 type LocalApplicationCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
@@ -45,7 +45,8 @@ type HostWindow = Window & {
   DocxtoolLocalApplication?: { runtime: LocalApplicationRuntime; panes: TaskPaneManager; store: HostResultStore; build: BuildInfo; pipeline: PipelineWorkerClient; };
   DocxtoolRunSnapshotShadow?: () => SnapshotCommandReceipt;
   DocxtoolCancelSnapshotShadow?: () => boolean;
-  DocxtoolDevelopmentE2E?: { command: "preview_document" | "format_document" | "recognition_launch_probe"; nonce: string };
+  DocxtoolDevelopmentE2E?: { command: "preview_document" | "format_document" | "recognition_launch_probe" | "shell_execute_one_argument"; nonce: string };
+  DocxtoolNativeLaunchProbe?: () => Promise<{ returned_in_ms: number }>;
   DocxtoolEarlyLogQueue?: DiagnosticEvent[];
   DocxtoolEarlyLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
   DocxtoolBootstrapLog?: (level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown, component?: string) => void;
@@ -164,7 +165,7 @@ export class LocalApplicationRuntime {
   private readonly registry: Record<LocalApplicationCommandName, (result: CommandResult) => Promise<string>>;
   private pipelineStart?: (command: PipelineCommand) => SnapshotCommandReceipt;
   constructor(private readonly app: ApplicationLike, private readonly panes: TaskPaneManager, private readonly store: HostResultStore, private readonly config: ClassifiedRuntimeConfig) {
-    this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
+    this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), probe_shell_execute_one_argument: async () => { const value = await hostWindow.DocxtoolNativeLaunchProbe?.(); if (!value) throw new Error("LOCAL_LAUNCH_PROBE_UNAVAILABLE"); return `单参数 ShellExecute 返回 ${Math.round(value.returned_in_ms)} ms`; }, open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
   }
   attachPipelineStarter(start: (command: PipelineCommand) => SnapshotCommandReceipt): void { this.pipelineStart = start; }
   async run(name: LocalApplicationCommandName, source: LocalCommandSource | "e2e" = "ribbon", requestId = id("local"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
@@ -315,6 +316,7 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
     const manifest = readRuntimeManifest(application, manifestPath);
     if (manifest) {
       manifest.threadedPreviewEnabled = direct.threadedPreviewEnabled === true;
+      manifest.launchProbeExecutablePath = typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined;
       application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(manifest));
       return manifest;
     }
@@ -322,6 +324,7 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
   if (typeof direct.recognitionExecutablePath === "string" && direct.recognitionExecutablePath) {
     const value = {
       recognitionExecutablePath: expandAppDataPath(application, direct.recognitionExecutablePath),
+      launchProbeExecutablePath: typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined,
       runtimeVersion: direct.runtimeVersion || "unknown",
       runtimeSha256: direct.runtimeSha256 || "",
       recognitionPackageVersion: direct.recognitionPackageVersion,
@@ -394,7 +397,15 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     else { store.update({ command_status: "FAIL", active_command: current ? { ...current, status: "FAIL", stage: "failed", summary: "后台任务失败", error_code: event.error.code, finished_at: now() } : null, formatting_progress: "后台线程任务失败", latest_error: event.error.code, active_view: "issues" }); hostLog("ERROR", "pipeline.job.failed", "后台线程任务失败", { command: activePipelineCommand ?? "", stable_error_code: event.error.code, main_thread_max_drift_ms: mainThreadMaxDrift }); }
     activePipelineCommand = null;
   };
-  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1 }), buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline" }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
+  const debugProbeEnabled = ["127.0.0.1", "localhost"].includes(hostWindow.location.hostname);
+  const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
+  hostWindow.DocxtoolNativeLaunchProbe = async () => {
+    if (!debugProbeEnabled) throw new Error("HOST_DEBUG_PROBE_DISABLED");
+    const response = await hostBridge.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: id("launch-probe"), job_id: id("launch-probe-job"), build_id: build.build_id, payload: {} });
+    if (!response.ok) throw new Error(response.error?.code ?? "LOCAL_LAUNCH_PROBE_FAILED");
+    return response.value as { returned_in_ms: number };
+  };
+  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline" }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
   const startPipeline = (command: PipelineCommand) => { const receipt = pipeline.start(command); if (receipt.accepted) { activePipelineCommand = command; pipelineBusy = true; hostWindow.DocxtoolCommandBusy = true; startHeartbeat(); invalidate(); hostWindow.setTimeout(() => { const active = store.read().active_command; if (active) store.update({ command_status: "RUNNING", active_command: { ...active, status: "RUNNING", stage: "pipeline", summary: "后台线程处理中", finished_at: "" } }); }, 0); } return receipt; };
   runtime.attachPipelineStarter(startPipeline);
   hostWindow.DocxtoolLocalApplication = { runtime, panes, store, build, pipeline };
@@ -416,6 +427,10 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     if (developmentE2E.command === "recognition_launch_probe") {
       const receipt = startPipeline("recognize");
       if (!receipt.accepted) hostLog("ERROR", "development.e2e.failed", "识别启动探针未能提交", { command: developmentE2E.command, stable_error_code: receipt.reason ?? "PIPELINE_START_REJECTED" });
+      return;
+    }
+    if (developmentE2E.command === "shell_execute_one_argument") {
+      void hostWindow.DocxtoolRunLocalCommand?.("probe_shell_execute_one_argument", "test", developmentE2E.nonce).catch((error) => hostLog("ERROR", "development.e2e.failed", "单参数 ShellExecute 探针执行失败", { command: developmentE2E.command, stable_error_code: stableError(error) }, error));
       return;
     }
     void hostWindow.DocxtoolRunLocalCommand?.(developmentE2E.command, "test", developmentE2E.nonce).catch((error) => hostLog("ERROR", "development.e2e.failed", "受控开发 E2E 调用失败", { command: developmentE2E.command, stable_error_code: stableError(error) }, error));

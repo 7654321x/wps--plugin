@@ -424,3 +424,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：测试为了读取一个既有 fixture 而重生成整个 fixtures 目录；把测试产生的二进制差异混入功能提交。
 - 正确方案：只读检查直接使用受管理的固定 fixture；确需生成时写入 pytest tmp_path，并只生成当前测试需要的文件。
 - 自动验证门槛：运行对应 pytest 前后，受 Git 管理的 DOCX blob 哈希不变；git status --short 不新增 tests/fixtures 二进制改动。
+
+## P049 WPS 原生启动探针误带 Params 参数
+
+- 症状：单独验证本地 EXE 时仍复现 WPS `ShellExecute` 同步阻塞，或无法证明宿主实际尝试了最小调用。
+- 根因：把正式识别调用的 `--request/--result/--error` 参数复用于启动边界探针；当前 WPS 对双参数形式可能同步等待或不启动进程。
+- 禁止：在单参数探针中传空字符串、`undefined`、参数数组或任何命令行；不要把探针直接接入正式识别或打开生产线程预览。
+- 正确方案：探针只调用 `OAAssist.ShellExecute(probeExecutablePath)`，由独立 EXE 原子写入 `%APPDATA%\Docxtool\launch-probe\process-started.json` 后退出；仅 localhost debug RPC 可触发，真实通过前保持 `threadedPreviewEnabled=false`。
+- 自动验证门槛：Node 测试断言 `ShellExecute` 参数数组长度为 1；Python 探针测试和 PyInstaller EXE 启动均生成 `schema_version=1`、`argv_count=1` 标记；真实 WPS 记录 Host 返回耗时和 5 秒内标记文件是否出现。

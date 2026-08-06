@@ -2,13 +2,14 @@ import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 import { type DocumentDescriptor, type HostParagraphData, type HostRpcResult, type JsonValue, type SerializableLocalDocumentSnapshot, type WorkerHostRequest } from "../../threading/src/protocol.js";
 import { parseWorkerHostRequest } from "../../threading/src/validation.js";
 import { stripWpsImplicitParagraphTerminator } from "./host-text.js";
+import { WpsLocalFileSystem } from "./local-filesystem.js";
 import { WpsRecognitionJobService } from "./recognition-jobs.js";
 import { HOST_PREVIEW_BATCH_LIMIT, WpsPreviewBatchService } from "./preview-batches.js";
 import type { PreviewPlanItem } from "./preview-comments.js";
 
 type WpsObject = Record<string, any>;
 export const HOST_PARAGRAPH_BATCH_LIMIT = 10;
-export interface WpsHostBridgeOptions { recognitionExecutablePath?: string; recognitionContractVersion?: number; maxRecognitionResultBytes?: number; }
+export interface WpsHostBridgeOptions { recognitionExecutablePath?: string; recognitionContractVersion?: number; maxRecognitionResultBytes?: number; probeExecutablePath?: string; enableDebugProbes?: boolean; }
 
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -59,6 +60,7 @@ export class WpsHostBridge {
     if (request.operation === "host.read_paragraph_batch") return this.readParagraphBatch(request);
     if (request.operation === "host.launch_recognition") return this.launchRecognition(request);
     if (request.operation === "host.probe_recognition") return this.probeRecognition(request);
+    if (request.operation === "host.probe_shell_execute_one_argument") return this.probeShellExecuteOneArgument();
     if (request.operation === "host.cancel_recognition") return this.cancelRecognition(request);
     if (request.operation === "host.apply_preview_batch") return this.applyPreviewBatch(request);
     if (request.operation === "host.clear_preview_batch") return this.clearPreviewBatch(request);
@@ -135,6 +137,31 @@ export class WpsHostBridge {
   private probeRecognition(request: WorkerHostRequest): JsonValue {
     if (!this.recognitionJobs) throw new Error("LOCAL_RUNTIME_CONFIGURATION_REQUIRED");
     return this.recognitionJobs.probe(String(request.payload.recognition_job_id ?? "")) as unknown as JsonValue;
+  }
+
+  private probeShellExecuteOneArgument(): JsonValue {
+    if (!this.options.enableDebugProbes) throw new Error("HOST_DEBUG_PROBE_DISABLED");
+    const executablePath = this.options.probeExecutablePath;
+    if (!executablePath) throw new Error("LOCAL_LAUNCH_PROBE_CONFIGURATION_REQUIRED");
+    const fs = this.application.FileSystem;
+    if (!fs || !new WpsLocalFileSystem(fs).exists(executablePath)) throw new Error("LOCAL_LAUNCH_PROBE_NOT_FOUND");
+    const shellExecute = this.application.OAAssist?.ShellExecute;
+    if (typeof shellExecute !== "function") throw new Error("LOCAL_PROCESS_EXECUTION_BLOCKED");
+    const started = performance.now();
+    this.diagnostics?.writeForComponent("wps-launch-probe", "INFO", "launch_probe.shell_execute.call.start", "准备调用单参数 ShellExecute 启动边界探针", {});
+    try {
+      // The one-argument form is the subject of this probe. Do not add an
+      // empty, undefined or options parameter: WPS blocks on the two-argument
+      // recognition form in the current host.
+      shellExecute.call(this.application.OAAssist, executablePath);
+      const returnedInMs = performance.now() - started;
+      this.diagnostics?.writeForComponent("wps-launch-probe", "INFO", "launch_probe.shell_execute.call.returned", "单参数 ShellExecute 已返回", { returned_in_ms: returnedInMs });
+      return { returned_in_ms: returnedInMs };
+    } catch (error) {
+      const returnedInMs = performance.now() - started;
+      this.diagnostics?.writeForComponent("wps-launch-probe", "ERROR", "launch_probe.shell_execute.call.failed", "单参数 ShellExecute 调用失败", { returned_in_ms: returnedInMs }, error);
+      throw error;
+    }
   }
 
   private cancelRecognition(request: WorkerHostRequest): JsonValue {

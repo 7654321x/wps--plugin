@@ -695,6 +695,26 @@ test("WpsHostBridge separates recognition launch and probe without host-side pol
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("WpsHostBridge single-argument ShellExecute probe never supplies a second parameter", async () => {
+  const executablePath = "C:\\runtime\\docxtool-launch-probe.exe";
+  const calls = [];
+  const application = {
+    FileSystem: { Exists(value) { return value === executablePath; } },
+    OAAssist: { ShellExecute(...args) { calls.push(args); } },
+  };
+  const bridge = new WpsHostBridge(application, undefined, { probeExecutablePath: executablePath, enableDebugProbes: true });
+  const response = await bridge.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: "probe-1", job_id: "job-1", build_id: "build-1", payload: {} });
+  assert.equal(response.ok, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], [executablePath]);
+  assert.equal(typeof response.value.returned_in_ms, "number");
+
+  const disabled = new WpsHostBridge(application, undefined, { probeExecutablePath: executablePath });
+  const rejected = await disabled.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: "probe-2", job_id: "job-1", build_id: "build-1", payload: {} });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error.code, "HOST_DEBUG_PROBE_DISABLED");
+});
+
 test("recognition Worker owns polling and returns the mapped RecognitionResult", async () => {
   const paragraphs = [{ Range: { Text: "脱敏段落\r", Tables: { Count: 0 }, Start: 0, End: 5 } }]; let probes = 0;
   const bridge = {

@@ -16,6 +16,7 @@ export const HOST_RPC_OPERATIONS = [
   "host.capture_target_batch",
   "host.launch_recognition",
   "host.probe_recognition",
+  "host.probe_shell_execute_one_argument",
   "host.cancel_recognition",
   "host.apply_preview_batch",
   "host.clear_preview_batch",

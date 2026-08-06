@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -83,3 +82,30 @@ def test_success_builds_plan_and_binding(tmp_path, monkeypatch):
     assert payload["request_id"] == "req-1"
     assert payload["recognition_plan"]["binding"]["host_text_contract_version"] == "host-text-v1"
     assert not error.exists()
+
+
+def test_launch_probe_writes_atomic_start_marker(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("launch_probe", ROOT / "launch_probe.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert module.main([]) == 0
+    marker = tmp_path / "Docxtool" / "launch-probe" / "process-started.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert isinstance(payload["pid"], int)
+    assert payload["argv_count"] == 1
+    assert payload["started_at"].endswith("Z")
+    assert not list(marker.parent.glob("*.tmp"))
+
+
+def test_launch_probe_reports_actual_argument_count(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("launch_probe_args", ROOT / "launch_probe.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert module.main(["unexpected"]) == 0
+    marker = tmp_path / "Docxtool" / "launch-probe" / "process-started.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["argv_count"] == 2
