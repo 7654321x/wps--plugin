@@ -272,6 +272,12 @@ export function quoteWindowsCommandLineArgument(value: string): string {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function uuidV4(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); bytes[6] = (bytes[6] & 0x0f) | 0x40; bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 function fileSystem(application: WpsApplicationLike): WpsLocalFileSystem {
   const fs = application.FileSystem;
   if (!fs) throw new Error("WPS_FILESYSTEM_UNAVAILABLE");
@@ -306,14 +312,23 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
     if (!snapshot.localDocxPath) throw new Error("DOCUMENT_MUST_BE_SAVED");
     const fs = fileSystem(this.application);
     if (!fs.exists(this.executablePath)) throw new Error("LOCAL_RECOGNITION_RUNTIME_NOT_FOUND");
-    const tempRoot = this.application.Env?.GetTempPath?.();
-    if (!tempRoot) throw new Error("WPS_TEMP_PATH_UNAVAILABLE");
-    const randomPart = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : Array.from(crypto.getRandomValues(new Uint8Array(4)), (value) => value.toString(16).padStart(2, "0")).join("");
-    const requestId = `local-rec-${Date.now().toString(36)}-${randomPart}`;
-    const jobDir = joinPath(tempRoot, requestId);
+    const appData = this.application.Env?.GetAppDataPath?.();
+    if (!appData) throw new Error("LOCAL_JOB_BROKER_APPDATA_UNAVAILABLE");
+    const currentPath = joinPath(joinPath(appData, "Docxtool"), "runtime\\current.json");
+    const statusPath = joinPath(joinPath(appData, "Docxtool"), "broker\\status.json");
+    if (!fs.exists(currentPath) || !fs.exists(statusPath)) throw new Error("LOCAL_JOB_BROKER_NOT_RUNNING");
+    const current = parseJsonObject(fs.readText(currentPath), "LOCAL_JOB_BROKER_RUNTIME_MISMATCH");
+    const status = parseJsonObject(fs.readText(statusPath), "LOCAL_JOB_BROKER_NOT_RUNNING");
+    const heartbeat = typeof status.heartbeat_at === "string" ? Date.parse(status.heartbeat_at) : NaN;
+    if (status.state !== "READY" && status.state !== "RUNNING") throw new Error("LOCAL_JOB_BROKER_NOT_RUNNING");
+    if (!Number.isFinite(heartbeat) || Date.now() - heartbeat > 3_000) throw new Error("LOCAL_JOB_BROKER_STALE");
+    if (status.runtime_version !== current.runtime_version || status.runtime_sha256 !== current.executable_sha256) throw new Error("LOCAL_JOB_BROKER_RUNTIME_MISMATCH");
+    const requestId = uuidV4();
+    const jobDir = joinPath(joinPath(appData, "Docxtool\\jobs"), requestId);
     const requestPath = joinPath(jobDir, "request.json");
     const resultPath = joinPath(jobDir, "result.json");
     const errorPath = joinPath(jobDir, "error.json");
+    const finishedPath = joinPath(jobDir, "finished.json");
     const request = {
       schema_version: 1,
       request_id: requestId,
@@ -333,21 +348,15 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
         })),
       },
     };
-    const shellExecute = this.application.OAAssist?.ShellExecute;
-    if (typeof shellExecute !== "function") throw new Error("LOCAL_PROCESS_EXECUTION_BLOCKED");
-    fs.mkdir(jobDir);
-    fs.writeText(requestPath, JSON.stringify(request));
+    const queuedPath = joinPath(jobDir, "queued.json");
+    const queued = { schema_version: 1, job_id: requestId, contract_version: 1, runtime_version: String(current.runtime_version ?? ""), runtime_sha256: String(current.executable_sha256 ?? ""), created_at: new Date().toISOString(), build_id: "legacy-recognize" };
+    fs.mkdir(jobDir); fs.writeText(requestPath, JSON.stringify(request)); fs.writeText(queuedPath, JSON.stringify(queued));
     const started = Date.now();
-    this.diagnostics?.writeForComponent("recognition-client", "INFO", "recognition.local_process.start", "开始调用本地识别进程", { request_id: requestId, paragraph_count: snapshot.paragraphs.length });
+    this.diagnostics?.writeForComponent("recognition-client", "INFO", "host.recognition.job.queued", "本地识别任务已写入文件队列", { request_id: requestId, paragraph_count: snapshot.paragraphs.length, launch_mode: "file_queue_broker" });
     try {
-      const argumentsText = [
-        "--request", quoteWindowsCommandLineArgument(requestPath),
-        "--result", quoteWindowsCommandLineArgument(resultPath),
-        "--error", quoteWindowsCommandLineArgument(errorPath),
-      ].join(" ");
-      shellExecute.call(this.application.OAAssist, this.executablePath, argumentsText);
       while (Date.now() - started <= this.timeoutMs) {
-        if (fs.exists(resultPath)) {
+        if (fs.exists(joinPath(jobDir, "cancel.json"))) throw new Error("RECOGNITION_CANCELLED");
+        if (fs.exists(resultPath) && fs.exists(finishedPath)) {
           const raw = fs.readText(resultPath);
           if (new TextEncoder().encode(raw).byteLength > this.maxResultBytes) throw new Error("LOCAL_RECOGNITION_RESULT_TOO_LARGE");
           const payload = parseJsonObject(raw, "LOCAL_RECOGNITION_INVALID_JSON");
@@ -356,12 +365,15 @@ export class LocalProcessRecognitionTransport implements LocalRecognitionTranspo
           if (!plan || typeof plan !== "object") throw new Error("LOCAL_RECOGNITION_INVALID_RESULT");
           return plan as WheelRecognitionPlan;
         }
-        if (fs.exists(errorPath)) throw new Error(processError(fs.readText(errorPath)));
+        if (fs.exists(errorPath) && fs.exists(finishedPath)) throw new Error(processError(fs.readText(errorPath)));
         await delay(this.pollMs);
       }
       throw new Error("LOCAL_RECOGNITION_TIMEOUT");
     } finally {
       for (const path of [requestPath, resultPath, errorPath]) {
+        try { fs.removeFile(path); } catch { /* cleanup must not hide the real error */ }
+      }
+      for (const path of [queuedPath, joinPath(jobDir, "claimed.json"), joinPath(jobDir, "launched.json"), joinPath(jobDir, "heartbeat.json"), finishedPath]) {
         try { fs.removeFile(path); } catch { /* cleanup must not hide the real error */ }
       }
       try { fs.removeDirectory(jobDir); } catch { /* cleanup must not hide the real error */ }

@@ -189,11 +189,17 @@ export class SnapshotPipelineWorkerRuntime {
     const recognitionJobId = String(launched.value.recognition_job_id ?? "");
     if (!recognitionJobId) throw new Error("LOCAL_RECOGNITION_HANDLE_INVALID");
     context.recognition_job_id = recognitionJobId; context.stage = "waiting_recognition";
-    let intervalMs = 300; const started = performance.now(); let probes = 0;
+    let intervalMs = 300; const started = performance.now(); let probes = 0; let lastState = "";
     while (performance.now() - started <= 120_000) {
       assertNotCancelled(context);
       const status = await this.rpc<Record<string, JsonValue>>(context, "host.probe_recognition", { recognition_job_id: recognitionJobId });
       probes += 1;
+      const state = String(status.value.state ?? "running");
+      if (state !== lastState) {
+        lastState = state;
+        if (state === "claimed") this.diagnostic(context, "broker.job.claimed");
+        if (state === "launched") this.diagnostic(context, "broker.recognizer.started");
+      }
       if (status.value.state === "completed") {
         context.stage = "mapping_recognition";
         const result = await mapWheelRecognitionPlan(snapshot, status.value.recognition_plan as unknown as WheelRecognitionPlan);
@@ -201,6 +207,10 @@ export class SnapshotPipelineWorkerRuntime {
         return result;
       }
       if (status.value.state === "failed") throw new Error(String((status.value.error as Record<string, JsonValue> | undefined)?.code ?? "LOCAL_RECOGNITION_FAILED"));
+      if (status.value.state === "cancelled") throw new Error("PIPELINE_CANCELLED");
+      const elapsed = performance.now() - started;
+      if ((state === "queued" || state === "running") && elapsed > 5_000) throw new Error("BROKER_CLAIM_TIMEOUT");
+      if (state === "claimed" && elapsed > 10_000) throw new Error("RECOGNIZER_LAUNCH_TIMEOUT");
       this.post({ type: "pipeline.progress", job_id: context.job.job_id, build_id: context.job.build_id, stage: "waiting_recognition", completed: probes, total: 0, batch_size: 1, detail: "本地识别正在运行" });
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
       intervalMs = Math.min(1_000, intervalMs + 100);

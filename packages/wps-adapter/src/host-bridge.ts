@@ -9,7 +9,17 @@ import type { PreviewPlanItem } from "./preview-comments.js";
 
 type WpsObject = Record<string, any>;
 export const HOST_PARAGRAPH_BATCH_LIMIT = 10;
-export interface WpsHostBridgeOptions { recognitionExecutablePath?: string; recognitionContractVersion?: number; maxRecognitionResultBytes?: number; probeExecutablePath?: string; enableDebugProbes?: boolean; }
+export interface WpsHostBridgeOptions {
+  recognitionExecutablePath?: string;
+  recognitionContractVersion?: number;
+  maxRecognitionResultBytes?: number;
+  brokerStatusPath?: string;
+  brokerJobsPath?: string;
+  brokerRuntimeVersion?: string;
+  brokerRuntimeSha256?: string;
+  probeExecutablePath?: string;
+  enableDebugProbes?: boolean;
+}
 
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -31,7 +41,7 @@ export class WpsHostBridge {
   private readonly recognitionJobs: WpsRecognitionJobService | null;
   private readonly previewBatches: WpsPreviewBatchService;
   constructor(private readonly application: WpsObject, private readonly diagnostics?: DiagnosticReporter, private readonly options: WpsHostBridgeOptions = {}) {
-    this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics) : null;
+    this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics, { statusPath: options.brokerStatusPath, jobsPath: options.brokerJobsPath, runtimeVersion: options.brokerRuntimeVersion, runtimeSha256: options.brokerRuntimeSha256, contractVersion: options.recognitionContractVersion }) : null;
     this.previewBatches = new WpsPreviewBatchService(application);
   }
 

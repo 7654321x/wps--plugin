@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import ctypes
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -37,6 +39,7 @@ DEBUG_MANIFEST = DEBUG_PACKAGE / "debug-package.json"
 WPSJS_LOG = ROOT / ".runtime" / "logs" / "wpsjs-debug.log"
 WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
+JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
 
 
 class StepFailed(RuntimeError):
@@ -116,6 +119,12 @@ def print_status() -> None:
     print(f"- WPS 插件页面：{'已加载' if plugin_page_loaded(event_names) else '等待 WPS 重新加载'}")
     print(f"- 本地识别组件：{'已安装' if values.get('local_runtime') == 'READY' else '未安装'}")
     print(f"- 识别程序文件：{'存在' if values.get('runtime_executable_exists') == 'YES' else '不存在'}")
+    current = broker_current()
+    status = broker_status()
+    print(f"- 本地任务 Broker：{'已就绪' if broker_healthy(current, status) else '未就绪'}")
+    print(f"- Broker PID：{status.get('pid', '未知')}")
+    print(f"- Broker 版本：{status.get('broker_version', '未知')}")
+    print("- Broker 通信：文件队列；网络端口：无")
     print(f"- 旧 local-agent：{'未使用' if values.get('local_agent') == 'NOT_USED' else '异常运行中'}")
     print(f"- 旧 command-service：{'未使用' if values.get('command_service') == 'NOT_USED' else '异常运行中'}")
     print(f"- 旧 9528 端口：{'已关闭' if values.get('port_9528') == 'CLOSED' else '仍在监听'}")
@@ -126,6 +135,7 @@ def print_status() -> None:
 def prepare() -> None:
     run_step("构建本地识别组件", "npm run build:local-runtime", "本地识别组件构建完成。", timeout=240)
     run_step("安装本地识别组件", "npm run install:local-runtime", "本地识别组件已安装。")
+    ensure_job_broker()
     run_step("构建 WPS 插件", "npm run build:classified", "WPS 插件构建完成。")
     run_step("检查 WPS 插件结构", "npm run verify:addin -- classified-offline", "WPS 插件结构检查已完成。")
     run_step("生成 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "WPS 调试包已生成。")
@@ -145,6 +155,118 @@ def read_json(path: Path) -> Dict[str, object]:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def appdata_docxtool_root() -> Path:
+    value = os.environ.get("APPDATA")
+    if not value:
+        raise StepFailed("检查本地任务 Broker", "APPDATA", "APPDATA_UNAVAILABLE")
+    return Path(value) / "Docxtool"
+
+
+def broker_current() -> Dict[str, object]:
+    return read_json(appdata_docxtool_root() / "runtime" / "current.json")
+
+
+def broker_status() -> Dict[str, object]:
+    return read_json(appdata_docxtool_root() / "broker" / "status.json")
+
+
+def process_is_alive(pid: object) -> bool:
+    try:
+        process_id = int(pid)
+        if process_id <= 0:
+            return False
+        if sys.platform == "win32":
+            result = subprocess.run(["pwsh", "-NoProfile", "-Command", f"Get-Process -Id {process_id} -ErrorAction SilentlyContinue | Out-Null"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return result.returncode == 0
+        os.kill(process_id, 0)
+        return True
+    except (OSError, SystemError, TypeError, ValueError):
+        return False
+
+
+def managed_broker_process(pid: object, executable: Path) -> bool:
+    if not process_is_alive(pid):
+        return False
+    script = f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; if($p){{$p.ExecutablePath; $p.CommandLine}}"
+    try:
+        output = subprocess.check_output(["pwsh", "-NoProfile", "-Command", script], cwd=str(ROOT), text=True, encoding="utf-8", errors="replace", timeout=10)
+        value = output.lower()
+        return str(executable).lower() in value and "docxtool-job-broker" in value
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def broker_healthy(current: Dict[str, object], status: Dict[str, object]) -> bool:
+    heartbeat = status.get("heartbeat_at")
+    if status.get("state") not in {"READY", "RUNNING"} or not isinstance(heartbeat, str):
+        return False
+    try:
+        heartbeat_ms = calendar.timegm(time.strptime(heartbeat[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return False
+    return time.time() - heartbeat_ms <= 3 and process_is_alive(status.get("pid")) and status.get("runtime_version") == current.get("runtime_version") and status.get("runtime_sha256") == current.get("executable_sha256")
+
+
+def stop_job_broker() -> None:
+    current = broker_current()
+    executable = Path(str(current.get("broker_executable_path", "")))
+    metadata = read_json(JOB_BROKER_PROCESS)
+    pid = metadata.get("pid")
+    if not pid or not managed_broker_process(pid, executable):
+        return
+    subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    for _ in range(20):
+        if not process_is_alive(pid):
+            break
+        time.sleep(0.1)
+    try:
+        JOB_BROKER_PROCESS.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def ensure_job_broker() -> Dict[str, object]:
+    current = broker_current()
+    executable_value = current.get("broker_executable_path")
+    if not isinstance(executable_value, str) or not executable_value:
+        raise StepFailed("启动本地任务 Broker", "runtime current.json", "LOCAL_JOB_BROKER_NOT_FOUND")
+    executable = Path(executable_value)
+    if not executable.is_file():
+        raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_NOT_FOUND")
+    expected_hash = str(current.get("broker_sha256", "")).lower()
+    if not expected_hash or hashlib.sha256(executable.read_bytes()).hexdigest().lower() != expected_hash:
+        raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_SHA256_MISMATCH")
+    status = broker_status()
+    if broker_healthy(current, status):
+        JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
+        JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"本地任务 Broker 已复用（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
+        return status
+    stale_pid = status.get("pid")
+    if stale_pid and managed_broker_process(stale_pid, executable):
+        subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    log_path = ROOT / ".runtime" / "logs" / "local-job-broker.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
+    process = subprocess.Popen([str(executable), "run"], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT, creationflags=creationflags, close_fds=True)
+    log_handle.close()
+    JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
+    JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, ensure_ascii=False, indent=2), encoding="utf-8")
+    for _ in range(50):
+        time.sleep(0.1)
+        status = broker_status()
+        if broker_healthy(current, status):
+            JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"本地任务 Broker 已就绪（PID {status.get('pid')}，版本 {status.get('broker_version', '未知')}）。", flush=True)
+            return status
+        if process.poll() is not None:
+            raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_EXITED")
+    raise StepFailed("启动本地任务 Broker", "docxtool-job-broker.exe", "LOCAL_JOB_BROKER_READY_TIMEOUT")
 
 
 def fetch_resource(relative: str) -> Dict[str, object]:
@@ -264,6 +386,7 @@ def register_addin() -> None:
 
 
 def verify() -> None:
+    ensure_job_broker()
     run_step("执行 WPS 本地直连功能检测", "npm run verify:local-direct", "WPS 功能检测已完成。", timeout=240)
 
 
@@ -404,6 +527,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.action == "logs":
             watch_wps_log()
         elif args.action == "stop":
+            stop_job_broker()
             run_step("停止本入口管理的开发资源", "pwsh -NoProfile -File scripts/local-direct.ps1 stop", "已停止。本操作不会关闭 WPS。")
         elif args.action == "reset":
             run_step("重置本地识别组件指针", "pwsh -NoProfile -File scripts/local-direct.ps1 reset", "本地识别组件指针已重置。")

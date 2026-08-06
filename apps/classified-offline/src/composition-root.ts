@@ -9,6 +9,8 @@ import type { PreviewMutationTracker } from "../../../packages/application/src/p
 
 export interface ClassifiedRuntimeConfig {
   recognitionExecutablePath: string;
+  brokerStatusPath?: string;
+  brokerJobsPath?: string;
   launchProbeExecutablePath?: string;
   runtimeVersion: string;
   runtimeSha256: string;

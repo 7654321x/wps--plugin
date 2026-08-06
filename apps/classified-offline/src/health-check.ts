@@ -115,9 +115,21 @@ export class ClassifiedHealthChecker {
           return { status: "FAIL", error_code: "LOCAL_RUNTIME_MANIFEST_INVALID", summary: "runtime 清单不可读" };
         }
       },
-      local_process_api: async () => typeof this.application.OAAssist?.ShellExecute === "function"
-        ? { status: "PASS", summary: "OAAssist.ShellExecute 可用" }
-        : { status: "FAIL", error_code: "LOCAL_PROCESS_EXECUTION_BLOCKED", summary: "WPS 未暴露本地进程调用能力" },
+      local_process_api: async () => {
+        const path = this.config.brokerStatusPath;
+        if (!path || !this.application.FileSystem) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_NOT_RUNNING", summary: "本地任务 Broker 未配置" };
+        try {
+          const fs = new WpsLocalFileSystem(this.application.FileSystem);
+          if (!fs.exists(path)) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_NOT_RUNNING", summary: "本地任务 Broker 未运行" };
+          const status = parseJson(fs.readText(path));
+          const heartbeat = typeof status?.heartbeat_at === "string" ? Date.parse(status.heartbeat_at) : NaN;
+          if (status?.state !== "READY" && status?.state !== "RUNNING") return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_NOT_RUNNING", summary: "本地任务 Broker 未就绪" };
+          if (!Number.isFinite(heartbeat) || Date.now() - heartbeat > 3_000) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_STALE", summary: "本地任务 Broker 心跳已过期" };
+          if (this.config.runtimeVersion && status.runtime_version !== this.config.runtimeVersion) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_RUNTIME_MISMATCH", summary: "本地任务 Broker 与 runtime 版本不匹配" };
+          if (this.config.runtimeSha256 && status.runtime_sha256 !== this.config.runtimeSha256) return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_RUNTIME_MISMATCH", summary: "本地任务 Broker 与 runtime 校验值不匹配" };
+          return { status: "PASS", summary: "本地任务 Broker 已就绪；文件队列；无网络端口" };
+        } catch { return { status: "FAIL", error_code: "LOCAL_JOB_BROKER_NOT_RUNNING", summary: "无法读取本地任务 Broker 状态" }; }
+      },
       required_fonts: async () => !this.profile || !fonts.length
         ? { status: "WARN", error_code: "DEFAULT_PROFILE_UNAVAILABLE", summary: "无法读取默认 Profile 字体清单" }
         : missingFonts.length ? { status: "WARN", error_code: "REQUIRED_FONT_MISSING", summary: `缺少 ${missingFonts.length} 种字体`, details_safe: { missing_font_count: missingFonts.length } }

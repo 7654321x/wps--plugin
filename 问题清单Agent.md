@@ -425,6 +425,22 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 正确方案：只读检查直接使用受管理的固定 fixture；确需生成时写入 pytest tmp_path，并只生成当前测试需要的文件。
 - 自动验证门槛：运行对应 pytest 前后，受 Git 管理的 DOCX blob 哈希不变；git status --short 不新增 tests/fixtures 二进制改动。
 
+## P050 WPS Host 直接 ShellExecute 阻塞识别启动
+
+- 症状：Worker 已完成快照，但 Host 调用 `OAAssist.ShellExecute(exe, params)` 同步阻塞，识别进程没有启动，Worker 先收到 `HOST_RPC_TIMEOUT`。
+- 根因：当前 WPS 版本没有为该 JSAPI 调用提供可用的异步完成合同；真实双参数调用会在宿主线程内等待且不产生可靠的 result/error。
+- 禁止：继续猜测 ShellExecute 参数、增加 timeout、把 WPS `Application` 传给外部进程、恢复 9528/local-agent/command-service，或回退同步全文预览。
+- 正确方案：`main.py` 管理无端口 `docxtool-job-broker.exe`；Host 只写 UUID v4 文件任务，Broker 从受校验的 `current.json` 取得 recognizer 路径与 SHA-256，原子 claim 后使用参数数组和 `shell=False` 启动 EXE。Broker 不读 DOCX 正文、不处理格式命令、不开放网络端口。
+- 自动验证门槛：Broker queued 合同拒绝额外 executable/command 字段；claim 使用原子替换；Host 单测确认不访问 ShellExecute 且快速返回；双 EXE SHA-256、安装清单、独立 Broker → recognizer → result smoke 全部通过；真实 WPS 20/200/1000 识别和正式预览未通过前，`threadedPreviewEnabled` 必须为 `false`。
+
+## P051 Local Job Broker 进程生命周期与安装锁
+
+- 症状：PyInstaller one-file Broker 会由启动器产生实际工作 PID；构建重装时旧 EXE 可能占用安装文件，若只记录 `Popen` 父 PID，`main.py stop` 不能准确停止实际 Broker。
+- 根因：Windows one-file 启动器 PID 与状态文件中的实际运行 PID 可能不同；未经归属校验的进程结束会扩大影响范围。
+- 禁止：结束所有同名 Python/EXE、用未知 PID 重启、复制覆盖被运行 Broker 锁定的 EXE、把 stale 状态直接当成可杀进程。
+- 正确方案：`main.py` 只接受 `current.json` 中的 Broker 路径与 hash；以 WMI 精确匹配 executable path 后停止，启动后以 Broker `status.json` 的实际 PID 更新受管理元数据；安装脚本同样只停止旧清单指向的精确路径。
+- 自动验证门槛：Broker `--help`、`--once`、PyInstaller 构建、安装后 hash、healthy reuse、stale restart 和未知 PID 不结束均有自动门槛；任务完成不删除用户文档或未知进程。
+
 ## P049 WPS 原生启动探针误带 Params 参数
 
 - 症状：单独验证本地 EXE 时仍复现 WPS `ShellExecute` 同步阻塞，或无法证明宿主实际尝试了最小调用。

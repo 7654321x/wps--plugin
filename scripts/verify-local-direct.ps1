@@ -21,9 +21,11 @@ try {
     "apps/classified-offline/vite.config.js",
     "packages/wps-adapter/src/local-filesystem.ts",
     "local-runtime/recognize_entry.py",
+    "local-runtime/job_broker.py",
     "local-runtime/contract.py",
     "scripts/build-local-recognition-runtime.ps1",
     "scripts/install-local-runtime.ps1",
+    "scripts/verify-local-recognizer-smoke.py",
     "scripts/remove-local-runtime.ps1",
     "scripts/local-direct.ps1"
   )
@@ -47,22 +49,34 @@ try {
 
   $distRoot = Join-Path $root "dist\local-runtime\win-x64"
   $exe = Join-Path $distRoot "docxtool-recognize.exe"
+  $brokerExe = Join-Path $distRoot "docxtool-job-broker.exe"
   $manifestPath = Join-Path $distRoot "runtime-manifest.json"
   $currentPath = Join-Path $env:APPDATA "Docxtool\runtime\current.json"
   if (-not (Test-Path -LiteralPath $exe)) { throw "LOCAL_RUNTIME_EXE_MISSING" }
+  if (-not (Test-Path -LiteralPath $brokerExe)) { throw "LOCAL_JOB_BROKER_EXE_MISSING" }
   if (-not (Test-Path -LiteralPath $manifestPath)) { throw "LOCAL_RUNTIME_MANIFEST_MISSING" }
   if (-not (Test-Path -LiteralPath $currentPath)) { throw "LOCAL_RUNTIME_CURRENT_MISSING" }
 
   $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
   $current = Get-Content -LiteralPath $currentPath -Raw | ConvertFrom-Json
   if ($manifest.schema_version -ne 1 -or $manifest.contract_version -ne 1) { throw "LOCAL_RUNTIME_MANIFEST_INVALID" }
+  if ($manifest.broker_executable -ne "docxtool-job-broker.exe" -or $manifest.broker_contract_version -ne 1) { throw "LOCAL_JOB_BROKER_MANIFEST_INVALID" }
   if ($current.schema_version -ne 1 -or $current.contract_version -ne 1) { throw "LOCAL_RUNTIME_CURRENT_INVALID" }
   $installedExe = [string]$current.executable_path
   if (-not (Test-Path -LiteralPath $installedExe)) { throw "LOCAL_RUNTIME_CURRENT_PATH_MISSING" }
   if ([string]$installedExe -notmatch [regex]::Escape($env:APPDATA)) { throw "LOCAL_RUNTIME_CURRENT_PATH_MISMATCH" }
   $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
   if ($hash -ne [string]$manifest.executable_sha256 -or $hash -ne [string]$current.executable_sha256) { throw "LOCAL_RUNTIME_SHA256_MISMATCH" }
+  $brokerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $brokerExe).Hash.ToLowerInvariant()
+  if ($brokerHash -ne [string]$manifest.broker_sha256 -or $brokerHash -ne [string]$current.broker_sha256) { throw "LOCAL_JOB_BROKER_SHA256_MISMATCH" }
+  $installedBroker = [string]$current.broker_executable_path
+  if (-not (Test-Path -LiteralPath $installedBroker)) { throw "LOCAL_JOB_BROKER_CURRENT_PATH_MISSING" }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installedBroker).Hash.ToLowerInvariant() -ne $brokerHash) { throw "LOCAL_JOB_BROKER_SHA256_MISMATCH" }
   if ([string]$manifest.recognition_package_version -ne [string]$current.recognition_package_version) { throw "LOCAL_RUNTIME_PACKAGE_VERSION_MISMATCH" }
+
+  $python = Join-Path $root ".venv\Scripts\python.exe"
+  & $python (Join-Path $root "scripts\verify-local-recognizer-smoke.py") (Join-Path $root "tests\fixtures\wps-e2e-baseline.docx")
+  if ($LASTEXITCODE) { throw "LOCAL_RECOGNIZER_SMOKE_FAILED" }
 
   & npm run build:classified
   if ($LASTEXITCODE) { throw "CLASSIFIED_BUILD_FAILED" }

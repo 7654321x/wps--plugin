@@ -1,6 +1,8 @@
 window.DocxtoolLocalRuntimeConfig = {
   runtimeVersion: "local-direct",
   runtimeManifestPath: "%APPDATA%\\Docxtool\\runtime\\current.json",
+  brokerStatusPath: "%APPDATA%\\Docxtool\\broker\\status.json",
+  brokerJobsPath: "%APPDATA%\\Docxtool\\jobs",
   launchProbeExecutablePath: "%APPDATA%\\Docxtool\\launch-probe\\docxtool-launch-probe.exe",
   threadedPreviewEnabled: false
 };

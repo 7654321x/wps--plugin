@@ -299,6 +299,8 @@ function readRuntimeManifest(application: ApplicationLike, manifestPath: string)
   if (!executablePath) return null;
   return {
     recognitionExecutablePath: expandAppDataPath(application, executablePath),
+    brokerStatusPath: expandAppDataPath(application, typeof manifest.broker_status_path === "string" ? manifest.broker_status_path : "%APPDATA%\\Docxtool\\broker\\status.json"),
+    brokerJobsPath: expandAppDataPath(application, typeof manifest.jobs_path === "string" ? manifest.jobs_path : "%APPDATA%\\Docxtool\\jobs"),
     runtimeVersion: typeof manifest.runtime_version === "string" ? manifest.runtime_version : typeof manifest.runtimeVersion === "string" ? manifest.runtimeVersion : "unknown",
     runtimeSha256: typeof manifest.executable_sha256 === "string" ? manifest.executable_sha256 : typeof manifest.sha256 === "string" ? manifest.sha256 : "",
     recognitionPackageVersion: typeof manifest.recognition_package_version === "string" ? manifest.recognition_package_version : typeof manifest.recognitionPackageVersion === "string" ? manifest.recognitionPackageVersion : undefined,
@@ -317,6 +319,8 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
     if (manifest) {
       manifest.threadedPreviewEnabled = direct.threadedPreviewEnabled === true;
       manifest.launchProbeExecutablePath = typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined;
+      manifest.brokerStatusPath = typeof direct.brokerStatusPath === "string" ? expandAppDataPath(application, direct.brokerStatusPath) : manifest.brokerStatusPath;
+      manifest.brokerJobsPath = typeof direct.brokerJobsPath === "string" ? expandAppDataPath(application, direct.brokerJobsPath) : manifest.brokerJobsPath;
       application.PluginStorage.setItem(CONFIG_KEY, JSON.stringify(manifest));
       return manifest;
     }
@@ -324,6 +328,8 @@ function runtimeConfig(application: ApplicationLike): ClassifiedRuntimeConfig {
   if (typeof direct.recognitionExecutablePath === "string" && direct.recognitionExecutablePath) {
     const value = {
       recognitionExecutablePath: expandAppDataPath(application, direct.recognitionExecutablePath),
+      brokerStatusPath: typeof direct.brokerStatusPath === "string" ? expandAppDataPath(application, direct.brokerStatusPath) : undefined,
+      brokerJobsPath: typeof direct.brokerJobsPath === "string" ? expandAppDataPath(application, direct.brokerJobsPath) : undefined,
       launchProbeExecutablePath: typeof direct.launchProbeExecutablePath === "string" ? expandAppDataPath(application, direct.launchProbeExecutablePath) : undefined,
       runtimeVersion: direct.runtimeVersion || "unknown",
       runtimeSha256: direct.runtimeSha256 || "",
@@ -398,7 +404,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     activePipelineCommand = null;
   };
   const debugProbeEnabled = ["127.0.0.1", "localhost"].includes(hostWindow.location.hostname);
-  const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
+  const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, brokerStatusPath: config.brokerStatusPath, brokerJobsPath: config.brokerJobsPath, brokerRuntimeVersion: config.runtimeVersion, brokerRuntimeSha256: config.runtimeSha256, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
   hostWindow.DocxtoolNativeLaunchProbe = async () => {
     if (!debugProbeEnabled) throw new Error("HOST_DEBUG_PROBE_DISABLED");
     const response = await hostBridge.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: id("launch-probe"), job_id: id("launch-probe-job"), build_id: build.build_id, payload: {} });

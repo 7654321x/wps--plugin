@@ -78,16 +78,19 @@ export interface HostParagraphData {
 
 export interface RecognitionJobHandle {
   recognition_job_id: string;
-  started_at: string;
+  queued_at: string;
+  request_path: string;
   result_path: string;
   error_path: string;
   cancel_path: string;
+  launch_mode: "file_queue_broker";
 }
 
 export type RecognitionJobStatus =
-  | { state: "running" }
+  | { state: "queued" | "claimed" | "launched" | "running" }
   | { state: "completed"; recognition_plan: JsonValue }
-  | { state: "failed"; error: SerializedHostError };
+  | { state: "failed"; error: SerializedHostError }
+  | { state: "cancelled" };
 
 export interface SerializableLocalDocumentSnapshot {
   snapshotContractVersion: "worker-snapshot-v1";
