@@ -50,7 +50,7 @@ function OnAction(control) {
   if (typeof window.DocxtoolRunLocalCommand !== "function") { DocxtoolPersistHostError("OnAction:" + controlId, "LOCAL_APPLICATION_RUNTIME_NOT_READY"); return true; }
   try {
     DocxtoolRibbonLog("INFO", "ribbon.command.started", "开始直接执行本地功能", { control_id: controlId, command_name: command });
-    window.DocxtoolRunLocalCommand(command, "ribbon").then(function (result) {
+    Promise.resolve(window.DocxtoolRunLocalCommand(command, "ribbon")).then(function (result) {
       DocxtoolRibbonLog(result && result.status === "PASS" ? "INFO" : "ERROR", "ribbon.command.completed", "本地功能执行完成", { control_id: controlId, command_name: command, command_id: result && result.command_id ? result.command_id : "", status: result && result.status ? result.status : "UNKNOWN", error_code: result && result.error_code ? result.error_code : "" });
     }).catch(function (error) {
       DocxtoolRibbonLog("ERROR", "ribbon.command.failed", "本地功能执行失败", { control_id: controlId, command_name: command }, error);

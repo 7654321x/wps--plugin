@@ -1233,6 +1233,38 @@ test("canonical ribbon directly runs preview locally without dispatch or queue",
   assert.deepEqual(calls, [["preview_document", "ribbon"]]);
 });
 
+test("Ribbon normalizes synchronous host results and records rejected commands", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
+  const logs = []; const storage = new Map();
+  const context = { Promise, JSON, Date, Number, String, Object, decodeURI, document: { location: { toString() { return "http://127.0.0.1:3891/main.js"; } } }, window: {
+    DocxtoolDiagnosticLog(level, component, event, message, data, error) { logs.push({ level, component, event, message, data, error }); },
+    Application: { PluginStorage: { getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) { storage.set(key, value); } } },
+    DocxtoolRunLocalCommand(name, sourceName) { if (name === "preview_document") return { status: "PASS", command_id: "sync-command", command_name: name }; return Promise.reject(new Error("RIBBON_COMMAND_REJECTED")); },
+  } };
+  vm.runInNewContext(source, context);
+  assert.equal(context.OnAction({ Id: "preview" }), true);
+  await Promise.resolve();
+  assert.equal(logs.some((item) => item.event === "ribbon.command.completed" && item.data.status === "PASS"), true);
+  assert.equal(context.OnAction({ Id: "apply" }), true);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(logs.some((item) => item.event === "ribbon.command.failed"), true);
+  assert.equal(JSON.parse(storage.get("docxtool_classified_host_result_v1")).latest_error, "LOCAL_APPLICATION_COMMAND_FAILED");
+});
+
+test("Host install lifecycle retries recoverable failures and stops only after ready or fatal", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
+  assert.match(source, /type InstallState = "waiting" \| "installing" \| "ready" \| "retryable_failed" \| "fatal"/);
+  assert.match(source, /installState = fatal \? "fatal" : "retryable_failed"/);
+  assert.match(source, /继续重试/);
+  assert.match(source, /if \(installState === "ready" \|\| installState === "fatal" \|\| installState === "installing"\) return/);
+  assert.equal(source.includes("installDone"), false);
+  const failureBlock = source.slice(source.indexOf("function recordInstallFailure"), source.indexOf("function tryInstall"));
+  assert.match(failureBlock, /if \(fatal\) stopInstallRetry\(\)/);
+  assert.equal(failureBlock.includes("installTimer = hostWindow.setInterval"), false);
+  assert.match(source, /function scheduleInstallRetry\(\)/);
+  assert.match(source, /if \(installTimer !== undefined \|\| installState === "ready" \|\| installState === "fatal"\) return/);
+});
+
 test("production preview starts only the Worker while legacy preview remains unreachable", async () => {
   const host = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
   const client = await readFile(new URL("../apps/classified-offline/src/pipeline-worker-client.ts", import.meta.url), "utf8");
@@ -1323,6 +1355,7 @@ test("local recognition runtime build collects the installed docxtool resources"
 test("canonical entry loads the runtime config, probe, ribbon and classic host emitted by the build", async () => {
   const config = await readFile(new URL("../apps/classified-offline/vite.config.js", import.meta.url), "utf8");
   const main = await readFile(new URL("../apps/classified-offline/main.js", import.meta.url), "utf8");
+  const ribbon = await readFile(new URL("../apps/classified-offline/dist/js/ribbon.js", import.meta.url), "utf8");
   const host = await readFile(new URL("../apps/classified-offline/dist/host-runtime.js", import.meta.url), "utf8");
   assert.match(main, /versioned\("js\/ribbon\.js"\)/);
   assert.match(main, /versioned\("ui\/local-runtime-config\.js"\)/);
@@ -1333,6 +1366,9 @@ test("canonical entry loads the runtime config, probe, ribbon and classic host e
   assert.equal(/^\s*import\s/m.test(host), false);
   assert.equal(/import\s*\(/.test(host), false);
   assert.match(host, /host\.module\.loaded/);
+  assert.match(ribbon, /DocxtoolRunLocalCommand/);
+  assert.equal(ribbon.includes("DocxtoolHostEnqueue"), false);
+  assert.match(host, /DocxtoolRunLocalCommand/);
 });
 
 test("classified Ribbon preserves a safe error when the host queue is stale", async () => {

@@ -469,14 +469,32 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   }, 500);
   void runAutomaticHostAcceptance(application, runtime, build);
 }
-let installDone = false;
+type InstallState = "waiting" | "installing" | "ready" | "retryable_failed" | "fatal";
+const FATAL_INSTALL_ERROR_CODES = new Set(["LOCAL_RUNTIME_CONFIGURATION_REQUIRED", "PRODUCTION_COMPOSITION_CONFIG_MISMATCH"]);
 let installAttempt = 0;
 let hostModuleReported = false;
 let installTimer: number | undefined;
+let installState: InstallState = "waiting";
 let lastConfigError = "";
 let lastConfigErrorAt = 0;
+function isFatalInstallError(errorCode: string): boolean { return FATAL_INSTALL_ERROR_CODES.has(errorCode); }
+function stopInstallRetry(): void {
+  if (installTimer === undefined) return;
+  hostWindow.clearInterval(installTimer);
+  installTimer = undefined;
+}
+function recordInstallFailure(application: ApplicationLike | undefined, build: BuildInfo | undefined, context: Record<string, unknown>, code: string, error: unknown): void {
+  const fatal = isFatalInstallError(code);
+  installState = fatal ? "fatal" : "retryable_failed";
+  if (fatal) stopInstallRetry();
+  hostLog("ERROR", fatal ? "application.install.fatal" : "application.install.failed", fatal ? "本地应用运行时存在不可恢复配置错误" : "本地应用运行时安装失败，将继续重试", { ...context, stable_error_code: code, install_state: installState, retry_scheduled: !fatal }, error);
+  void reportHostAcceptance("host_install", "FAIL", code);
+  if (!application || !build) return;
+  try { new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" }); }
+  catch (storeError) { hostLog("ERROR", "application.install.state.failed", "本地运行时失败状态无法写入 PluginStorage", { stable_error_code: code }, storeError); }
+}
 function tryInstall(): void {
-  if (installDone) return;
+  if (installState === "ready" || installState === "fatal" || installState === "installing") return;
   installAttempt += 1;
   const application = hostWindow.Application; const build = hostWindow.DocxtoolBuildInfo;
   let config: ClassifiedRuntimeConfig | null = null;
@@ -490,34 +508,39 @@ function tryInstall(): void {
         lastConfigError = code;
         lastConfigErrorAt = nowMs;
       }
+      if (isFatalInstallError(code)) {
+        recordInstallFailure(application, build, { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: false }, code, error);
+        return;
+      }
     }
   }
-  const readiness = { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: Boolean(config), plugin_storage_available: Boolean(application?.PluginStorage), active_document_available: Boolean(application?.ActiveDocument), local_runtime_before_install: typeof hostWindow.DocxtoolRunLocalCommand === "function" };
+  const readiness = { attempt: installAttempt, application_available: Boolean(application), build_info_available: Boolean(build), runtime_config_available: Boolean(config), plugin_storage_available: Boolean(application?.PluginStorage), active_document_available: Boolean(application?.ActiveDocument), local_runtime_before_install: typeof hostWindow.DocxtoolRunLocalCommand === "function", install_state: installState };
   if (installAttempt === 1 || installAttempt % 20 === 0) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "application.install.attempt", "检查本地应用运行时安装条件", readiness);
   if (!hostModuleReported) { hostModuleReported = true; void reportHostAcceptance("host_module_loaded", "PASS"); }
   if (!application || !build || !config) {
-    if ([1, 20, 40, 60].includes(installAttempt)) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "application.install.waiting", "等待 WPS Application、构建信息和本地运行时配置", readiness);
+    installState = "waiting";
+    if ([1, 20, 40, 60].includes(installAttempt)) hostLog(installAttempt === 1 ? "INFO" : "DEBUG", "application.install.waiting", "等待 WPS Application、构建信息和本地运行时配置", { ...readiness, install_state: installState });
     return;
   }
+  installState = "installing";
+  const installingReadiness = { ...readiness, install_state: installState };
   const started = Date.now();
   try {
-    hostLog("INFO", "application.install.start", "开始安装本地应用运行时", readiness);
+    hostLog("INFO", "application.install.start", "开始安装本地应用运行时", installingReadiness);
     diagnosticLogPath = config.diagnosticLogPath ?? "";
     const hostContextId = randomId();
     install(application, build, config, hostContextId);
-    installDone = true;
-    if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
-    hostLog("INFO", "application.install.success", "本地应用运行时安装成功", { ...readiness, host_context_id: hostContextId, duration_ms: Date.now() - started });
+    installState = "ready";
+    stopInstallRetry();
+    hostLog("INFO", "application.install.success", "本地应用运行时安装成功", { ...installingReadiness, install_state: installState, host_context_id: hostContextId, duration_ms: Date.now() - started });
   } catch (error) {
-    const code = stableError(error);
-    installDone = true;
-    if (installTimer !== undefined) hostWindow.clearInterval(installTimer);
-    hostLog("ERROR", "application.install.failed", "本地应用运行时安装失败", { ...readiness, stable_error_code: code, duration_ms: Date.now() - started }, error);
-    void reportHostAcceptance("host_install", "FAIL", code);
-    try { new HostResultStore(application.PluginStorage, build).update({ latest_error: code, active_view: "issues" }); }
-    catch (storeError) { hostLog("ERROR", "application.install.state.failed", "本地运行时失败状态无法写入 PluginStorage", { stable_error_code: code }, storeError); }
+    recordInstallFailure(application, build, { ...installingReadiness, duration_ms: Date.now() - started }, stableError(error), error);
   }
 }
+function scheduleInstallRetry(): void {
+  if (installTimer !== undefined || installState === "ready" || installState === "fatal") return;
+  installTimer = hostWindow.setInterval(tryInstall, 250);
+  (installTimer as unknown as { unref?: () => void }).unref?.();
+}
 tryInstall();
-installTimer = hostWindow.setInterval(tryInstall, 250);
-(installTimer as unknown as { unref?: () => void }).unref?.();
+scheduleInstallRetry();
