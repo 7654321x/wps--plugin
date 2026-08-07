@@ -11,6 +11,13 @@ async function sha256(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
 }
 function normalize(value: unknown): string { return stripWpsImplicitParagraphTerminator(value); }
+class HostRangeTextMismatchError extends Error {
+  readonly technical_detail: string;
+  constructor(values: { paragraphIndex: number; requestedStart: number; requestedEnd: number; actualStart: number; actualEnd: number; expectedHash: string; actualHash: string; expectedLength: number; actualLength: number }) {
+    super("HOST_RANGE_TEXT_MISMATCH");
+    this.technical_detail = `paragraph_index=${values.paragraphIndex}; requested_start=${values.requestedStart}; requested_end=${values.requestedEnd}; actual_start=${values.actualStart}; actual_end=${values.actualEnd}; expected_sha256=${values.expectedHash.slice(0, 12)}; actual_sha256=${values.actualHash.slice(0, 12)}; expected_length_utf16=${values.expectedLength}; actual_length_utf16=${values.actualLength}`;
+  }
+}
 function commentContent(comment: WpsObject): string { return [comment.Content?.Text, comment.Content, comment.Text, comment.Range?.Text].filter((value) => typeof value === "string").join("\n"); }
 function fingerprint(comments: WpsObject, excluded = new Set<WpsObject>()): string {
   const values: string[] = [];
@@ -36,9 +43,11 @@ export class WpsPreviewBatchService {
       if (await sha256(hostRaw) !== target.host_raw_text_sha256) throw new Error("PARAGRAPH_CHANGED");
       const fragment = rawSliceUtf16(hostRaw, target.host_raw_start_utf16, target.host_raw_end_utf16);
       if (fragment === null || await sha256(fragment) !== target.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
-      const start = item.host_range_start + target.host_raw_start_utf16; const end = item.host_range_start + target.host_raw_end_utf16;
-      const bodyRange = document.Range(start, end) as WpsObject;
-      if (await sha256(normalize(bodyRange.Text)) !== target.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
+      if (typeof paragraphRange.SetRange !== "function") throw new Error("HOST_RANGE_SET_RANGE_UNSUPPORTED");
+      const paragraphStart = Number(paragraphRange.Start); const start = paragraphStart + target.host_raw_start_utf16; const end = paragraphStart + target.host_raw_end_utf16;
+      paragraphRange.SetRange(start, end);
+      const bodyRange = paragraphRange; const bodyText = normalize(bodyRange.Text); const bodyHash = await sha256(bodyText);
+      if (bodyHash !== target.text_sha256) throw new HostRangeTextMismatchError({ paragraphIndex: target.host_paragraph_index, requestedStart: start, requestedEnd: end, actualStart: Number(bodyRange.Start), actualEnd: Number(bodyRange.End), expectedHash: target.text_sha256, actualHash: bodyHash, expectedLength: fragment.length, actualLength: bodyText.length });
       const countBefore = Number(comments.Count ?? 0); const returned = comments.Add(bodyRange, item.comment_text) as WpsObject | undefined;
       let comment = returned && typeof returned === "object" ? returned : undefined;
       for (let attempt = 0; !comment && attempt < 10; attempt += 1) { const countAfter = Number(comments.Count ?? 0); if (countAfter > countBefore) comment = comments.Item(countAfter) as WpsObject; else await new Promise((resolve) => setTimeout(resolve, 10)); }

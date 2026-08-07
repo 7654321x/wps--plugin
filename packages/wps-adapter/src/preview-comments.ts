@@ -55,18 +55,13 @@ export function createPreviewCommentText(item: { recognized_type: string; confid
 export function shouldAddPreview(item: { recognized_type: string; needs_review: boolean }, mode: PreviewDisplayMode): boolean { return mode === "all" || (mode === "review_only" ? item.needs_review || item.recognized_type === "unknown" : SPECIAL.has(item.recognized_type)); }
 export interface PreviewPlanItem {
   item_id: string; source_paragraph_index: number; target: RecognitionResult["paragraphs"][number];
-  host_range_start: number;
   recognized_type: string; needs_review: boolean; comment_text: string; comment_author: string; comment_initial: string;
 }
 export function createPreviewPlan(snapshot: LocalDocumentSnapshot, recognition: RecognitionResult, commands: FormattingCommandSet, mode: PreviewDisplayMode = "all"): PreviewPlanItem[] {
   const commandsByTarget = new Map<string, FormattingCommandSet["commands"]>();
   for (const command of commands.commands) { const values = commandsByTarget.get(command.target.target_id) ?? []; values.push(command); commandsByTarget.set(command.target.target_id, values); }
   const sources = new Map(snapshot.paragraphs.map((item) => [item.sourceParagraphIndex, item]));
-  return recognition.paragraphs.filter((item) => shouldAddPreview(item, mode) && Boolean(sources.get(item.host_paragraph_index)?.text)).map((item, index) => {
-    const source = sources.get(item.host_paragraph_index)!;
-    if (!Number.isInteger(source.rangeStart) || !Number.isInteger(source.rangeEnd) || source.rangeEnd! <= source.rangeStart!) throw new Error("HOST_RANGE_COORDINATES_REQUIRED");
-    return { item_id: `preview-${String(index + 1).padStart(6, "0")}`, source_paragraph_index: item.source_paragraph_index, target: item, host_range_start: source.rangeStart!, recognized_type: item.recognized_type, needs_review: item.needs_review, comment_text: createPreviewCommentText(item, commandsByTarget.get(item.target_id) ?? []), comment_author: previewAuthor(item.recognized_type), comment_initial: previewInitial(item.recognized_type) };
-  });
+  return recognition.paragraphs.filter((item) => shouldAddPreview(item, mode) && Boolean(sources.get(item.host_paragraph_index)?.text)).map((item, index) => ({ item_id: `preview-${String(index + 1).padStart(6, "0")}`, source_paragraph_index: item.source_paragraph_index, target: item, recognized_type: item.recognized_type, needs_review: item.needs_review, comment_text: createPreviewCommentText(item, commandsByTarget.get(item.target_id) ?? []), comment_author: previewAuthor(item.recognized_type), comment_initial: previewInitial(item.recognized_type) }));
 }
 function textHash(snapshot: LocalDocumentSnapshot): string { return snapshot.sourceSha256; }
 function commentReference(comment: WpsObject): string {

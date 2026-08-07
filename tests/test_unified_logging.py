@@ -66,6 +66,17 @@ def test_catalog_covers_required_runtime_failures() -> None:
         assert f"错误码：{code}" in line
 
 
+def test_host_range_mismatch_keeps_precise_non_sensitive_detail() -> None:
+    event = error_event("HOST_RANGE_TEXT_MISMATCH")
+    event["data"]["technical_detail"] = "paragraph_index=0; requested_start=10; requested_end=15; expected_sha256=0123456789ab; actual_sha256=abcdef012345"
+
+    line = format_event(event)
+
+    assert "阶段：创建 WPS 预览批注目标" in line
+    assert "技术详情：paragraph_index=0; requested_start=10; requested_end=15" in line
+    assert "错误码：HOST_RANGE_TEXT_MISMATCH" in line
+
+
 def test_repeated_error_is_written_once_until_state_changes(tmp_path: Path) -> None:
     path = tmp_path / "wps-plugin.log"
     writer = UnifiedLogWriter(path)

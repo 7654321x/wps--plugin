@@ -262,6 +262,16 @@ ERROR_CATALOG: Dict[str, Dict[str, str]] = {
         "reason_cn": "WPS 宿主命令返回失败",
         "action_cn": "查看同一请求的后续错误码并按处理建议操作",
     },
+    "HOST_RANGE_TEXT_MISMATCH": {
+        "stage_cn": "创建 WPS 预览批注目标",
+        "reason_cn": "WPS 子 Range 读回文字与已经验证的识别锚点不一致",
+        "action_cn": "保留本条日志的坐标和摘要技术详情后停止当前预览",
+    },
+    "HOST_RANGE_SET_RANGE_UNSUPPORTED": {
+        "stage_cn": "创建 WPS 预览批注目标",
+        "reason_cn": "当前 WPS Range 对象没有提供官方 SetRange 方法",
+        "action_cn": "核对当前 WPS 版本与 wps-jsapi 1.0.5 的实际兼容性",
+    },
     "WPS_INDEX_RESPONSE_MISMATCH": {
         "stage_cn": "校验 WPS 主资源",
         "reason_cn": "资源服务返回的 index.html 内容与当前构建不一致",

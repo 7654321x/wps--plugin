@@ -31,10 +31,11 @@ async function sha256(value: string): Promise<string> {
 }
 function code(error: unknown): string { const value = error instanceof Error ? error.message : "HOST_RPC_FAILED"; return /^[A-Z][A-Z0-9_]{1,100}$/.test(value) ? value : "HOST_RPC_FAILED"; }
 function serialized(error: unknown): { code: string; message: string; stack?: string } { return { code: code(error), message: error instanceof Error ? error.message : "HOST_RPC_FAILED", ...(error instanceof Error && error.stack ? { stack: error.stack } : {}) }; }
+function technicalDetail(error: unknown): string { const value = error && typeof error === "object" ? (error as { technical_detail?: unknown }).technical_detail : undefined; return typeof value === "string" ? value : ""; }
 function snapshot(value: unknown): SerializableLocalDocumentSnapshot {
   const item = value as Partial<SerializableLocalDocumentSnapshot> | null;
   if (!item || item.snapshotContractVersion !== "worker-snapshot-v1" || typeof item.documentId !== "string" || typeof item.revision !== "string" || typeof item.textRevision !== "string" || typeof item.sourceSha256 !== "string" || typeof item.localDocxPath !== "string" || !Array.isArray(item.paragraphs)) throw new Error("INVALID_WORKER_SNAPSHOT");
-  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean" || !Number.isInteger(paragraph.rangeStart) || !Number.isInteger(paragraph.rangeEnd) || paragraph.rangeEnd <= paragraph.rangeStart) throw new Error("INVALID_WORKER_SNAPSHOT");
+  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean") throw new Error("INVALID_WORKER_SNAPSHOT");
   return item as SerializableLocalDocumentSnapshot;
 }
 
@@ -64,7 +65,8 @@ export class WpsHostBridge {
       return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: duration, value };
     } catch (error) {
       const duration = performance.now() - started;
-      this.diagnostics?.writeForComponent("wps-host-bridge", "ERROR", "host.rpc.failed", "WPS Host RPC 执行失败", { operation: request.operation, duration_ms: duration, stable_error_code: code(error) }, error);
+      const detail = technicalDetail(error);
+      this.diagnostics?.writeForComponent("wps-host-bridge", "ERROR", "host.rpc.failed", "WPS Host RPC 执行失败", { operation: request.operation, duration_ms: duration, stable_error_code: code(error), ...(detail ? { technical_detail: detail } : {}) }, error);
       return { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: false, duration_ms: duration, error: serialized(error) };
     }
   }
