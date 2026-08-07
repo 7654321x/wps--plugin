@@ -388,3 +388,38 @@ def test_start_rebuilds_runtime_when_build_manifest_differs(tmp_path: Path, monk
     main.prepare(rebuild_runtime=False)
 
     assert commands[:2] == ["npm run build:local-runtime", "npm run install:local-runtime"]
+
+
+def test_status_is_emitted_as_one_grouped_multiline_event(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(main, "run_command", lambda *_args, **_kwargs: "\n".join((
+        "repository_head: abc1234",
+        "plugin_build: READY",
+        "plugin_registration: READY",
+        "local_runtime: READY",
+        "runtime_executable_exists: YES",
+        "local_agent: NOT_USED",
+        "command_service: NOT_USED",
+        "port_9528: CLOSED",
+    )))
+    monkeypatch.setattr(main, "is_port_open", lambda _port: False)
+    monkeypatch.setattr(main, "diagnostic_events", lambda: [{"event": "host.module.loaded"}])
+    monkeypatch.setattr(main, "broker_current", current_manifest)
+    monkeypatch.setattr(main, "read_json", lambda path: {"version": "1.5.7"} if path.name == "package.json" else {})
+    status = broker_status()
+    monkeypatch.setattr(main, "read_broker_status", lambda _path: (status, None))
+    monkeypatch.setattr(main, "broker_readiness", lambda *_args: main.broker_ready())
+    monkeypatch.setattr(main, "control_server_health", lambda: {"status": "ready", "port": 57729})
+    monkeypatch.setattr(main, "wps_is_running", lambda: False)
+    events: list[tuple[str, str, str, dict[str, object]]] = []
+    monkeypatch.setattr(main, "log_event", lambda level, event, message, data=None, *_args, **_kwargs: events.append((level, event, message, data or {})))
+
+    main.print_status(startup=True, watch_logs=True)
+
+    assert capsys.readouterr().out == ""
+    assert len(events) == 1
+    assert events[0][:3] == ("INFO", "launcher.status.summary", "WPS 启动状态汇总")
+    lines = events[0][3]["summary_lines"]
+    assert isinstance(lines, list) and len(lines) == 8
+    assert any("产品 v1.5.7；提交 abc1234" in line for line in lines)
+    assert any("本地识别：组件已安装" in line for line in lines)
+    assert any("统一日志：wps-plugin.log" in line for line in lines)

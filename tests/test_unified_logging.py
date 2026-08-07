@@ -27,6 +27,29 @@ def test_format_event_is_chinese_and_has_no_json_object() -> None:
     assert parse_log_line(line)["stable_error_code"] == "LOCAL_RUNTIME_CONFIGURATION_REQUIRED"
 
 
+def test_format_event_supports_one_redacted_multiline_summary() -> None:
+    rendered = format_event({
+        "timestamp": "2026-08-07T05:30:00Z",
+        "level": "INFO",
+        "component": "main",
+        "event": "launcher.status.summary",
+        "message": "WPS 当前状态汇总",
+        "data": {
+            "summary_lines": [
+                "本地识别：Broker 已就绪",
+                r"统一日志：D:\private\wps-plugin.log Authorization=secret-token",
+            ],
+        },
+    })
+
+    lines = rendered.splitlines()
+    assert len(lines) == 3
+    assert parse_log_line(lines[0])["event"] == "launcher.status.summary"
+    assert lines[1] == "  - 本地识别：Broker 已就绪"
+    assert "[本机路径]" in lines[2]
+    assert "secret-token" not in lines[2]
+
+
 def test_catalog_covers_required_runtime_failures() -> None:
     codes = (
         "LOCAL_RUNTIME_CONFIGURATION_REQUIRED",

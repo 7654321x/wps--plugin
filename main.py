@@ -167,42 +167,38 @@ def parse_status(output: str) -> Dict[str, str]:
     return values
 
 
-def print_status() -> None:
+def print_status(*, startup: bool = False, watch_logs: bool = False) -> None:
     output = run_command("pwsh -NoProfile -File scripts/local-direct.ps1 status", timeout=60)
     values = parse_status(output)
-    print("当前状态：")
-    print(f"- 项目版本：{values.get('repository_head', '未知')}")
-    print(f"- WPS 插件构建：{'已生成' if values.get('plugin_build') == 'READY' else '未生成'}")
     server_ready = is_port_open(WPSJS_PORT) and probe_debug_server().get("status") == "PASS"
     event_names = [str(item.get("event", "")) for item in diagnostic_events()]
-    print(f"- 调试资源服务：{'已验证' if server_ready else '未就绪'}")
-    print(f"- WPS 注册配置：{'已登记' if values.get('plugin_registration') else '未确认'}")
-    print(f"- WPS 插件页面：{'已加载' if plugin_page_loaded(event_names) else '等待 WPS 重新加载'}")
-    print(f"- 本地识别组件：{'已安装' if values.get('local_runtime') == 'READY' else '未安装'}")
-    print(f"- 识别程序文件：{'存在' if values.get('runtime_executable_exists') == 'YES' else '不存在'}")
+    page_loaded = plugin_page_loaded(event_names)
     current = broker_current()
     status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
     broker_check = status_error or broker_readiness(current, status)
-    print(f"- 本地任务 Broker：{'已就绪' if broker_check.ready else '未就绪'}")
-    print(f"- Broker PID：{status.get('pid', '未知')}")
-    print(f"- Broker 版本：{status.get('broker_version', '未知')}")
+    control = control_server_health()
+    product_version = read_json(ROOT / "package.json").get("version", "未知")
+    lines = [
+        f"版本与插件：产品 v{product_version}；提交 {values.get('repository_head', '未知')}；构建{'已生成' if values.get('plugin_build') == 'READY' else '未生成'}；页面{'已加载' if page_loaded else '等待 WPS 重新加载'}",
+        f"资源与注册：资源服务{'已验证' if server_ready else '未就绪'}；WPS 注册{'已登记' if values.get('plugin_registration') else '未确认'}",
+        f"本地识别：组件{'已安装' if values.get('local_runtime') == 'READY' else '未安装'}；识别程序{'存在' if values.get('runtime_executable_exists') == 'YES' else '不存在'}；Broker {'已就绪' if broker_check.ready else '未就绪'}（PID {status.get('pid', '未知')}，版本 {status.get('broker_version', '未知')}）",
+        f"控制服务：{'已就绪' if control.get('status') == 'ready' else '未就绪'}（127.0.0.1:{control.get('port', '未知')}）；Broker 使用文件队列，识别执行不开放网络端口",
+        f"旧链路：local-agent {'未使用' if values.get('local_agent') == 'NOT_USED' else '异常运行中'}；command-service {'未使用' if values.get('command_service') == 'NOT_USED' else '异常运行中'}；9528 端口{'已关闭' if values.get('port_9528') == 'CLOSED' else '仍在监听'}",
+        "执行方式：识别由本地进程执行；排版命令由插件内部生成",
+    ]
     if not broker_check.ready:
-        print("- Broker 失败阶段：校验本地任务代理")
-        print(f"- Broker 具体原因：{broker_check.reason_cn}")
-        print(f"- Broker 错误码：{broker_check.error_code}")
-        print(f"- Broker 建议处理：{broker_check.action_cn}")
+        lines.append(f"Broker 失败：{broker_check.reason_cn}；错误码 {broker_check.error_code}；建议 {broker_check.action_cn}")
         detail = readiness_technical_detail(broker_check)
         if detail:
-            print(f"- Broker 诊断详情：{detail}")
-    control = control_server_health()
-    print(f"- WPS Control Server：{'已就绪' if control.get('status') == 'ready' else '未就绪'}")
-    print(f"- Control Server 端口：{control.get('port', '未知')}（仅 127.0.0.1 随机端口）")
-    print("- Broker 通信：文件队列；识别执行不开放网络端口")
-    print(f"- 旧 local-agent：{'未使用' if values.get('local_agent') == 'NOT_USED' else '异常运行中'}")
-    print(f"- 旧 command-service：{'未使用' if values.get('command_service') == 'NOT_USED' else '异常运行中'}")
-    print(f"- 旧 9528 端口：{'已关闭' if values.get('port_9528') == 'CLOSED' else '仍在监听'}")
-    print("- 识别方式：本地进程")
-    print("- 排版命令：插件内部生成")
+            lines.append(f"Broker 诊断：{detail}")
+    if startup:
+        if wps_is_running() and not page_loaded:
+            lines.append("下一步：当前 WPS 尚未重新加载本次构建；保存并关闭当前文档，完全退出 WPS 后重新打开，不要继续点击旧功能区")
+        else:
+            lines.append("下一步：打开 WPS 后使用顶部功能区")
+    if watch_logs:
+        lines.append("统一日志：wps-plugin.log；正在等待 WPS 操作，按 Ctrl+C 停止监视")
+    log_event("INFO", "launcher.status.summary", "WPS 启动状态汇总" if startup else "WPS 当前状态汇总", {"result_cn": "成功", "summary_lines": lines})
 
 
 def prepare(*, rebuild_runtime: bool = True) -> None:
@@ -1169,9 +1165,9 @@ def wps_is_running() -> bool:
         return False
 
 
-def watch_wps_log() -> None:
-    print(f"WPS 统一日志：{WPS_LOG}", flush=True)
-    print("正在等待 WPS 操作日志；按 Ctrl+C 停止监视。", flush=True)
+def watch_wps_log(*, announce: bool = True) -> None:
+    if announce:
+        log_event("INFO", "logs.watch.started", "开始监视 WPS 统一日志", {"summary_lines": ["日志文件：wps-plugin.log", "等待 WPS 操作；按 Ctrl+C 停止监视"]})
     positions = {path: path.stat().st_size if path.exists() else 0 for path in (WPS_LOG,)}
     last_fingerprint = ""
     suppressed_repeats = 0
@@ -1228,13 +1224,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             run_step("同步最终 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "最终 WPS 调试包已同步。", timeout=60)
             ensure_control_server()
             register_addin(force_restart=True)
-            print_status()
-            if wps_is_running() and not plugin_page_loaded([str(item.get("event", "")) for item in diagnostic_events()]):
-                print("启动完成，但当前 WPS 尚未重新加载本次构建。请先正常保存并关闭脱敏测试文档，再完全退出 WPS 后重新打开；不要重复点击旧功能区。", flush=True)
-            else:
-                print("启动完成。请打开 WPS 后使用顶部功能区。", flush=True)
+            print_status(startup=True, watch_logs=not args.once)
             if not args.once:
-                watch_wps_log()
+                watch_wps_log(announce=False)
         elif args.action == "prepare":
             prepare(rebuild_runtime=True)
             print("准备完成。", flush=True)

@@ -505,7 +505,16 @@ def format_event(raw: Dict[str, Any]) -> str:
     if event.technical_detail and len(fields) < 7:
         fields.append(f"技术详情：{event.technical_detail}")
     line = f"{event.timestamp} [{LEVEL_LABELS[event.level]}] [{event.component}] {message}"
-    return line + ("｜" + "｜".join(fields) if fields else "")
+    if fields:
+        line += "｜" + "｜".join(fields)
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    summary_lines = data.get("summary_lines")
+    if summary_lines is None:
+        return line
+    if not isinstance(summary_lines, list) or not all(isinstance(item, str) and item.strip() for item in summary_lines):
+        raise TypeError("统一日志多行摘要必须是非空字符串数组")
+    rendered = [redact_text(item.strip(), 320) for item in summary_lines]
+    return line + "\n" + "\n".join(f"  - {item}" for item in rendered)
 
 
 def parse_log_line(line: str) -> Optional[Dict[str, str]]:
