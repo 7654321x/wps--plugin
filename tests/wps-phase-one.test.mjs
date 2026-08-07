@@ -205,6 +205,7 @@ test("snapshot worker creates text-equivalent snapshots for 0, 20, 200 and 1000 
     assert.equal(result.revision, `${expectedSource}:${count}`);
     assert.equal(result.textRevision, result.revision);
     assert.equal(result.paragraphOrderHash, expectedOrder);
+    assert.deepEqual(result.paragraphs.map((item) => [item.rangeStart, item.rangeEnd]), values.map((item) => [item.range_start, item.range_end]));
     assert.equal(result.paragraphs.length, count);
     assert.equal("formattingRevision" in result, false);
     if (count > 4) assert.equal(result.paragraphs[4].isInTable, true);
@@ -660,7 +661,7 @@ test("WpsHostBridge queues recognition and leaves polling to the Worker", async 
     const bridge = new WpsHostBridge(application, { writeForComponent(...values) { diagnostics.push(values); } }, { recognitionExecutablePath: runtimeExecutablePath, recognitionContractVersion: 1, brokerStatusPath: broker.statusPath, brokerJobsPath: broker.jobsPath, brokerRuntimeVersion: "docxtool-test", brokerRuntimeSha256: "runtime-sha" });
     const base = { type: "host.rpc.request", job_id: "recognize-1", build_id: "build-1", payload: {} };
     const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-1", operation: "host.capture_document_descriptor" });
-    const workerSnapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev-1", textRevision: "rev-1", sourceSha256: SHA, localDocxPath: sourcePath, paragraphs: [{ sourceParagraphIndex: 0, text: "脱敏段落", isInTable: false }], paragraphOrderHash: SHA, sectionCount: 1, documentFullNameHash: descriptor.value.local_docx_path_hash };
+    const workerSnapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev-1", textRevision: "rev-1", sourceSha256: SHA, localDocxPath: sourcePath, paragraphs: [{ sourceParagraphIndex: 0, text: "脱敏段落", isInTable: false, rangeStart: 0, rangeEnd: 5 }], paragraphOrderHash: SHA, sectionCount: 1, documentFullNameHash: descriptor.value.local_docx_path_hash };
     const launched = await bridge.handle({ ...base, rpc_id: "launch-1", operation: "host.launch_recognition", document_token: descriptor.value.document_token, payload: { source_path: sourcePath, snapshot: workerSnapshot, contract_version: 1 } });
     assert.equal(launched.ok, true); assert.equal(reads.filter((value) => value.endsWith("request.json")).length, 0);
     const queuedRequest = JSON.parse(readFileSync(launched.value.request_path, "utf8"));
@@ -948,9 +949,13 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   const application = { ActiveDocument: { FullName: "C:\\preview.docx", Saved: true, Sections: { Count: 1 }, Comments: commentCollection, Paragraphs: { Count: 1, Item() { return { Range: paragraphRange }; } }, Range(start, end) { return { Start: start, End: end, Text: text.slice(start - 10, end - 10) }; } } };
   const bridge = new WpsHostBridge(application); const base = { type: "host.rpc.request", job_id: "preview-job-1", build_id: "build-1", payload: {} };
   const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-preview", operation: "host.capture_document_descriptor" });
+  const paragraphBatch = await bridge.handle({ ...base, rpc_id: "paragraphs-preview", operation: "host.read_paragraph_batch", document_token: descriptor.value.document_token, payload: { start_index: 0, batch_size: 1 } });
+  const workerSnapshot = await createEquivalentSnapshot(descriptor.value, paragraphBatch.value);
+  paragraphRange.Start = 99;
   const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "4", document_id: "doc-1", document_revision: "rev", source_sha256: hash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [{ target_id: "doc-1:p:0", source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: "main_title", section_kind: "body", text_sha256: hash, physical_text_sha256: hash, range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields(text) }] };
   const target = { ...commandTarget(hash, text.length), target_id: "doc-1:p:0" }; const commands = commandSet([{ command_id: "cmd-000001", kind: "paragraph.set_font", target, arguments: { east_asia_font_name: "方正小标宋简体", latin_font_name: "Times New Roman", font_size_pt: 22, bold: false }, required_capability: "paragraph.font", on_unsupported: "fail" }]);
-  const plan = createPreviewPlan({ documentId: "doc-1", revision: "rev", sourceSha256: hash, paragraphs: [{ sourceParagraphIndex: 0, text }] }, recognition, commands, "all");
+  const plan = createPreviewPlan(workerSnapshot, recognition, commands, "all");
+  assert.equal(plan[0].host_range_start, 10);
   assert.equal(plan.length, 1); assert.match(plan[0].comment_text, /识别结果：主标题/);
   const applied = await bridge.handle({ ...base, rpc_id: "preview-apply", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-1", items: plan } });
   assert.equal(applied.ok, true); assert.equal(applied.value.applied_count, 1); assert.equal(comments.filter((item) => !item.deleted).length, 2);
@@ -958,6 +963,8 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   assert.equal(oversized.ok, false); assert.equal(oversized.error.code, "HOST_PREVIEW_BATCH_INVALID");
   const cleared = await bridge.handle({ ...base, rpc_id: "preview-clear", operation: "host.clear_preview_batch", document_token: descriptor.value.document_token, payload: { batch_size: 5 } });
   assert.equal(cleared.ok, true); assert.equal(cleared.value.remaining, 0); assert.equal(cleared.value.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
+  const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-2", items: [{ ...plan[0], host_range_start: 99 }] } });
+  assert.equal(mismatched.ok, false); assert.equal(mismatched.error.code, "HOST_RANGE_TEXT_MISMATCH");
 });
 
 test("preview comments anchor each mixed role to its verified UTF-16 sub-range", async () => {

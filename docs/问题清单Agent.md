@@ -576,3 +576,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：只凭首页 200 或单个脚本事件写加载成功；缺少阶段时输出假成功；重复写入 `wps.load.completed`。
 - 正确方案：当前构建同时具备首页 served、Bootstrap、Ribbon、Host Runtime、应用运行时安装、Ribbon 加载和 Worker 探针完成事件时，只追加一次 `wps.load.completed`；阶段日志继续保留用于诊断。
 - 自动验证门槛：缺任一必需事件不写完成事件；全部事件只写一次，事件带当前 build_id；真实 WPS 重载后日志出现 `wps.load.completed`，此前仍只能显示等待。
+
+## P068 Worker 预览丢失 WPS 段落绝对 Range 起点
+
+- 症状：Broker 已完成识别且段落全文、Host UTF-16 子片段哈希均正确，但 Worker 写预览批注时返回 `HOST_RANGE_TEXT_MISMATCH`，WPS 中没有批注。
+- 根因：Host 批量读取段落时已经取得真实 `Range.Start/End`，Worker 快照却只保留文本和段落索引；写批注阶段重新读取的 `Paragraph.Range.Start` 被直接当作 `Document.Range` 绝对坐标基准，两个 WPS API 返回的坐标语义不一致时目标文字读回失败。
+- 禁止：删除 `HOST_RANGE_TEXT_MISMATCH`；尝试 `end+1/end-1`；全文搜索；跳过失败目标；把识别成功记录成批注成功。
+- 正确方案：Worker 快照保留 Host 首次采集的绝对 `Range.Start/End`，预览计划携带对应段落绝对起点，再叠加已验证的 `host_raw_start_utf16/host_raw_end_utf16` 创建 `Document.Range`；创建前继续执行段落、子片段和 Range.Text 三层真实哈希核验。
+- 自动验证门槛：回归测试在快照采集后故意改变写入阶段的 `Paragraph.Range.Start`，预览计划仍使用快照绝对起点并成功写入；错误绝对坐标仍必须返回 `HOST_RANGE_TEXT_MISMATCH`。真实 WPS 需出现 `pipeline.preview.complete` 且 `preview_comment_count > 0`，保存后 OOXML 未检查前不得写完整 PASS。

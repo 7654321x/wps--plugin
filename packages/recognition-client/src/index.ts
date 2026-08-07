@@ -17,6 +17,8 @@ export interface LocalHostParagraph {
   text: string;
   isInTable?: boolean;
   storyType?: "main" | "header" | "footer";
+  rangeStart?: number;
+  rangeEnd?: number;
 }
 export interface LocalDocumentSnapshot {
   documentId: string; revision: string; sourceSha256: string;

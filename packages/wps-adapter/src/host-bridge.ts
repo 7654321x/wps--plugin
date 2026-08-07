@@ -34,7 +34,7 @@ function serialized(error: unknown): { code: string; message: string; stack?: st
 function snapshot(value: unknown): SerializableLocalDocumentSnapshot {
   const item = value as Partial<SerializableLocalDocumentSnapshot> | null;
   if (!item || item.snapshotContractVersion !== "worker-snapshot-v1" || typeof item.documentId !== "string" || typeof item.revision !== "string" || typeof item.textRevision !== "string" || typeof item.sourceSha256 !== "string" || typeof item.localDocxPath !== "string" || !Array.isArray(item.paragraphs)) throw new Error("INVALID_WORKER_SNAPSHOT");
-  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean") throw new Error("INVALID_WORKER_SNAPSHOT");
+  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean" || !Number.isInteger(paragraph.rangeStart) || !Number.isInteger(paragraph.rangeEnd) || paragraph.rangeEnd <= paragraph.rangeStart) throw new Error("INVALID_WORKER_SNAPSHOT");
   return item as SerializableLocalDocumentSnapshot;
 }
 

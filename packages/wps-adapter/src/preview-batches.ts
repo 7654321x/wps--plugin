@@ -36,7 +36,7 @@ export class WpsPreviewBatchService {
       if (await sha256(hostRaw) !== target.host_raw_text_sha256) throw new Error("PARAGRAPH_CHANGED");
       const fragment = rawSliceUtf16(hostRaw, target.host_raw_start_utf16, target.host_raw_end_utf16);
       if (fragment === null || await sha256(fragment) !== target.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
-      const start = Number(paragraphRange.Start) + target.host_raw_start_utf16; const end = Number(paragraphRange.Start) + target.host_raw_end_utf16;
+      const start = item.host_range_start + target.host_raw_start_utf16; const end = item.host_range_start + target.host_raw_end_utf16;
       const bodyRange = document.Range(start, end) as WpsObject;
       if (await sha256(normalize(bodyRange.Text)) !== target.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
       const countBefore = Number(comments.Count ?? 0); const returned = comments.Add(bodyRange, item.comment_text) as WpsObject | undefined;

@@ -439,3 +439,29 @@ def test_wps_load_completion_is_emitted_once_after_all_required_events(monkeypat
     assert len(logged) == 1
     assert logged[0][:3] == ("INFO", "wps.load.completed", "WPS 加载完成")
     assert logged[0][3]["build_id"] == "build-1"
+
+
+def test_wps_load_completion_accepts_only_current_session_unknown_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = [
+        {"event": "bootstrap.probe.loaded", "build_id": "unknown"},
+        {"event": "wps.resource.index.served", "build_id": "old-build"},
+        {"event": "wps.resource.index.served", "build_id": "build-1"},
+        {"event": "bootstrap.probe.loaded", "build_id": "unknown"},
+        *[
+            {"event": event, "build_id": "build-1"}
+            for event in main.WPS_LOAD_REQUIRED_EVENTS
+            if event not in {"wps.resource.index.served", "bootstrap.probe.loaded"}
+        ],
+    ]
+    monkeypatch.setattr(main, "_wps_load_completion_logged", False)
+    monkeypatch.setattr(main, "read_json", lambda _path: {"build_id": "build-1"})
+    monkeypatch.setattr(main, "read_log_events", lambda _path: events)
+    logged: list[tuple[str, str, str, dict[str, object]]] = []
+    monkeypatch.setattr(main, "log_event", lambda level, event, message, data=None, *_args, **_kwargs: logged.append((level, event, message, data or {})))
+
+    current = main.current_wps_load_events()
+
+    assert current[0] == {"event": "wps.resource.index.served", "build_id": "build-1"}
+    assert sum(item["event"] == "bootstrap.probe.loaded" for item in current) == 1
+    assert main.maybe_log_wps_load_completed() is True
+    assert len(logged) == 1

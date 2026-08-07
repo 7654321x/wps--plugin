@@ -85,7 +85,7 @@ export async function createEquivalentSnapshot(descriptor: DocumentDescriptor, p
   return {
     snapshotContractVersion: "worker-snapshot-v1", documentId: `wps-${sourceSha256.slice(0, 16)}`, revision: textRevision, textRevision,
     sourceSha256, localDocxPath: descriptor.local_docx_path,
-    paragraphs: paragraphs.map((item) => ({ sourceParagraphIndex: item.host_paragraph_index, text: item.raw_text, isInTable: item.is_in_table })),
+    paragraphs: paragraphs.map((item) => ({ sourceParagraphIndex: item.host_paragraph_index, text: item.raw_text, isInTable: item.is_in_table, rangeStart: item.range_start, rangeEnd: item.range_end })),
     paragraphOrderHash, sectionCount: descriptor.section_count, documentFullNameHash: descriptor.local_docx_path_hash,
   };
 }

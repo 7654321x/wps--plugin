@@ -99,7 +99,7 @@ export interface SerializableLocalDocumentSnapshot {
   textRevision: string;
   sourceSha256: string;
   localDocxPath: string;
-  paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable: boolean }>;
+  paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable: boolean; rangeStart: number; rangeEnd: number }>;
   paragraphOrderHash: string;
   sectionCount: number;
   documentFullNameHash: string;

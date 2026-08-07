@@ -182,7 +182,7 @@ def print_status(*, startup: bool = False, watch_logs: bool = False) -> None:
     values = parse_status(output)
     server_ready = is_port_open(WPSJS_PORT) and probe_debug_server().get("status") == "PASS"
     events = diagnostic_events()
-    maybe_log_wps_load_completed(events)
+    maybe_log_wps_load_completed()
     event_names = [str(item.get("event", "")) for item in events]
     page_loaded = plugin_page_loaded(event_names)
     current = broker_current()
@@ -1132,11 +1132,38 @@ def diagnostic_events() -> List[Dict[str, object]]:
     return [item for item in events if not current_build or not item.get("build_id") or item.get("build_id") == current_build]
 
 
+def current_wps_load_events() -> List[Dict[str, object]]:
+    current_build = str(read_json(DEBUG_MANIFEST).get("build_id", ""))
+    if not current_build:
+        return []
+    events = read_log_events(WPS_LOG)
+    served_index = next(
+        (
+            index
+            for index in range(len(events) - 1, -1, -1)
+            if events[index].get("event") == "wps.resource.index.served"
+            and events[index].get("build_id") == current_build
+        ),
+        None,
+    )
+    if served_index is None:
+        return []
+    return [
+        item
+        for item in events[served_index:]
+        if item.get("build_id") == current_build
+        or (
+            item.get("event") == "bootstrap.probe.loaded"
+            and item.get("build_id") in (None, "", "unknown")
+        )
+    ]
+
+
 def maybe_log_wps_load_completed(events: Optional[List[Dict[str, object]]] = None) -> bool:
     global _wps_load_completion_logged
     if _wps_load_completion_logged:
         return True
-    values = events if events is not None else diagnostic_events()
+    values = events if events is not None else current_wps_load_events()
     names = {str(item.get("event", "")) for item in values}
     if not WPS_LOAD_REQUIRED_EVENTS.issubset(names):
         return False
