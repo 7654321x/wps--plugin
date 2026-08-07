@@ -592,3 +592,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：修改识别接口、把 `__object_caption__` 直接暴露给 UI、将合同外类型默认为正文，或放宽混合物理段落的 `review_only` 门禁。
 - 正确方案：保留 wheel 适配边界的 `__object_caption__ → caption`；在 WPS 三处显示表同步补齐合同角色，并直接使用已有 `review_level`、`mixed_structure` 和 `formatting_disposition` 区分识别复核与混合结构。
 - 自动验证门槛：表格驱动测试证明五类角色在特殊预览、批注作者/简称、Host 和任务窗格均有正确中文名称；真实 `unknown` 仍显示未知；混合结构与识别复核可同时显示，正式排版门禁不变。
+
+## P070 Worker 预览批注使一键排版误报文档未保存
+
+- 症状：`pipeline.preview.complete` 已成功且批注可见，随后点击“一键排版”在首次快照读取时返回 `DOCUMENT_MUST_BE_SAVED`。
+- 根因：Worker 预览由 `WpsPreviewBatchService` 持有，正式 `FormatDocumentUseCase` 使用另一套 preview tracker；预览批注令 `Document.Saved=false`，正式排版未先清理 Worker 预览并保存。
+- 禁止：要求用户在预览后手工按 `Ctrl+S`、把临时预览批注保存进原文档、忽略 `Saved=false` 继续识别，或跨文档删除旧批注对象。
+- 正确方案：一键排版先按当前 document token 清理 Worker 预览并核对用户批注，再调用官方 `Document.Save()` 等待保存完成；排版成功后再次保存。没有本地 DOCX 路径继续返回 `DOCUMENT_MUST_BE_SAVED`，实际保存失败返回 `DOCUMENT_SAVE_FAILED`。
+- 自动验证门槛：回归证明顺序为“清理预览 → 保存 → 正式排版 → 最终保存”；跨文档清理返回 `DOCUMENT_CHANGED`；用户批注完整；保存失败不进入排版；真实 WPS 必须加载当前 build 并完成预览、一键排版及保存后 OOXML 检查。

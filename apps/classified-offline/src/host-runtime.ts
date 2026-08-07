@@ -107,6 +107,22 @@ function recognitionSummary(recognition: RecognitionResult): string {
   const review = recognition.paragraphs.filter((item) => item.review_level === "review" || item.review_level === "critical_review").length;
   return `总识别项 ${recognition.paragraphs.length + unresolved}；可应用 ${applicable}；其中混合结构 ${mixed}；识别建议复核 ${review}；未定位 ${unresolved}`;
 }
+export async function saveActiveDocument(application: Pick<ApplicationLike, "ActiveDocument">, force: boolean, phase: "before_format" | "after_format"): Promise<void> {
+  const document = application.ActiveDocument;
+  const fullName = String(document?.FullName ?? "");
+  if (!document || !fullName.toLowerCase().endsWith(".docx")) throw new Error("DOCUMENT_MUST_BE_SAVED");
+  if (!force && document.Saved === true) return;
+  if (typeof document.Save !== "function") { hostLog("ERROR", "document.save.failed", "WPS 未提供当前文档保存方法", { phase, stable_error_code: "DOCUMENT_SAVE_FAILED" }); throw new Error("DOCUMENT_SAVE_FAILED"); }
+  hostLog("INFO", "document.save.start", "开始保存当前 WPS 文档", { phase });
+  try { document.Save(); }
+  catch (error) { hostLog("ERROR", "document.save.failed", "WPS 文档保存失败", { phase, stable_error_code: "DOCUMENT_SAVE_FAILED" }, error); throw new Error("DOCUMENT_SAVE_FAILED", { cause: error }); }
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (document.Saved === true) { hostLog("INFO", "document.save.completed", "当前 WPS 文档已保存", { phase }); return; }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  hostLog("ERROR", "document.save.failed", "等待 WPS 文档保存完成超时", { phase, stable_error_code: "DOCUMENT_SAVE_FAILED" });
+  throw new Error("DOCUMENT_SAVE_FAILED");
+}
 
 export class HostResultStore {
   private state: HostState;
@@ -166,10 +182,12 @@ export class TaskPaneManager {
 export class LocalApplicationRuntime {
   private readonly registry: Record<LocalApplicationCommandName, (result: CommandResult) => Promise<string>>;
   private pipelineStart?: (command: PipelineCommand) => SnapshotCommandReceipt;
+  private threadedPreviewCleanup?: () => Promise<void>;
   constructor(private readonly app: ApplicationLike, private readonly panes: TaskPaneManager, private readonly store: HostResultStore, private readonly config: ClassifiedRuntimeConfig) {
     this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), probe_shell_execute_one_argument: async () => { const value = await hostWindow.DocxtoolNativeLaunchProbe?.(); if (!value) throw new Error("LOCAL_LAUNCH_PROBE_UNAVAILABLE"); return `单参数 ShellExecute 返回 ${Math.round(value.returned_in_ms)} ms`; }, open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
   }
   attachPipelineStarter(start: (command: PipelineCommand) => SnapshotCommandReceipt): void { this.pipelineStart = start; }
+  attachThreadedPreviewCleanup(cleanup: () => Promise<void>): void { this.threadedPreviewCleanup = cleanup; }
   async run(name: LocalApplicationCommandName, source: LocalCommandSource | "e2e" = "ribbon", requestId = id("local"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
     const started = now(); const startedMs = Date.now();
     const context = { correlation_id: requestId, request_id: requestId, command_id: requestId, command_name: name, source };
@@ -266,8 +284,17 @@ export class LocalApplicationRuntime {
       throw error;
     }
   }
-  private async clearPreview(): Promise<string> { await this.composition().clearPreviewUseCase.execute(); this.store.update({ preview_comment_status: "预览批注已清除" }); return "预览批注已清除"; }
-  private async format(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) }); const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`; this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "无 Docxtool 预览批注", active_view: "execution" }); return summary; }
+  private async clearPreview(): Promise<string> { await this.composition().clearPreviewUseCase.execute(); await this.threadedPreviewCleanup?.(); this.store.update({ preview_comment_status: "预览批注已清除" }); return "预览批注已清除"; }
+  private async format(_result: CommandResult): Promise<string> {
+    const identity = await this.documentIdentity();
+    await this.threadedPreviewCleanup?.();
+    await saveActiveDocument(this.app, false, "before_format");
+    const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) });
+    await saveActiveDocument(this.app, true, "after_format");
+    const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`;
+    this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "无 Docxtool 预览批注", active_view: "execution" });
+    return summary;
+  }
   private async health(): Promise<string> {
     const state = this.store.read();
     const report = await new ClassifiedHealthChecker(
@@ -431,6 +458,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   };
   const debugProbeEnabled = ["127.0.0.1", "localhost"].includes(hostWindow.location.hostname);
   const hostBridge = new WpsHostBridge(application as unknown as Record<string, any>, hostWindow.DocxtoolDiagnosticLogger, { recognitionExecutablePath: config.recognitionExecutablePath, recognitionContractVersion: config.contractVersion ?? 1, brokerStatusPath: config.brokerStatusPath, brokerJobsPath: config.brokerJobsPath, brokerRuntimeVersion: config.runtimeVersion, brokerRuntimeSha256: config.runtimeSha256, brokerVersion: config.brokerVersion, brokerExecutablePathHash: config.brokerExecutablePathHash, brokerExecutableSha256: config.brokerExecutableSha256, brokerQueueContractVersion: config.queueContractVersion, probeExecutablePath: config.launchProbeExecutablePath, enableDebugProbes: debugProbeEnabled });
+  runtime.attachThreadedPreviewCleanup(async () => { const result = await hostBridge.clearPreviewForCurrentDocument(); hostLog("INFO", "preview.cleanup.completed", "Worker 预览批注已清理", { deleted_count: result.deleted_count, user_comment_integrity: result.user_comment_integrity }); });
   hostWindow.DocxtoolNativeLaunchProbe = async () => {
     if (!debugProbeEnabled) throw new Error("HOST_DEBUG_PROBE_DISABLED");
     const response = await hostBridge.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: id("launch-probe"), job_id: id("launch-probe-job"), build_id: build.build_id, payload: {} });

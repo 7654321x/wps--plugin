@@ -68,10 +68,11 @@ export class WpsPreviewBatchService {
     return { session_id: sessionId, applied_count: results.length, total_created: this.active.created.length, results };
   }
 
-  clear(batchSize: number): JsonValue {
+  clear(documentToken: string, batchSize: number): JsonValue {
     if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
     const session = this.active;
     if (!session) return { session_id: "", deleted_count: 0, remaining: 0, user_comment_integrity: true };
+    if (session.document_token !== documentToken) throw new Error("DOCUMENT_CHANGED");
     const document = this.application.ActiveDocument as WpsObject; const comments = document.Comments as WpsObject;
     let deleted = 0;
     while (session.created.length && deleted < batchSize) { const comment = session.created.pop()!; try { comment.Delete(); } catch { throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED"); } deleted += 1; }

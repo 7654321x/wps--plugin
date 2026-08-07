@@ -50,6 +50,17 @@ export class WpsHostBridge {
     this.previewBatches = new WpsPreviewBatchService(application);
   }
 
+  async clearPreviewForCurrentDocument(): Promise<{ deleted_count: number; user_comment_integrity: true }> {
+    const descriptor = await this.captureDocumentDescriptor();
+    let deleted = 0;
+    for (;;) {
+      const result = this.previewBatches.clear(descriptor.document_token, HOST_PREVIEW_BATCH_LIMIT) as { deleted_count?: number; remaining?: number; user_comment_integrity?: boolean };
+      if (result.user_comment_integrity === false) throw new Error("PREVIEW_USER_COMMENT_CHANGED");
+      deleted += Number(result.deleted_count ?? 0);
+      if (Number(result.remaining ?? 0) === 0) return { deleted_count: deleted, user_comment_integrity: true };
+    }
+  }
+
   async handle(input: unknown): Promise<HostRpcResult> {
     const started = performance.now();
     let request: WorkerHostRequest;
@@ -194,6 +205,6 @@ export class WpsHostBridge {
 
   private clearPreviewBatch(request: WorkerHostRequest): JsonValue {
     this.validateDocumentToken(request.document_token);
-    return this.previewBatches.clear(Number(request.payload.batch_size));
+    return this.previewBatches.clear(String(request.document_token ?? ""), Number(request.payload.batch_size));
   }
 }

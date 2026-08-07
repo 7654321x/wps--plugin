@@ -39,7 +39,7 @@ import {
 } from "../dist/packages/wps-adapter/src/index.js";
 import { CommandValidator } from "../dist/packages/security/src/index.js";
 import { FormatDocumentUseCase, PreviewDocumentUseCase } from "../dist/packages/application/src/format-document-usecase.js";
-import { LocalApplicationRuntime, HostResultStore, TaskPaneManager } from "../dist/apps/classified-offline/src/host-runtime.js";
+import { LocalApplicationRuntime, HostResultStore, TaskPaneManager, saveActiveDocument } from "../dist/apps/classified-offline/src/host-runtime.js";
 import { ClassifiedHealthChecker } from "../dist/apps/classified-offline/src/health-check.js";
 import { errorMessage, errorText } from "../dist/apps/classified-offline/src/error-messages.js";
 import { probeWorkerCapability } from "../dist/apps/classified-offline/src/worker-capability.js";
@@ -960,8 +960,12 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   assert.equal(applied.ok, true); assert.equal(applied.value.applied_count, 1); assert.equal(comments.filter((item) => !item.deleted).length, 2);
   const oversized = await bridge.handle({ ...base, rpc_id: "preview-overflow", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-1", items: Array(6).fill(plan[0]) } });
   assert.equal(oversized.ok, false); assert.equal(oversized.error.code, "HOST_PREVIEW_BATCH_INVALID");
-  const cleared = await bridge.handle({ ...base, rpc_id: "preview-clear", operation: "host.clear_preview_batch", document_token: descriptor.value.document_token, payload: { batch_size: 5 } });
-  assert.equal(cleared.ok, true); assert.equal(cleared.value.remaining, 0); assert.equal(cleared.value.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
+  application.ActiveDocument.FullName = "C:\\other.docx";
+  await assert.rejects(() => bridge.clearPreviewForCurrentDocument(), /DOCUMENT_CHANGED/);
+  assert.equal(comments[1].deleted, undefined);
+  application.ActiveDocument.FullName = "C:\\preview.docx";
+  const cleared = await bridge.clearPreviewForCurrentDocument();
+  assert.equal(cleared.deleted_count, 1); assert.equal(cleared.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
   corruptSetRangeReadback = true;
   const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-2", items: plan } });
   assert.equal(mismatched.ok, false); assert.equal(mismatched.error.code, "HOST_RANGE_TEXT_MISMATCH");
@@ -1314,6 +1318,11 @@ test("production preview starts only the Worker while legacy preview remains unr
   assert.equal(previewBlock.includes("readSnapshot"), false);
   assert.match(legacyPreviewBlock, /this\.composition\(\)\.previewUseCase\.execute/);
   assert.match(formatBlock, /this\.composition\(\)\.formatUseCase\.execute/);
+  const cleanupAt = formatBlock.indexOf("this.threadedPreviewCleanup");
+  const firstSaveAt = formatBlock.indexOf("saveActiveDocument");
+  const formatAt = formatBlock.indexOf("formatUseCase.execute");
+  const finalSaveAt = formatBlock.indexOf("saveActiveDocument", firstSaveAt + 1);
+  assert.equal(cleanupAt >= 0 && cleanupAt < firstSaveAt && firstSaveAt < formatAt && formatAt < finalSaveAt, true);
   assert.match(shadowBlock, /startPipeline\("snapshot_shadow"\)/);
   for (const forbidden of ["PreviewDocumentUseCase", "FormatDocumentUseCase", "readSnapshot"]) {
     assert.equal(client.includes(forbidden), false);
@@ -1321,6 +1330,16 @@ test("production preview starts only the Worker while legacy preview remains unr
   for (const forbidden of ["window", "Application", "ActiveDocument", "Paragraphs", "Range", "Comments"]) {
     assert.equal(worker.includes(forbidden), false);
   }
+});
+
+test("one-click save lifecycle accepts dirty DOCX files and exposes real save failures", async () => {
+  let saves = 0;
+  const document = { FullName: "C:\\fixture.docx", Saved: false, Save() { saves += 1; this.Saved = true; } };
+  await saveActiveDocument({ ActiveDocument: document }, false, "before_format");
+  await saveActiveDocument({ ActiveDocument: document }, true, "after_format");
+  assert.equal(saves, 2);
+  await assert.rejects(() => saveActiveDocument({ ActiveDocument: { FullName: "", Saved: false } }, false, "before_format"), /DOCUMENT_MUST_BE_SAVED/);
+  await assert.rejects(() => saveActiveDocument({ ActiveDocument: { FullName: "C:\\fixture.docx", Saved: false, Save() { throw new Error("disk locked"); } } }, false, "before_format"), /DOCUMENT_SAVE_FAILED/);
 });
 
 test("canonical ribbon reports taskpane creation failure instead of swallowing it", async () => {
@@ -1496,8 +1515,9 @@ test("classified health check reports missing fonts as WARN and unreachable serv
 
 test("classified UI error messages localize stable WPS error codes", () => {
   assert.match(errorMessage("DOCUMENT_MUST_BE_SAVED"), /当前文档尚未保存/);
-  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先在 WPS 中保存为本地 \.docx 文件/);
+  assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /请先选择保存位置/);
   assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /错误码：DOCUMENT_MUST_BE_SAVED/);
+  assert.match(errorText("DOCUMENT_SAVE_FAILED"), /文件是否只读或被其他程序占用/);
   assert.match(errorMessage("CONTROL_SERVER_NOT_RUNNING"), /Control Server 未运行/);
 });
 
