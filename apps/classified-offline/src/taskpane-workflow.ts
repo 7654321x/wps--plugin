@@ -6,12 +6,13 @@ interface StorageLike { getItem(key: string): string | null; setItem(key: string
 interface HostState {
   build_id: string; asset_hash: string; host_context_id: string; command_status: string; active_view: "recognition" | "preview" | "execution" | "issues";
   active_command?: { command_id?: string; status?: string; error_code?: string } | null;
-  recognition_summary: string; paragraph_recognition_models: Array<{ paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean }>;
-  formatting_preview_models: Array<{ paragraph_index: number; recognized_type: string; plan: string; needs_review: boolean }>;
+  recognition_summary: string; paragraph_recognition_models: Array<ReviewDisplayModel & { paragraph_index: number; recognized_type: string; confidence: number }>;
+  formatting_preview_models: Array<ReviewDisplayModel & { paragraph_index: number; recognized_type: string; plan: string }>;
   preview_comment_status: string; formatting_progress: string; formatting_result: string; latest_error: string; updated_at: string;
   unresolved_block_count?: number; mixed_paragraph_count?: number;
   health_overall?: "PASS" | "WARN" | "FAIL" | ""; health_report?: string;
 }
+interface ReviewDisplayModel { needs_review: boolean; review_level: "confirmed" | "info" | "review" | "critical_review"; mixed_structure: boolean; formatting_disposition: "apply" | "review_only"; }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; }
 type BridgeWindow = Window & {
   DocxtoolBuildInfo?: BuildInfo;
@@ -25,7 +26,7 @@ const bridgeWindow = window as BridgeWindow;
 const RESULT_KEY = "docxtool_classified_host_result_v1";
 const ERROR_KEY = "docxtool_classified_host_error_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
-const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
+const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", role_name: "职务姓名", attachment_note: "附件说明", attachment_note_item: "附件说明续项", attachment_title: "附件正文标题", attachment_page_mark: "附件正文标记", attachment_body: "附件正文", caption: "对象标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 let pendingRequestId = "";
 let pendingStartedAt = 0;
 let lastObservedRequestState = "";
@@ -100,6 +101,13 @@ function focusDocument(): void {
   }
 }
 function rows(id: string, values: string[]): void { node(id).replaceChildren(...values.map((value) => { const row = document.createElement("div"); row.className = "row"; row.textContent = value; return row; })); }
+function reviewText(item: ReviewDisplayModel): string {
+  const reasons: string[] = [];
+  if (item.mixed_structure) reasons.push("混合结构：同一物理段落包含多个角色，正式排版前需要拆段");
+  if (item.review_level === "review" || item.review_level === "critical_review") reasons.push("识别结果已定位，建议人工复核");
+  if (reasons.length > 0) return reasons.join(" · ");
+  return item.needs_review || item.formatting_disposition === "review_only" ? "需要复核" : "可应用";
+}
 function issueText(state: HostState): string {
   if (state.latest_error === "MIXED_PARAGRAPH_REQUIRES_SPLIT") return `检测到 ${state.mixed_paragraph_count ?? 0} 个物理段落包含多个角色。预览批注已按文字范围分别标出；请先拆分这些段落，再执行一键排版。`;
   if (state.latest_error === "RECOGNITION_LOCATOR_UNVERIFIED") return `有 ${state.unresolved_block_count ?? 0} 个识别块无法证明原文位置。系统没有猜测定位，请根据预览批注复核。`;
@@ -115,9 +123,9 @@ function render(state: HostState): void {
   const build = bridgeWindow.DocxtoolBuildInfo; const expected = new URLSearchParams(location.search).get("host_build");
   if (!build || state.build_id !== build.build_id || (expected && expected !== build.build_id)) { const warning = node("context-warning"); warning.hidden = false; warning.textContent = "ADDIN_CONTEXT_STALE：当前 WPS 加载的是旧版 Docxtool，请关闭全部 WPS 窗口后重新打开。"; return; }
   text("recognition-summary", state.recognition_summary || "等待识别。");
-  rows("recognition-rows", state.paragraph_recognition_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · 置信度 ${Math.round(item.confidence * 100)}%${item.needs_review ? " · 需要复核" : ""}`));
+  rows("recognition-rows", state.paragraph_recognition_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · 置信度 ${Math.round(item.confidence * 100)}% · ${reviewText(item)}`));
   text("preview-summary", state.preview_comment_status || "不会写入格式；空段落不添加批注。");
-  rows("preview-rows", state.formatting_preview_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · ${item.plan}${item.needs_review ? " · 需要复核" : ""}`));
+  rows("preview-rows", state.formatting_preview_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · ${item.plan} · ${reviewText(item)}`));
   text("workflow-status", workflowText(state)); text("execution-result", state.formatting_result || ""); text("issues", issueText(state));
   text("health-summary", state.health_report || "尚未运行功能检测。");
   document.body.dataset.activeView = state.active_view;

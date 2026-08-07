@@ -932,7 +932,7 @@ test("preview comments use a paragraph Range and remove only their session marke
   assert.equal(comments[1].Initial, "主");
   assert.match(previewText, /^识别结果：主标题 中文字体：方正小标宋简体/);
   assert.equal(previewText.split(/\r?\n/).length, 3);
-  for (const value of ["识别结果：主标题", "中文字体：方正小标宋简体", "西文字体：Times New Roman", "字号：二号", "粗体：否", "对齐方式：居中", "首行缩进：0 字符", "左缩进：0 字符", "右缩进：0 字符", "段前：0 行", "段后：0 行", "固定行距：28 磅", "段前分页：否", "识别状态：需要复核", "识别置信度：50%"] ) assert.match(previewText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  for (const value of ["识别结果：主标题", "中文字体：方正小标宋简体", "西文字体：Times New Roman", "字号：二号", "粗体：否", "对齐方式：居中", "首行缩进：0 字符", "左缩进：0 字符", "右缩进：0 字符", "段前：0 行", "段后：0 行", "固定行距：28 磅", "段前分页：否", "复核原因：识别结果已定位，建议人工复核", "识别状态：需要复核", "识别置信度：50%"] ) assert.match(previewText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   for (const value of ["[DOCXTOOL_PREVIEW]", "\u2063", "preview_session=", "document_identity=", "paragraph_index=", "reference_start=", "识别代码：", "具体格式：", "固定行距：28 pt"]) assert.doesNotMatch(previewText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   comments[1].Reference = { Start: 11, End: 14 };
   await service.removePreviewComments(created.tracker);
@@ -975,13 +975,58 @@ test("preview comments anchor each mixed role to its verified UTF-16 sub-range",
   const collection = { get Count() { return comments.length; }, Item(index) { return comments[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() {} }; comments.push(item); return item; } };
   globalThis.Application = { ActiveDocument: { Saved: true, Comments: collection, Paragraphs: { Item() { return { Range: { Text: text + "\r", Start: 100, End: 100 + text.length + 1 } }; } }, Range(start, end) { return { Start: start, End: end, Text: text.slice(start - 100, end - 100) }; } } };
   const physicalHash = hashText(text);
-  const makeItem = (value, type, blockIndex) => ({ target_id: `doc-mixed:p:0:r:${text.indexOf(value)}:${text.indexOf(value) + value.length}:${blockIndex}`, source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: type, section_kind: "body", text_sha256: hashText(value), physical_text_sha256: physicalHash, range_start_utf16: text.indexOf(value), range_end_utf16: text.indexOf(value) + value.length, locator_verified: true, mixed_structure: true, formatting_disposition: "review_only", text_length: value.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: true, ...hostFields(text, text.indexOf(value), text.indexOf(value) + value.length) });
+  const makeItem = (value, type, blockIndex) => ({ target_id: `doc-mixed:p:0:r:${text.indexOf(value)}:${text.indexOf(value) + value.length}:${blockIndex}`, source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: type, section_kind: "body", text_sha256: hashText(value), physical_text_sha256: physicalHash, range_start_utf16: text.indexOf(value), range_end_utf16: text.indexOf(value) + value.length, locator_verified: true, mixed_structure: true, formatting_disposition: "review_only", text_length: value.length, occurrence_index: 0, confidence: 1, review_level: "review", needs_review: true, ...hostFields(text, text.indexOf(value), text.indexOf(value) + value.length) });
   const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "3", document_id: "doc-mixed", document_revision: "rev", source_sha256: physicalHash, document_mode: "normal", document_mode_confidence: 1, paragraphs: [makeItem(title, "heading1", 0), makeItem(body, "body", 1)] };
   const result = await new WpsPreviewCommentService().addPreviewComments({ snapshot: { documentId: "doc-mixed", revision: "rev", sourceSha256: physicalHash, documentFullNameHash: "path", paragraphs: [{ sourceParagraphIndex: 0, text }] }, recognition, commands: commandSet([]), mode: "all" });
   assert.equal(result.comment_count, 2);
   assert.deepEqual(comments.map((item) => [item.Reference.Start, item.Reference.End]), [[100, 100 + title.length], [100 + title.length, 100 + text.length]]);
   assert.match(comments[0].Range.Text, /识别结果：一级标题/); assert.match(comments[1].Range.Text, /识别结果：正文/);
   assert.match(comments[0].Range.Text, /正式排版前需要拆段/);
+  assert.match(comments[0].Range.Text, /识别结果已定位，建议人工复核/);
+});
+
+test("WPS display mappings cover every supported role omitted from the original UI tables", async () => {
+  const roles = [
+    ["role_name", "职务姓名", "职"],
+    ["attachment_note_item", "附件说明续项", "附项"],
+    ["attachment_page_mark", "附件正文标记", "附标"],
+    ["attachment_body", "附件正文", "附文"],
+    ["caption", "对象标题", "对象"],
+  ];
+  const paragraphs = roles.map(([recognizedType], index) => {
+    const text = `测试${index}`;
+    return { target_id: `doc-display:p:${index}:0`, source_paragraph_index: index, physical_paragraph_index: index, recognized_type: recognizedType, section_kind: "body", text_sha256: hashText(text), physical_text_sha256: hashText(text), range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, mixed_structure: false, formatting_disposition: "apply", text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, ...hostFields(text, 0, text.length, index) };
+  });
+  const displaySnapshot = { documentId: "doc-display", revision: "rev", sourceSha256: SHA, documentFullNameHash: "path", paragraphs: paragraphs.map((item, index) => ({ sourceParagraphIndex: index, text: `测试${index}` })) };
+  const recognition = { schema_version: RECOGNITION_RESULT_VERSION, recognition_engine_version: "4", document_id: "doc-display", document_revision: "rev", source_sha256: SHA, document_mode: "normal", document_mode_confidence: 1, paragraphs };
+  const plan = createPreviewPlan(displaySnapshot, recognition, commandSet([]), "headings_and_special");
+  assert.equal(plan.length, roles.length);
+  for (const [index, [, label, initial]] of roles.entries()) {
+    assert.match(plan[index].comment_text, new RegExp(`识别结果：${label}`));
+    assert.equal(plan[index].comment_author, `DocxTool·${label}`);
+    assert.equal(plan[index].comment_initial, initial);
+    assert.doesNotMatch(plan[index].comment_text, /识别结果：未知/);
+  }
+  const [hostSource, taskpaneSource] = await Promise.all([
+    readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8"),
+    readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8"),
+  ]);
+  for (const [type, label] of roles) {
+    for (const source of [hostSource, taskpaneSource]) assert.match(source, new RegExp(`${type}: "${label}"`));
+  }
+  assert.equal(hostSource.includes("__object_caption__"), false);
+  assert.equal(taskpaneSource.includes("__object_caption__"), false);
+});
+
+test("WPS review wording distinguishes recognition review from mixed structure", async () => {
+  const previewSource = await readFile(new URL("../packages/wps-adapter/src/preview-comments.ts", import.meta.url), "utf8");
+  const taskpaneSource = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
+  for (const source of [previewSource, taskpaneSource]) {
+    assert.match(source, /同一物理段落包含多个角色，正式排版前需要拆段/);
+    assert.match(source, /识别结果已定位，建议人工复核/);
+  }
+  assert.match(taskpaneSource, /reasons\.join/);
+  assert.match(taskpaneSource, /formatting_disposition === "review_only"/);
 });
 
 test("preview flow never creates a comment inside a table cell", async () => {

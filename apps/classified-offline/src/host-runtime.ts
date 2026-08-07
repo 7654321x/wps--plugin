@@ -19,8 +19,9 @@ interface TaskPaneLike { ID: number | string; Visible: boolean; Delete?: () => v
 interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: WpsFileSystemApi; Env?: { GetAppDataPath?: () => string }; }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; build_timestamp: string; }
 interface CommandResult { command_id: string; command_name: LocalApplicationCommandName; status: LocalApplicationCommandStatus; stage: string; summary: string; error_code: string; started_at: string; finished_at: string; }
-interface RecognitionModel { paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean; }
-interface PreviewModel { paragraph_index: number; recognized_type: string; plan: string; needs_review: boolean; }
+type ReviewLevel = RecognitionResult["paragraphs"][number]["review_level"];
+interface RecognitionModel { paragraph_index: number; recognized_type: string; confidence: number; needs_review: boolean; review_level: ReviewLevel; mixed_structure: boolean; formatting_disposition: "apply" | "review_only"; }
+interface PreviewModel { paragraph_index: number; recognized_type: string; plan: string; needs_review: boolean; review_level: ReviewLevel; mixed_structure: boolean; formatting_disposition: "apply" | "review_only"; }
 interface CallbackLog { callback_name: string; build_id: string; host_context: string; started_at: string; completed_at: string; status: "PASS" | "FAIL"; stable_error_code: string; }
 interface HostState {
   schema_version: 1; build_id: string; asset_hash: string; host_context_id: string; document_identity_hash: string;
@@ -79,7 +80,7 @@ const RESULT_KEY = "docxtool_classified_host_result_v1";
 const REQUEST_KEY = "docxtool_classified_host_request_v1";
 const CONFIG_KEY = "docxtool_classified_runtime_config";
 const PANE_KEY = "docxtool_classified_taskpane";
-const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
+const roles: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", role_name: "职务姓名", attachment_note: "附件说明", attachment_note_item: "附件说明续项", attachment_title: "附件正文标题", attachment_page_mark: "附件正文标记", attachment_body: "附件正文", caption: "对象标题", signature_org: "落款署名", signature_date: "落款日期", unknown: "未知" };
 function now(): string { return new Date().toISOString(); }
 function id(prefix: string): string { return `${prefix}-${Date.now().toString(36)}-${randomId().slice(0, 8)}`; }
 function stableError(error: unknown): string { const raw = error instanceof Error ? error.message : "HOST_COMMAND_FAILED"; if (/path cannot contains/i.test(raw)) return "WPS_FILESYSTEM_PATH_REJECTED"; if (/fetch|network/i.test(raw)) return "LOCAL_AGENT_UNAVAILABLE"; return /^[A-Z0-9_:.-]+$/.test(raw) ? raw : "HOST_COMMAND_FAILED"; }
@@ -92,6 +93,19 @@ function formattingPlan(commands: FormattingCommandSet["commands"]): string {
   if (indent?.kind === "paragraph.set_indent") values.push(`缩进:${indent.arguments.first_line_indent_chars}/${indent.arguments.left_indent_chars}/${indent.arguments.right_indent_chars}字符`);
   if (spacing?.kind === "paragraph.set_spacing") values.push(`段前后:${spacing.arguments.space_before_lines}/${spacing.arguments.space_after_lines}行 固定:${spacing.arguments.line_spacing_pt}pt`);
   return values.join("；") || "无可应用命令";
+}
+function recognitionModel(item: RecognitionResult["paragraphs"][number]): RecognitionModel {
+  return { paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review, review_level: item.review_level, mixed_structure: item.mixed_structure, formatting_disposition: item.formatting_disposition };
+}
+function previewModel(item: RecognitionResult["paragraphs"][number], plan: string): PreviewModel {
+  return { ...recognitionModel(item), plan };
+}
+function recognitionSummary(recognition: RecognitionResult): string {
+  const unresolved = recognition.unresolved_blocks?.length ?? 0;
+  const applicable = recognition.paragraphs.filter((item) => item.formatting_disposition === "apply" && !item.needs_review).length;
+  const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.physical_paragraph_index)).size;
+  const review = recognition.paragraphs.filter((item) => item.review_level === "review" || item.review_level === "critical_review").length;
+  return `总识别项 ${recognition.paragraphs.length + unresolved}；可应用 ${applicable}；其中混合结构 ${mixed}；识别建议复核 ${review}；未定位 ${unresolved}`;
 }
 
 export class HostResultStore {
@@ -199,7 +213,7 @@ export class LocalApplicationRuntime {
   }
   private composition() { return getClassifiedProductionComposition(this.config, hostWindow.DocxtoolDiagnosticLogger); }
   private async documentIdentity(): Promise<string> { const document = this.app.ActiveDocument; if (!document) throw new Error("ACTIVE_DOCUMENT_NOT_FOUND"); return hash(`${document.FullName ?? "unsaved"}|${document.Paragraphs?.Count ?? 0}`); }
-  private async recognize(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const recognition = await this.composition().recognizeUseCase.execute(); const models = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review })); const review = models.filter((item) => item.needs_review).length; this.store.update({ document_identity_hash: identity, paragraph_recognition_models: models, recognition_summary: `总段落 ${models.length}；需要复核 ${review}`, active_view: "recognition" }); return "识别完成"; }
+  private async recognize(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const recognition = await this.composition().recognizeUseCase.execute(); const models = recognition.paragraphs.map(recognitionModel); this.store.update({ document_identity_hash: identity, paragraph_recognition_models: models, recognition_summary: recognitionSummary(recognition), active_view: "recognition" }); return "识别完成"; }
   private async preview(_result: CommandResult): Promise<string> {
     const mode = this.config.threadedPreviewMode ?? (this.config.threadedPreviewEnabled === true ? "enabled" : "disabled");
     if (mode === "disabled") throw new Error("THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED");
@@ -237,7 +251,7 @@ export class LocalApplicationRuntime {
         list.push(command); grouped.set(command.target.source_paragraph_index, list);
       }
       hostLog("DEBUG", "preview.commands.grouped", "格式命令已按物理段落分组", { ...context, formatting_command_count: value.commands.commands.length, target_paragraph_count: grouped.size });
-      const models = value.recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, plan: formattingPlan(grouped.get(item.source_paragraph_index) ?? []), needs_review: item.needs_review }));
+      const models = value.recognition.paragraphs.map((item) => previewModel(item, formattingPlan(grouped.get(item.source_paragraph_index) ?? [])));
       const mixed = value.summary.mixed_paragraph_count;
       const unresolved = value.summary.unresolved_block_count;
       const notices = [`已创建 ${count} 条临时批注`];
@@ -397,18 +411,18 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     const current = store.read().active_command;
     if (event.type === "pipeline.completed" && event.command === "diagnostic" && event.recognition_result) {
       const recognition = event.recognition_result;
-      const recognitionModels = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review }));
+      const recognitionModels = recognition.paragraphs.map(recognitionModel);
       const unresolved = recognition.unresolved_blocks?.length ?? 0;
       const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index)).size;
-      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "诊断识别完成（未写入）", finished_at: now() } : null, active_view: "recognition", recognition_summary: `总段落 ${recognitionModels.length + unresolved}；需要复核 ${recognitionModels.filter((item) => item.needs_review).length + unresolved}`, paragraph_recognition_models: recognitionModels, formatting_preview_models: [], preview_comment_status: "诊断模式：未写入批注或格式", formatting_progress: "诊断识别完成", formatting_result: "诊断模式未生成格式命令", latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
+      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "诊断识别完成（未写入）", finished_at: now() } : null, active_view: "recognition", recognition_summary: recognitionSummary(recognition), paragraph_recognition_models: recognitionModels, formatting_preview_models: [], preview_comment_status: "诊断模式：未写入批注或格式", formatting_progress: "诊断识别完成", formatting_result: "诊断模式未生成格式命令", latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
       hostLog("INFO", "pipeline.diagnostic.complete", "后台线程诊断识别完成（未写入）", { ...event.snapshot_summary, recognized_paragraph_count: recognition.paragraphs.length, unresolved_block_count: unresolved, mixed_paragraph_count: mixed, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed" && event.command === "preview" && event.recognition_result && event.formatting_commands && event.preview_result) {
       const recognition = event.recognition_result; const commands = event.formatting_commands; const grouped = new Map<number, FormattingCommandSet["commands"]>();
       for (const command of commands.commands) { const values = grouped.get(command.target.source_paragraph_index) ?? []; values.push(command); grouped.set(command.target.source_paragraph_index, values); }
-      const recognitionModels = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, confidence: item.confidence, needs_review: item.needs_review }));
-      const previewModels = recognition.paragraphs.map((item) => ({ paragraph_index: item.source_paragraph_index, recognized_type: item.recognized_type, plan: formattingPlan(grouped.get(item.source_paragraph_index) ?? []), needs_review: item.needs_review }));
+      const recognitionModels = recognition.paragraphs.map(recognitionModel);
+      const previewModels = recognition.paragraphs.map((item) => previewModel(item, formattingPlan(grouped.get(item.source_paragraph_index) ?? [])));
       const unresolved = recognition.unresolved_blocks?.length ?? 0; const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index)).size;
-      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "预览排版完成", finished_at: now() } : null, active_view: "preview", recognition_summary: `总段落 ${recognitionModels.length + unresolved}；需要复核 ${recognitionModels.filter((item) => item.needs_review).length + unresolved}`, paragraph_recognition_models: recognitionModels, formatting_preview_models: previewModels, preview_comment_status: `已创建 ${event.preview_result.comment_count} 条临时批注`, formatting_progress: "预览排版完成", formatting_result: `后台线程生成 ${commands.commands.length} 条格式命令`, latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
+      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "预览排版完成", finished_at: now() } : null, active_view: "preview", recognition_summary: recognitionSummary(recognition), paragraph_recognition_models: recognitionModels, formatting_preview_models: previewModels, preview_comment_status: `已创建 ${event.preview_result.comment_count} 条临时批注`, formatting_progress: "预览排版完成", formatting_result: `后台线程生成 ${commands.commands.length} 条格式命令`, latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
       hostLog("INFO", "pipeline.preview.complete", "后台线程正式预览完成", { ...event.snapshot_summary, preview_comment_count: event.preview_result.comment_count, formatting_command_count: commands.commands.length, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed") { store.update({ formatting_progress: `后台线程快照完成：${event.snapshot_summary.paragraph_count} 段`, formatting_result: `快照 ${event.snapshot_summary.source_sha256_prefix}；Host RPC P95 ${event.snapshot_summary.p95_host_rpc_ms.toFixed(1)} ms` }); hostLog("INFO", "worker.snapshot.shadow.complete", "后台线程影子快照完成", { ...event.snapshot_summary, main_thread_max_drift_ms: mainThreadMaxDrift }); }
     else if (event.type === "pipeline.cancelled") { store.update({ command_status: "CANCELLED", active_command: current ? { ...current, status: "CANCELLED", stage: "cancelled", summary: "后台任务已取消", finished_at: now() } : null, formatting_progress: "后台任务已取消" }); hostLog("WARN", "pipeline.job.cancelled", "后台线程任务已取消", { command: activePipelineCommand ?? "", main_thread_max_drift_ms: mainThreadMaxDrift }); }

@@ -584,3 +584,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：删除 `HOST_RANGE_TEXT_MISMATCH`；尝试 `end+1/end-1`；全文搜索；跳过失败目标；把识别成功记录成批注成功。
 - 正确方案：识别接口和 UTF-16 锚点保持不变；在 WPS 适配层把 UTF-16 边界转换为字符序号，通过官方 `Paragraph.Range.Characters.Item()` 取得目标首尾字符的真实 Range 边界，再在首字符 Range 上调用 `SetRange(first.Start, last.End)`。创建批注前继续执行 Range.Text 哈希核验；失败日志只记录相对边界、段落坐标、字符坐标、长度和哈希前缀，不记录正文。
 - 自动验证门槛：Mock 中令段落 `Start` 与首字符 `Start` 不同，且 `Document.Range` 固定返回错误对象，正式预览仍必须通过 `Characters.Item` 的首尾边界写入；构造错误字符 Range 读回时继续返回 `HOST_RANGE_TEXT_MISMATCH` 和精准技术详情。真实 WPS 需出现 `pipeline.preview.complete` 且 `preview_comment_count > 0`，保存后 OOXML 未检查前不得写完整 PASS。
+
+## P069 有效识别类型因 WPS 显示映射漏配而显示未知
+
+- 症状：识别接口、Schema 和格式 profile 已接受 `role_name`、`attachment_note_item`、`attachment_page_mark`、`attachment_body`、`caption`，任务窗格或预览批注仍显示“未知/需要复核”。
+- 根因：WPS 的特殊角色集合、批注角色名/简称、任务窗格角色名和 Host 角色名没有随冻结合同类型同步补齐；UI 将有效合同类型误当成未知类型。
+- 禁止：修改识别接口、把 `__object_caption__` 直接暴露给 UI、将合同外类型默认为正文，或放宽混合物理段落的 `review_only` 门禁。
+- 正确方案：保留 wheel 适配边界的 `__object_caption__ → caption`；在 WPS 三处显示表同步补齐合同角色，并直接使用已有 `review_level`、`mixed_structure` 和 `formatting_disposition` 区分识别复核与混合结构。
+- 自动验证门槛：表格驱动测试证明五类角色在特殊预览、批注作者/简称、Host 和任务窗格均有正确中文名称；真实 `unknown` 仍显示未知；混合结构与识别复核可同时显示，正式排版门禁不变。

@@ -7,8 +7,8 @@ import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.
 type WpsObject = Record<string, any>;
 const LEGACY_MARKER = "[DOCXTOOL_PREVIEW]";
 const PREVIEW_AUTHOR_PREFIX = "DocxTool·";
-const SPECIAL = new Set(["main_title", "title_continuation", "heading1", "heading2", "heading3", "heading4", "recipient", "attachment_note", "attachment_title", "signature_org", "signature_date"]);
-const ROLE_NAMES: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", attachment_note: "附件说明", attachment_title: "附件正文标题", signature_org: "落款署名", signature_date: "落款日期" };
+const SPECIAL = new Set(["main_title", "title_continuation", "heading1", "heading2", "heading3", "heading4", "recipient", "role_name", "attachment_note", "attachment_note_item", "attachment_title", "attachment_page_mark", "attachment_body", "caption", "signature_org", "signature_date"]);
+const ROLE_NAMES: Record<string, string> = { main_title: "主标题", title_continuation: "主标题续行", heading1: "一级标题", heading2: "二级标题", heading3: "三级标题", heading4: "四级标题", body: "正文", recipient: "称呼", role_name: "职务姓名", attachment_note: "附件说明", attachment_note_item: "附件说明续项", attachment_title: "附件正文标题", attachment_page_mark: "附件正文标记", attachment_body: "附件正文", caption: "对象标题", signature_org: "落款署名", signature_date: "落款日期" };
 function app(): WpsObject { const value = (globalThis as { Application?: unknown }).Application; if (!value || typeof value !== "object") throw new Error("WPS_API_UNSUPPORTED"); return value as WpsObject; }
 function normalize(value: unknown): string { return stripWpsImplicitParagraphTerminator(value); }
 async function sha256(value: string): Promise<string> {
@@ -36,19 +36,21 @@ function fontSizeName(value: number): string {
   return names.get(value) ?? `${value} pt`;
 }
 export function previewAuthor(type: string): string { return PREVIEW_AUTHOR_PREFIX + (ROLE_NAMES[type] ?? "需要复核"); }
-export function previewInitial(type: string): string { return ({ main_title: "主", title_continuation: "续", heading1: "一", heading2: "二", heading3: "三", heading4: "四", body: "文", recipient: "称", attachment_note: "附", attachment_title: "附题", signature_org: "署", signature_date: "日" } as Record<string, string>)[type] ?? "复"; }
-export function createPreviewCommentText(item: { recognized_type: string; confidence: number; needs_review: boolean }, commands: FormattingCommandSet["commands"]): string {
+export function previewInitial(type: string): string { return ({ main_title: "主", title_continuation: "续", heading1: "一", heading2: "二", heading3: "三", heading4: "四", body: "文", recipient: "称", role_name: "职", attachment_note: "附", attachment_note_item: "附项", attachment_title: "附题", attachment_page_mark: "附标", attachment_body: "附文", caption: "对象", signature_org: "署", signature_date: "日" } as Record<string, string>)[type] ?? "复"; }
+export function createPreviewCommentText(item: Pick<RecognitionResult["paragraphs"][number], "recognized_type" | "confidence" | "needs_review" | "review_level" | "mixed_structure" | "formatting_disposition">, commands: FormattingCommandSet["commands"]): string {
   const role = ROLE_NAMES[item.recognized_type] ?? "未知";
   const font = commands.find((command) => command.kind === "paragraph.set_font"); const alignment = commands.find((command) => command.kind === "paragraph.set_alignment"); const indent = commands.find((command) => command.kind === "paragraph.set_indent"); const spacing = commands.find((command) => command.kind === "paragraph.set_spacing");
   const alignmentNames: Record<string, string> = { left: "左对齐", center: "居中", right: "右对齐", justify: "两端对齐", distributed: "分散对齐" };
   const fields = [`识别结果：${role}`];
-  if ((item as { mixed_structure?: boolean }).mixed_structure) fields.push("结构状态：同一段落包含多个角色，正式排版前需要拆段");
+  if (item.mixed_structure) fields.push("结构状态：同一物理段落包含多个角色，正式排版前需要拆段");
   if (item.recognized_type === "unknown" || commands.length === 0) fields.push("可应用格式：暂无");
   if (font?.kind === "paragraph.set_font") fields.push(`中文字体：${font.arguments.east_asia_font_name}`, `西文字体：${font.arguments.latin_font_name}`, `字号：${fontSizeName(font.arguments.font_size_pt)}`, `粗体：${font.arguments.bold ? "是" : "否"}`);
   if (alignment?.kind === "paragraph.set_alignment") fields.push(`对齐方式：${alignmentNames[alignment.arguments.alignment] ?? alignment.arguments.alignment}`);
   if (indent?.kind === "paragraph.set_indent") fields.push(`首行缩进：${indent.arguments.first_line_indent_chars} 字符`, `左缩进：${indent.arguments.left_indent_chars} 字符`, `右缩进：${indent.arguments.right_indent_chars} 字符`);
   if (spacing?.kind === "paragraph.set_spacing") fields.push(`段前：${spacing.arguments.space_before_lines} 行`, `段后：${spacing.arguments.space_after_lines} 行`, `固定行距：${spacing.arguments.line_spacing_pt} 磅`, `段前分页：${spacing.arguments.page_break_before ? "是" : "否"}`);
-  const needsReview = item.needs_review || item.recognized_type === "unknown" || commands.length === 0 || Boolean((item as { mixed_structure?: boolean }).mixed_structure);
+  const recognitionReview = item.review_level === "review" || item.review_level === "critical_review";
+  if (recognitionReview) fields.push("复核原因：识别结果已定位，建议人工复核");
+  const needsReview = item.needs_review || item.recognized_type === "unknown" || commands.length === 0 || item.mixed_structure || item.formatting_disposition === "review_only";
   fields.push(`识别状态：${needsReview ? "需要复核" : "可应用"}`, `识别置信度：${Math.round(item.confidence * 100)}%`);
   return [fields.slice(0, 5), fields.slice(5, 10), fields.slice(10)].filter((group) => group.length > 0).map((group) => group.join(" ")).join("\n");
 }
