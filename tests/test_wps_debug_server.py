@@ -88,6 +88,16 @@ def test_index_events_use_one_chinese_log_without_html(resource_server) -> None:
     assert all("/hot-update-inject.js" not in line for line in lines)
 
 
+def test_internal_probe_does_not_log_wps_page_request(resource_server) -> None:
+    server, _, log_path = resource_server
+    request = urllib.request.Request(url(server, "/index.html"), headers={"X-Docxtool-Probe": "1"})
+    with urllib.request.urlopen(request, timeout=2):
+        pass
+    lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+    assert not any("WPS 已请求插件主页面" in line for line in lines)
+    assert not any("插件主页面已原样返回" in line for line in lines)
+
+
 def test_probe_has_hard_index_byte_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repository = tmp_path / "repo"
     build_root = repository / "apps" / "classified-offline" / "dist"
@@ -134,7 +144,10 @@ def test_probe_has_hard_index_byte_gate(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(main, "fetch_resource", served)
     report = main.probe_debug_server()
     assert report["status"] == "PASS"
-    assert any(kwargs.get("component") == "debug_server" for _, kwargs in events)
+    assert events == []
+    main.log_index_verification(report)
+    assert len(events) == 1
+    assert events[0][1].get("component") == "debug_server"
 
     def served_mismatch(path: str) -> dict[str, object]:
         value = served(path)

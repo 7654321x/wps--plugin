@@ -50,6 +50,12 @@ CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
 BROKER_READY_TIMEOUT_SECONDS = 10.0
 BROKER_HEARTBEAT_MAX_AGE_SECONDS = 3.0
 PROCESS_METADATA_TIMEOUT_SECONDS = 2.0
+BROKER_SWITCH_ERROR_CODES = {
+    "LOCAL_JOB_BROKER_VERSION_MISMATCH",
+    "LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH",
+    "LOCAL_JOB_BROKER_RUNTIME_VERSION_MISMATCH",
+    "LOCAL_JOB_BROKER_RUNTIME_HASH_MISMATCH",
+}
 
 
 @dataclass(frozen=True)
@@ -742,23 +748,6 @@ def readiness_technical_detail(readiness: BrokerReadiness) -> str:
     return "；".join(f"{key}={value}" for key, value in readiness.details.items())
 
 
-def readiness_log_data(readiness: BrokerReadiness) -> Dict[str, object]:
-    data: Dict[str, object] = {
-        "stage_cn": "校验本地任务代理",
-        "reason_cn": readiness.reason_cn,
-        "action_cn": readiness.action_cn,
-        "stable_error_code": readiness.error_code or "",
-    }
-    technical_detail = readiness_technical_detail(readiness)
-    if technical_detail:
-        data["technical_detail"] = technical_detail
-    return data
-
-
-def readiness_fingerprint(readiness: BrokerReadiness) -> Tuple[Optional[str], str, str]:
-    return readiness.error_code, readiness.reason_cn, readiness.action_cn
-
-
 def step_failed_for_readiness(readiness: BrokerReadiness) -> StepFailed:
     error_code = readiness.error_code or "LOCAL_JOB_BROKER_READY_TIMEOUT"
     return StepFailed(
@@ -808,7 +797,9 @@ def ensure_job_broker() -> Dict[str, object]:
         JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
         log_event("INFO", "broker.reused", "本地任务代理已复用", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
         return status
+    previous_instance_id = status.get("broker_instance_id")
     stale_pid = status.get("pid")
+    switching_build = False
     if stale_pid:
         managed = managed_broker_process(stale_pid, executable, status.get("process_created_at"), current.get("broker_executable_path_hash"))
         if not managed and process_is_alive(stale_pid):
@@ -822,6 +813,14 @@ def ensure_job_broker() -> Dict[str, object]:
                 details={"pid": stale_pid, "expected_executable_name": executable.name},
             )
         if managed:
+            switching_build = initial_readiness.error_code in BROKER_SWITCH_ERROR_CODES
+            if switching_build:
+                log_event(
+                    "INFO",
+                    "broker.switch.start",
+                    "检测到本地任务代理仍在使用上一构建，正在切换到当前版本",
+                    {"stage_cn": "切换本地任务代理", "technical_detail": f"PID {stale_pid}"},
+                )
             subprocess.run(["pwsh", "-NoProfile", "-Command", "Stop-Process", "-Id", str(int(stale_pid))], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     creationflags = 0
     if sys.platform == "win32":
@@ -831,9 +830,9 @@ def ensure_job_broker() -> Dict[str, object]:
     JOB_BROKER_PROCESS.parent.mkdir(parents=True, exist_ok=True)
     JOB_BROKER_PROCESS.write_text(json.dumps({"pid": process.pid, "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": utc_now(), "process_created_at": ""}, ensure_ascii=False, indent=2), encoding="utf-8")
     deadline = time.monotonic() + BROKER_READY_TIMEOUT_SECONDS
-    last_readiness: Optional[BrokerReadiness] = None
-    last_fingerprint: Optional[Tuple[Optional[str], str, str]] = None
     identity_readiness: Optional[BrokerReadiness] = None
+    current_process_readiness: Optional[BrokerReadiness] = None
+    observed_status_pid: object = None
     while time.monotonic() < deadline:
         exit_code = process.poll()
         if exit_code is not None:
@@ -845,8 +844,16 @@ def ensure_job_broker() -> Dict[str, object]:
             )
             raise step_failed_for_readiness(readiness)
         status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
+        observed_status_pid = status.get("pid")
         if status_error:
             readiness = status_error
+        elif previous_instance_id and status.get("broker_instance_id") == previous_instance_id:
+            readiness = broker_failure(
+                "LOCAL_JOB_BROKER_INSTANCE_PENDING",
+                "正在等待当前 Broker 写入新的状态文件",
+                "等待当前 Broker 完成启动",
+                {"previous_instance_id": previous_instance_id, "actual_pid": status.get("pid")},
+            )
         else:
             quick = broker_quick_readiness(current, status)
             if quick.ready:
@@ -855,31 +862,32 @@ def ensure_job_broker() -> Dict[str, object]:
                 readiness = identity_readiness
             else:
                 readiness = quick
-        last_readiness = readiness
-        fingerprint = readiness_fingerprint(readiness)
+            current_process_readiness = readiness
         if readiness.ready:
             JOB_BROKER_PROCESS.write_text(json.dumps({"pid": status.get("pid"), "executable": str(executable), "runtime_version": current.get("runtime_version"), "runtime_sha256": current.get("executable_sha256"), "started_at": status.get("started_at", ""), "process_created_at": status.get("process_created_at", ""), "broker_instance_id": status.get("broker_instance_id", "")}, ensure_ascii=False, indent=2), encoding="utf-8")
-            log_event("INFO", "broker.ready", "本地任务代理已就绪", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
+            if switching_build:
+                log_event("INFO", "broker.switch.completed", "本地任务代理已切换到当前构建", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
+            else:
+                log_event("INFO", "broker.ready", "本地任务代理已就绪", {"result_cn": "成功", "technical_detail": f"PID {status.get('pid')}"})
             return status
-        if fingerprint != last_fingerprint:
-            log_event("WARN", "broker.readiness.waiting", "本地任务代理尚未就绪", readiness_log_data(readiness))
-            last_fingerprint = fingerprint
+        if current_process_readiness is not None:
+            raise step_failed_for_readiness(current_process_readiness)
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(0.1, remaining))
-    if last_readiness is not None:
-        raise step_failed_for_readiness(last_readiness)
     raise step_failed_for_readiness(broker_failure(
         "LOCAL_JOB_BROKER_READY_TIMEOUT",
-        "本地任务代理在规定时间内没有进入就绪状态",
-        "查看统一日志中的错误码并修复后重试",
+        "本地任务代理在规定时间内没有写入当前进程的就绪状态",
+        "查看统一日志中的 Broker 启动错误和退出状态后重试",
+        {"launcher_pid": process.pid, "observed_status_pid": observed_status_pid},
     ))
 
 
 def fetch_resource(relative: str) -> Dict[str, object]:
     url = f"http://127.0.0.1:{WPSJS_PORT}/{relative.lstrip('/')}"
     try:
-        with urllib.request.urlopen(url, timeout=3) as response:
+        request = urllib.request.Request(url, headers={"X-Docxtool-Probe": "1"})
+        with urllib.request.urlopen(request, timeout=3) as response:
             content = response.read()
             return {
                 "path": relative,
@@ -945,8 +953,15 @@ def probe_debug_server() -> Dict[str, object]:
         if resources.get(str(path), {}).get("sha256") != expected_hash: errors.append(f"ASSET_HASH_MISMATCH:{path}")
     report: Dict[str, object] = {"schema_version": 1, "expected_build_id": expected_build, "served_build_id": expected_build if not errors else "", "status": "PASS" if not errors else "FAIL", "errors": sorted(set(errors)), "build_root": "apps/classified-offline/dist", "resources": [{key: value for key, value in item.items() if key not in ("text", "content")} for item in resources.values()]}
     RESOURCE_PROBE.parent.mkdir(parents=True, exist_ok=True); RESOURCE_PROBE.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    index_report = resources["index.html"]
-    if "WPS_INDEX_RESPONSE_MISMATCH" in report["errors"]:
+    return report
+
+
+def log_index_verification(report: Dict[str, object]) -> None:
+    build_index = ROOT / "apps" / "classified-offline" / "dist" / "index.html"
+    index_expected = build_index.read_bytes() if build_index.is_file() else b""
+    resources = report.get("resources", [])
+    index_report = next((item for item in resources if isinstance(item, dict) and item.get("path") == "index.html"), {})
+    if "WPS_INDEX_RESPONSE_MISMATCH" in report.get("errors", []):
         log_event(
             "ERROR",
             "wps.resource.index.verify.failed",
@@ -976,9 +991,6 @@ def probe_debug_server() -> Dict[str, object]:
             },
             component="debug_server",
         )
-    return report
-
-
 def write_process_metadata(process: subprocess.Popen[bytes], manifest: Dict[str, object], command: List[str]) -> None:
     WPSJS_PROCESS.parent.mkdir(parents=True, exist_ok=True)
     WPSJS_PROCESS.write_text(json.dumps({"pid": process.pid, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cwd": str(DEBUG_PACKAGE), "expected_build_id": manifest.get("build_id", ""), "port": WPSJS_PORT, "command": command}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1033,6 +1045,7 @@ def register_addin(*, force_restart: bool = False) -> None:
         if not force_restart and report.get("status") == "PASS" and managed_owner:
             metadata["expected_build_id"] = read_json(DEBUG_MANIFEST).get("build_id", "")
             WPSJS_PROCESS.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            log_index_verification(report)
             log_event("INFO", "debug_server.reused", "WPS 资源服务已验证并复用", {"result_cn": "成功"})
             return
         if managed_owner:
@@ -1087,6 +1100,7 @@ def register_addin(*, force_restart: bool = False) -> None:
     for _ in range(30):
         if is_port_open(WPSJS_PORT):
             report = probe_debug_server()
+            log_index_verification(report)
             if report.get("status") != "PASS":
                 raise StepFailed("验证 WPS 调试资源", "HTTP resource probe", ",".join(str(item) for item in report.get("errors", [])))
             update_server_owner_metadata()

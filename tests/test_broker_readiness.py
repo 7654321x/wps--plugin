@@ -171,7 +171,7 @@ def test_process_identity_returns_specific_error(
     assert readiness.error_code == error_code
 
 
-def test_start_wait_uses_real_ten_second_monotonic_budget_and_keeps_status_error(
+def test_start_wait_uses_real_ten_second_monotonic_budget_without_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -207,9 +207,9 @@ def test_start_wait_uses_real_ten_second_monotonic_budget_and_keeps_status_error
 
     with pytest.raises(main.StepFailed) as raised:
         main.ensure_job_broker()
-    assert raised.value.error_code == "LOCAL_JOB_BROKER_STATUS_MISSING"
+    assert raised.value.error_code == "LOCAL_JOB_BROKER_READY_TIMEOUT"
     assert clock[0] == pytest.approx(10.0, abs=0.11)
-    assert events.count(("WARN", "broker.readiness.waiting")) == 1
+    assert not any(level == "WARN" for level, _event in events)
 
 
 def test_start_wait_checks_process_identity_at_most_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -222,7 +222,7 @@ def test_start_wait_checks_process_identity_at_most_once(monkeypatch: pytest.Mon
     monkeypatch.setattr(main, "appdata_docxtool_root", lambda: appdata_root)
     monkeypatch.setattr(main, "JOB_BROKER_PROCESS", process_file)
     missing = main.broker_failure("LOCAL_JOB_BROKER_STATUS_MISSING", "状态文件尚未生成", "等待 Broker")
-    ready_status = broker_status()
+    ready_status = broker_status(pid=4322)
     reads = 0
 
     def read_status(_path: Path) -> tuple[dict[str, object], main.BrokerReadiness | None]:
@@ -256,6 +256,46 @@ def test_start_wait_checks_process_identity_at_most_once(monkeypatch: pytest.Mon
         main.ensure_job_broker()
     assert raised.value.error_code == "LOCAL_JOB_BROKER_PROCESS_METADATA_UNAVAILABLE"
     assert identity_calls == 1
+
+
+def test_known_previous_build_switches_with_info_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    executable = tmp_path / "docxtool-job-broker.exe"
+    executable.write_bytes(b"broker")
+    digest = hashlib.sha256(b"broker").hexdigest()
+    current = {**current_manifest(), "broker_executable_path": str(executable), "broker_sha256": digest}
+    old_status = broker_status(pid=4310, broker_executable_sha256="previous-build")
+    ready_status = broker_status(pid=4323, broker_instance_id="current-instance", broker_executable_sha256=digest)
+    reads = 0
+
+    def read_status(_path: Path) -> tuple[dict[str, object], main.BrokerReadiness | None]:
+        nonlocal reads
+        reads += 1
+        return (old_status, None) if reads == 1 else (ready_status, None)
+
+    monkeypatch.setattr(main, "broker_current", lambda: current)
+    monkeypatch.setattr(main, "appdata_docxtool_root", lambda: tmp_path / "Docxtool")
+    monkeypatch.setattr(main, "JOB_BROKER_PROCESS", tmp_path / "broker-process.json")
+    monkeypatch.setattr(main, "read_broker_status", read_status)
+    monkeypatch.setattr(main, "managed_broker_process", lambda *_args: True)
+    monkeypatch.setattr(main, "broker_process_readiness", lambda *_args: main.broker_ready())
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: None)
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(main, "log_event", lambda level, event, *_args, **_kwargs: events.append((level, event)))
+
+    class FakeProcess:
+        pid = 4323
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    result = main.ensure_job_broker()
+
+    assert result["pid"] == 4323
+    assert ("INFO", "broker.switch.start") in events
+    assert ("INFO", "broker.switch.completed") in events
+    assert not any(level == "WARN" for level, _event in events)
 
 
 def test_broker_startup_writes_lifecycle_events(tmp_path: Path) -> None:

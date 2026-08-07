@@ -127,6 +127,9 @@ class WpsDebugHandler(SimpleHTTPRequestHandler):
             "user_agent": _short_user_agent(self.headers.get("User-Agent", "")),
         }
 
+    def _is_internal_probe(self) -> bool:
+        return self.headers.get("X-Docxtool-Probe") == "1"
+
     def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib handler API
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -186,7 +189,7 @@ class WpsDebugHandler(SimpleHTTPRequestHandler):
             self._send_bytes(HTTPStatus.NOT_FOUND, b"WPS_RESOURCE_NOT_FOUND", "text/plain; charset=utf-8", send_body=send_body)
             return
 
-        if relative == "index.html":
+        if relative == "index.html" and not self._is_internal_probe():
             self._log("INFO", "wps.resource.index.requested", "WPS 已请求插件主页面", self._request_data(relative))
         try:
             body = file_path.read_bytes()
@@ -212,7 +215,7 @@ class WpsDebugHandler(SimpleHTTPRequestHandler):
             response_data["stable_error_code"] = "WPS_BUILD_ASSET_CHANGED"
             self._log("ERROR", "wps.resource.asset.changed", "当前构建资源在服务期间发生变化", response_data)
         self._send_bytes(HTTPStatus.OK, body, self._content_type(relative), send_body=send_body)
-        if relative == "index.html":
+        if relative == "index.html" and not self._is_internal_probe():
             self._log(
                 "INFO",
                 "wps.resource.index.served",

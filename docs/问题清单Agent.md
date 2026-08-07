@@ -552,3 +552,11 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：每次普通启动重建 runtime；只凭 PID、心跳或同名进程复用/结束服务；在身份不明时结束 3889 端口进程；静默吞掉 `taskkill` 的权限失败。
 - 正确方案：`start` 只在 `current.json` 与 runtime 构建清单的版本、合同、摘要和安装文件不一致时重建；显式 `prepare` 强制重建。PyInstaller 空路径场景必须同时校验状态路径哈希、同名直接父子树和创建时间；资源服务仅在端口监听者是启动器记录的直接子进程且父 PID/创建时间/启动命令均一致时停止。停止失败必须返回明确权限错误。
 - 自动验证门槛：匹配清单的 `start` 不执行 `build:local-runtime` 或 `install:local-runtime`；清单不一致时重建；空 WMI 路径的受信 Broker 子进程可复用；未知子进程不可复用；受管理资源服务的停止目标为记录父 PID；完整 `main.py --once` 记录 runtime/Broker 复用。真实 WPS 未重启前仍只能写 `NOT RUN`。
+
+## P065 Broker 版本切换与资源自检被误记为运行故障
+
+- 症状：已安装当前 runtime 后，启动日志先出现 `LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH` 警告，随后 Broker 正常就绪；同一次启动还会重复记录多条“插件首页响应与当前构建完全一致”。
+- 根因：新 Broker 启动等待期间仍读到旧进程残留的 `status.json`，启动器把预期的构建切换当成 readiness 故障；`probe_debug_server()` 在每次状态查询时自行记录成功，资源服务又把启动器自检请求当作真实 WPS 首页请求。
+- 禁止：放松安装文件与清单的 SHA-256 硬校验；新增猜测性的协议、能力或日志服务；把旧 PID、状态暂缺等预期启动过渡状态记录为警告；让只读 `status`/`diagnose` 探测产生成功日志。
+- 正确方案：安装文件摘要不一致继续立即失败；身份可信的旧 Broker 出现版本/runtime/构建摘要差异时记录一次 INFO 并切换。启动等待以现有 `broker_instance_id` 排除旧残留状态，再用 PID、创建时间和受信 PyInstaller 父子进程身份确认新实例，不能要求启动父 PID 与状态工作 PID 相等。首页探针保持字节、长度、Content-Type 和 SHA-256 严格校验，但校验函数只返回结果，由资源服务启动或复用边界记录一次；内部探针请求使用专用请求头，不冒充真实 WPS 加载。
+- 自动验证门槛：旧构建切换只产生 `broker.switch.start/completed` INFO 且无 readiness WARN；状态文件始终停留在旧 instance 时以 `LOCAL_JOB_BROKER_READY_TIMEOUT` 终止；PyInstaller 新工作 PID 可经身份校验就绪；安装 Broker 摘要不一致仍硬失败；首页探针本身零日志，状态边界只记一次成功；真实无探针请求头的首页请求仍记录 requested/served，响应字节严格一致。
