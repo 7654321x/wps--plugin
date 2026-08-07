@@ -423,3 +423,19 @@ def test_status_is_emitted_as_one_grouped_multiline_event(monkeypatch: pytest.Mo
     assert any("产品 v1.5.7；提交 abc1234" in line for line in lines)
     assert any("本地识别：组件已安装" in line for line in lines)
     assert any("统一日志：wps-plugin.log" in line for line in lines)
+
+
+def test_wps_load_completion_is_emitted_once_after_all_required_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = [{"event": event, "build_id": "build-1"} for event in main.WPS_LOAD_REQUIRED_EVENTS]
+    monkeypatch.setattr(main, "_wps_load_completion_logged", False)
+    monkeypatch.setattr(main, "read_json", lambda _path: {"build_id": "build-1"})
+    logged: list[tuple[str, str, str, dict[str, object]]] = []
+    monkeypatch.setattr(main, "log_event", lambda level, event, message, data=None, *_args, **_kwargs: logged.append((level, event, message, data or {})))
+
+    assert main.maybe_log_wps_load_completed(events[:-1]) is False
+    assert logged == []
+    assert main.maybe_log_wps_load_completed(events) is True
+    assert main.maybe_log_wps_load_completed(events) is True
+    assert len(logged) == 1
+    assert logged[0][:3] == ("INFO", "wps.load.completed", "WPS 加载完成")
+    assert logged[0][3]["build_id"] == "build-1"

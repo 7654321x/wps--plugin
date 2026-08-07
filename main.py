@@ -50,6 +50,16 @@ CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
 BROKER_READY_TIMEOUT_SECONDS = 10.0
 BROKER_HEARTBEAT_MAX_AGE_SECONDS = 3.0
 PROCESS_METADATA_TIMEOUT_SECONDS = 2.0
+WPS_LOAD_REQUIRED_EVENTS = frozenset({
+    "wps.resource.index.served",
+    "bootstrap.probe.loaded",
+    "ribbon.script.loaded",
+    "host.module.loaded",
+    "application.install.success",
+    "ribbon.addin.load.success",
+    "pipeline.worker.probe.complete",
+})
+_wps_load_completion_logged = False
 BROKER_SWITCH_ERROR_CODES = {
     "LOCAL_JOB_BROKER_VERSION_MISMATCH",
     "LOCAL_JOB_BROKER_EXECUTABLE_HASH_MISMATCH",
@@ -171,7 +181,9 @@ def print_status(*, startup: bool = False, watch_logs: bool = False) -> None:
     output = run_command("pwsh -NoProfile -File scripts/local-direct.ps1 status", timeout=60)
     values = parse_status(output)
     server_ready = is_port_open(WPSJS_PORT) and probe_debug_server().get("status") == "PASS"
-    event_names = [str(item.get("event", "")) for item in diagnostic_events()]
+    events = diagnostic_events()
+    maybe_log_wps_load_completed(events)
+    event_names = [str(item.get("event", "")) for item in events]
     page_loaded = plugin_page_loaded(event_names)
     current = broker_current()
     status, status_error = read_broker_status(appdata_docxtool_root() / "broker" / "status.json")
@@ -1120,6 +1132,29 @@ def diagnostic_events() -> List[Dict[str, object]]:
     return [item for item in events if not current_build or not item.get("build_id") or item.get("build_id") == current_build]
 
 
+def maybe_log_wps_load_completed(events: Optional[List[Dict[str, object]]] = None) -> bool:
+    global _wps_load_completion_logged
+    if _wps_load_completion_logged:
+        return True
+    values = events if events is not None else diagnostic_events()
+    names = {str(item.get("event", "")) for item in values}
+    if not WPS_LOAD_REQUIRED_EVENTS.issubset(names):
+        return False
+    if any(str(item.get("event", "")) == "wps.load.completed" for item in values):
+        _wps_load_completion_logged = True
+        return True
+    build_id = str(read_json(DEBUG_MANIFEST).get("build_id", ""))
+    log_event(
+        "INFO",
+        "wps.load.completed",
+        "WPS 加载完成",
+        {"result_cn": "成功", "build_id": build_id, "summary_lines": ["主页面、Ribbon、Host Runtime、应用运行时和 Worker 探针均已就绪"]},
+        component="main",
+    )
+    _wps_load_completion_logged = True
+    return True
+
+
 def plugin_page_loaded(event_names: List[str]) -> bool:
     return any(name in event_names for name in ("bootstrap.probe.loaded", "ribbon.script.loaded", "host.module.loaded"))
 
@@ -1193,6 +1228,7 @@ def watch_wps_log(*, announce: bool = True) -> None:
                         last_fingerprint = fingerprint
                         print(rendered, flush=True)
                     positions[path] = handle.tell()
+            maybe_log_wps_load_completed()
             time.sleep(0.5)
     except KeyboardInterrupt:
         if suppressed_repeats:
