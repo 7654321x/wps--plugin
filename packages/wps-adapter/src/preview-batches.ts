@@ -1,5 +1,6 @@
 import type { JsonValue } from "../../threading/src/protocol.js";
 import type { PreviewPlanItem } from "./preview-comments.js";
+import type { DiagnosticReporter } from "../../diagnostics/src/index.js";
 import { rawSliceUtf16, stripWpsImplicitParagraphTerminator } from "./host-text.js";
 
 type WpsObject = Record<string, any>;
@@ -33,7 +34,11 @@ function fingerprint(comments: WpsObject, excluded = new Set<WpsObject>()): stri
 
 export class WpsPreviewBatchService {
   private active: PreviewSession | null = null;
-  constructor(private readonly application: WpsObject) {}
+  constructor(private readonly application: WpsObject, private readonly diagnostics?: DiagnosticReporter) {}
+
+  private log(level: "DEBUG" | "INFO" | "ERROR", event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
+    this.diagnostics?.writeForComponent("wps-preview-batch", level, event, message, data, error);
+  }
 
   async apply(documentToken: string, sessionId: string, items: PreviewPlanItem[]): Promise<JsonValue> {
     if (!Array.isArray(items) || items.length < 1 || items.length > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
@@ -72,11 +77,29 @@ export class WpsPreviewBatchService {
     if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
     const session = this.active;
     if (!session) return { session_id: "", deleted_count: 0, remaining: 0, user_comment_integrity: true };
-    if (session.document_token !== documentToken) throw new Error("DOCUMENT_CHANGED");
-    const document = this.application.ActiveDocument as WpsObject; const comments = document.Comments as WpsObject;
+    const document = this.application.ActiveDocument as WpsObject | undefined;
+    const comments = document?.Comments as WpsObject | undefined;
+    const commentsBefore = Number(comments?.Count ?? 0);
+    this.log("INFO", "preview.cleanup.batch.start", "开始清理 Worker 预览批注批次", { batch_size: batchSize, comments_before_count: commentsBefore, preview_session_suffix: session.session_id.slice(-12), session_document_token_suffix: session.document_token.slice(-12), request_document_token_suffix: documentToken.slice(-12), created_preview_count: session.created.length });
+    if (session.document_token !== documentToken) {
+      this.log("ERROR", "preview.cleanup.batch.failed", "预览批注清理拒绝跨文档操作", { stable_error_code: "DOCUMENT_CHANGED", comments_before_count: commentsBefore, preview_session_suffix: session.session_id.slice(-12), session_document_token_suffix: session.document_token.slice(-12), request_document_token_suffix: documentToken.slice(-12), created_preview_count: session.created.length });
+      throw new Error("DOCUMENT_CHANGED");
+    }
+    if (!document || !comments) throw new Error("COMMENT_PREVIEW_UNSUPPORTED");
     let deleted = 0;
-    while (session.created.length && deleted < batchSize) { const comment = session.created.pop()!; try { comment.Delete(); } catch { throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED"); } deleted += 1; }
+    while (session.created.length && deleted < batchSize) {
+      const comment = session.created.pop()!;
+      try { comment.Delete(); }
+      catch (error) {
+        this.log("ERROR", "preview.cleanup.batch.failed", "删除 Worker 预览批注失败", { stable_error_code: "PREVIEW_COMMENT_CLEANUP_FAILED", comments_before_count: commentsBefore, comments_current_count: Number(comments.Count ?? 0), deleted_count: deleted, remaining_preview_count: session.created.length, preview_session_suffix: session.session_id.slice(-12) }, error);
+        throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED", { cause: error });
+      }
+      deleted += 1;
+    }
     const remaining = session.created.length; const integrity = fingerprint(comments, new Set(session.created)) === session.user_fingerprint;
+    const commentsCurrent = Number(comments.Count ?? 0);
+    this.log(integrity ? "DEBUG" : "ERROR", integrity ? "preview.cleanup.batch.completed" : "preview.cleanup.batch.failed", integrity ? "Worker 预览批注批次清理完成" : "用户批注完整性校验失败", { stable_error_code: integrity ? "" : "PREVIEW_USER_COMMENT_CHANGED", comments_before_count: commentsBefore, comments_current_count: commentsCurrent, deleted_count: deleted, remaining_preview_count: remaining, expected_user_fingerprint_present: Boolean(session.user_fingerprint), user_comment_integrity: integrity, preview_session_suffix: session.session_id.slice(-12) });
+    if (!integrity) throw new Error("PREVIEW_USER_COMMENT_CHANGED");
     if (remaining === 0) this.active = null;
     return { session_id: session.session_id, deleted_count: deleted, remaining, user_comment_integrity: integrity };
   }

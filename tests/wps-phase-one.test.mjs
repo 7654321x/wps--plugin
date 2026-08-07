@@ -966,6 +966,8 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   application.ActiveDocument.FullName = "C:\\preview.docx";
   const cleared = await bridge.clearPreviewForCurrentDocument();
   assert.equal(cleared.deleted_count, 1); assert.equal(cleared.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
+  assert.equal(diagnostics.some((item) => item[2] === "preview.cleanup.batch.start"), true);
+  assert.equal(diagnostics.some((item) => item[2] === "preview.cleanup.batch.completed"), true);
   corruptSetRangeReadback = true;
   const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-2", items: plan } });
   assert.equal(mismatched.ok, false); assert.equal(mismatched.error.code, "HOST_RANGE_TEXT_MISMATCH");

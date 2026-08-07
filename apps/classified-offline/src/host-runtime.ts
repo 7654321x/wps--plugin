@@ -287,13 +287,25 @@ export class LocalApplicationRuntime {
   private async clearPreview(): Promise<string> { await this.composition().clearPreviewUseCase.execute(); await this.threadedPreviewCleanup?.(); this.store.update({ preview_comment_status: "预览批注已清除" }); return "预览批注已清除"; }
   private async format(_result: CommandResult): Promise<string> {
     const identity = await this.documentIdentity();
-    await this.threadedPreviewCleanup?.();
-    await saveActiveDocument(this.app, false, "before_format");
-    const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) });
-    await saveActiveDocument(this.app, true, "after_format");
-    const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`;
-    this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "无 Docxtool 预览批注", active_view: "execution" });
-    return summary;
+    let phase = "preview_cleanup";
+    hostLog("INFO", "format.lifecycle.start", "一键排版保存生命周期开始", { phase, document_identity_hash: identity });
+    try {
+      await this.threadedPreviewCleanup?.();
+      phase = "save_before_format";
+      await saveActiveDocument(this.app, false, "before_format");
+      phase = "format_use_case";
+      hostLog("INFO", "format.use_case.start", "开始执行正式排版用例", { phase });
+      const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) });
+      phase = "save_after_format";
+      await saveActiveDocument(this.app, true, "after_format");
+      const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`;
+      hostLog("INFO", "format.lifecycle.completed", "一键排版保存生命周期完成", { phase, executed_command_count: value.executed_command_ids.length, skipped_command_count: value.skipped_command_ids.length });
+      this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "无 Docxtool 预览批注", active_view: "execution" });
+      return summary;
+    } catch (error) {
+      hostLog("ERROR", "format.lifecycle.failed", "一键排版保存生命周期失败", { phase, stable_error_code: stableError(error), document_identity_hash: identity }, error);
+      throw error;
+    }
   }
   private async health(): Promise<string> {
     const state = this.store.read();

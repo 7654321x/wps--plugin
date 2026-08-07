@@ -47,17 +47,26 @@ export class WpsHostBridge {
   private readonly previewBatches: WpsPreviewBatchService;
   constructor(private readonly application: WpsObject, private readonly diagnostics?: DiagnosticReporter, private readonly options: WpsHostBridgeOptions = {}) {
     this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics, { statusPath: options.brokerStatusPath, jobsPath: options.brokerJobsPath, runtimeVersion: options.brokerRuntimeVersion, runtimeSha256: options.brokerRuntimeSha256, contractVersion: options.recognitionContractVersion, queueContractVersion: options.brokerQueueContractVersion, brokerVersion: options.brokerVersion, brokerExecutablePathHash: options.brokerExecutablePathHash, brokerExecutableSha256: options.brokerExecutableSha256 }) : null;
-    this.previewBatches = new WpsPreviewBatchService(application);
+    this.previewBatches = new WpsPreviewBatchService(application, diagnostics);
   }
 
   async clearPreviewForCurrentDocument(): Promise<{ deleted_count: number; user_comment_integrity: true }> {
+    this.diagnostics?.writeForComponent("wps-host-bridge", "INFO", "preview.cleanup.start", "开始清理当前文档的 Worker 预览批注", {});
     const descriptor = await this.captureDocumentDescriptor();
     let deleted = 0;
-    for (;;) {
-      const result = this.previewBatches.clear(descriptor.document_token, HOST_PREVIEW_BATCH_LIMIT) as { deleted_count?: number; remaining?: number; user_comment_integrity?: boolean };
-      if (result.user_comment_integrity === false) throw new Error("PREVIEW_USER_COMMENT_CHANGED");
-      deleted += Number(result.deleted_count ?? 0);
-      if (Number(result.remaining ?? 0) === 0) return { deleted_count: deleted, user_comment_integrity: true };
+    try {
+      for (;;) {
+        const result = this.previewBatches.clear(descriptor.document_token, HOST_PREVIEW_BATCH_LIMIT) as { deleted_count?: number; remaining?: number; user_comment_integrity?: boolean };
+        if (result.user_comment_integrity === false) throw new Error("PREVIEW_USER_COMMENT_CHANGED");
+        deleted += Number(result.deleted_count ?? 0);
+        if (Number(result.remaining ?? 0) === 0) {
+          this.diagnostics?.writeForComponent("wps-host-bridge", "INFO", "preview.cleanup.completed", "当前文档的 Worker 预览批注已清理", { deleted_count: deleted, user_comment_integrity: true, document_token_suffix: descriptor.document_token.slice(-12) });
+          return { deleted_count: deleted, user_comment_integrity: true };
+        }
+      }
+    } catch (error) {
+      this.diagnostics?.writeForComponent("wps-host-bridge", "ERROR", "preview.cleanup.failed", "当前文档的 Worker 预览批注清理失败", { stable_error_code: error instanceof Error ? error.message : "PREVIEW_CLEANUP_FAILED", deleted_count: deleted, document_token_suffix: descriptor.document_token.slice(-12) }, error);
+      throw error;
     }
   }
 
