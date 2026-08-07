@@ -469,9 +469,9 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 
 - 症状：单一 `threadedPreviewEnabled` 布尔值无法区分关闭、只诊断识别和允许正式批注预览的风险等级。
 - 根因：识别链稳定性验收与正式 WPS 文档写入被同一个开关绑定，容易在真实证据不足时误开启 Preview Batch。
-- 禁止：全局硬编码 `true`；诊断失败回退旧同步预览；diagnostic 模式写批注或格式；未完成真实 20/200/1000 识别就开启 enabled。
-- 正确方案：`disabled` 拒绝线程识别，`diagnostic` 只跑 Worker snapshot/Broker recognition 与 blocks/binding 校验，`enabled` 才调用现有 Preview Batch；任何模式都不回退同步旧链。v1.3.2 默认保持 `diagnostic` + `threadedPreviewEnabled=false`。
-- 自动验证门槛：Node 测试覆盖三态、diagnostic 零写入、enabled 走 Preview Batch 和无同步 fallback；真实 WPS 20/200/1000 证据完成前 Looper 状态必须保持 `READY_FOR_REAL_WPS_VALIDATION`。
+- 禁止：诊断失败回退旧同步预览；diagnostic 模式写批注或格式；按钮名称为“预览排版”却默认只执行不写入的诊断任务；未经明确功能需求擅自改变三态语义。
+- 正确方案：`disabled` 拒绝线程识别，`diagnostic` 只跑 Worker snapshot/Broker recognition 与 blocks/binding 校验，`enabled` 调用现有 Preview Batch 写入临时批注；任何模式都不回退同步旧链。v1.5.6 根据用户明确要求将产品默认改为 `enabled`，诊断能力仍通过显式 diagnostic 命令保留。
+- 自动验证门槛：Node 测试覆盖三态、diagnostic 零写入、enabled 走 Preview Batch 和无同步 fallback；产品配置断言为 `threadedPreviewMode="enabled"`；真实 WPS 必须出现 `pipeline.preview.complete` 和大于 0 的批注数，保存后 OOXML 验收完成前不得写完整 PASS。
 
 ## P055 Worker 清理终态任务与 Broker reap 存在竞态
 

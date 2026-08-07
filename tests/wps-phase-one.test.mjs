@@ -1328,7 +1328,8 @@ test("local recognition runtime build collects the installed docxtool resources"
   const script = await readFile(new URL("../scripts/build-local-recognition-runtime.ps1", import.meta.url), "utf8");
   const config = await readFile(new URL("../apps/classified-offline/ui/local-runtime-config.js", import.meta.url), "utf8");
   assert.match(script, /--collect-data\s+"docxtool"/);
-  assert.match(config, /threadedPreviewEnabled:\s*false/);
+  assert.match(config, /threadedPreviewEnabled:\s*true/);
+  assert.match(config, /threadedPreviewMode:\s*"enabled"/);
 });
 
 test("canonical entry loads the runtime config, probe, ribbon and classic host emitted by the build", async () => {
