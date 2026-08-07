@@ -6,9 +6,12 @@ import { WpsLocalFileSystem } from "./local-filesystem.js";
 import { WpsRecognitionJobService } from "./recognition-jobs.js";
 import { HOST_PREVIEW_BATCH_LIMIT, WpsPreviewBatchService } from "./preview-batches.js";
 import type { PreviewPlanItem } from "./preview-comments.js";
+import { assertFormattingCommandSet, type FormattingCommandSet } from "../../contracts/src/index.js";
+import { WpsApiDocumentExecutor, WpsCapabilityProvider, WpsTransactionManager } from "./official-host.js";
 
 type WpsObject = Record<string, any>;
 export const HOST_PARAGRAPH_BATCH_LIMIT = 10;
+export const HOST_FORMAT_BATCH_LIMIT = 12;
 export interface WpsHostBridgeOptions {
   recognitionExecutablePath?: string;
   recognitionContractVersion?: number;
@@ -45,6 +48,9 @@ export class WpsHostBridge {
   private descriptorIdentity: { document_token: string; full_name: string; paragraph_count: number; section_count: number } | null = null;
   private readonly recognitionJobs: WpsRecognitionJobService | null;
   private readonly previewBatches: WpsPreviewBatchService;
+  private readonly formatTransactions = new WpsTransactionManager();
+  private readonly formatExecutor = new WpsApiDocumentExecutor(undefined, new WpsCapabilityProvider(), undefined, this.formatTransactions, { yieldEvery: HOST_FORMAT_BATCH_LIMIT });
+  private activeFormat: { job_id: string; document_token: string; transaction_id: string; executed_count: number } | null = null;
   constructor(private readonly application: WpsObject, private readonly diagnostics?: DiagnosticReporter, private readonly options: WpsHostBridgeOptions = {}) {
     this.recognitionJobs = options.recognitionExecutablePath ? new WpsRecognitionJobService(application, options.recognitionExecutablePath, options.maxRecognitionResultBytes, diagnostics, { statusPath: options.brokerStatusPath, jobsPath: options.brokerJobsPath, runtimeVersion: options.brokerRuntimeVersion, runtimeSha256: options.brokerRuntimeSha256, contractVersion: options.recognitionContractVersion, queueContractVersion: options.brokerQueueContractVersion, brokerVersion: options.brokerVersion, brokerExecutablePathHash: options.brokerExecutablePathHash, brokerExecutableSha256: options.brokerExecutableSha256 }) : null;
     this.previewBatches = new WpsPreviewBatchService(application, diagnostics);
@@ -100,6 +106,10 @@ export class WpsHostBridge {
     if (request.operation === "host.cancel_recognition") return this.cancelRecognition(request);
     if (request.operation === "host.apply_preview_batch") return this.applyPreviewBatch(request);
     if (request.operation === "host.clear_preview_batch") return this.clearPreviewBatch(request);
+    if (request.operation === "host.begin_transaction") return this.beginFormatTransaction(request);
+    if (request.operation === "host.apply_format_batch") return this.applyFormatBatch(request);
+    if (request.operation === "host.rollback_batch") return this.rollbackFormatTransaction(request);
+    if (request.operation === "host.commit_transaction") return this.commitFormatTransaction(request);
     throw new Error("HOST_RPC_NOT_IMPLEMENTED");
   }
 
@@ -215,5 +225,47 @@ export class WpsHostBridge {
   private clearPreviewBatch(request: WorkerHostRequest): JsonValue {
     this.validateDocumentToken(request.document_token);
     return this.previewBatches.clear(String(request.document_token ?? ""), Number(request.payload.batch_size));
+  }
+
+  private beginFormatTransaction(request: WorkerHostRequest): JsonValue {
+    this.validateDocumentToken(request.document_token);
+    if (this.activeFormat) throw new Error("FORMAT_TRANSACTION_BUSY");
+    const transactionId = this.formatTransactions.begin();
+    this.activeFormat = { job_id: request.job_id, document_token: String(request.document_token), transaction_id: transactionId, executed_count: 0 };
+    return { transaction_id: transactionId };
+  }
+
+  private async applyFormatBatch(request: WorkerHostRequest): Promise<JsonValue> {
+    this.validateDocumentToken(request.document_token);
+    const active = this.activeFormat;
+    const commandSet = request.payload.command_set as unknown as FormattingCommandSet;
+    if (!active || active.job_id !== request.job_id || active.document_token !== request.document_token || active.transaction_id !== request.payload.transaction_id) throw new Error("FORMAT_TRANSACTION_MISMATCH");
+    assertFormattingCommandSet(commandSet, commandSet.request_id);
+    if (commandSet.commands.length < 1 || commandSet.commands.length > HOST_FORMAT_BATCH_LIMIT) throw new Error("HOST_FORMAT_BATCH_INVALID");
+    const result = await this.formatExecutor.execute(commandSet, active.transaction_id, String(request.payload.document_revision ?? ""));
+    if (result.failed_command_id || result.rolled_back) {
+      this.activeFormat = null;
+      throw new Error(result.warnings[0] ?? "WPS_API_EXECUTION_FAILED");
+    }
+    active.executed_count += result.executed_command_ids.length;
+    return { executed_count: result.executed_command_ids.length, total_executed_count: active.executed_count };
+  }
+
+  private rollbackFormatTransaction(request: WorkerHostRequest): JsonValue {
+    const active = this.activeFormat;
+    if (!active || active.job_id !== request.job_id || active.transaction_id !== request.payload.transaction_id) return { rolled_back: false };
+    const rolledBack = this.formatTransactions.rollback(active.transaction_id) && this.formatTransactions.verifyRollback(active.transaction_id);
+    this.activeFormat = null;
+    return { rolled_back: rolledBack };
+  }
+
+  private commitFormatTransaction(request: WorkerHostRequest): JsonValue {
+    this.validateDocumentToken(request.document_token);
+    const active = this.activeFormat;
+    if (!active || active.job_id !== request.job_id || active.document_token !== request.document_token || active.transaction_id !== request.payload.transaction_id) throw new Error("FORMAT_TRANSACTION_MISMATCH");
+    this.formatTransactions.commit(active.transaction_id);
+    const executedCount = active.executed_count;
+    this.activeFormat = null;
+    return { committed: true, executed_count: executedCount };
   }
 }

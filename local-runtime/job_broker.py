@@ -72,6 +72,10 @@ def read_json(path: Path) -> Dict[str, Any]:
     return value
 
 
+def canonical_path(value: str | Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -191,6 +195,7 @@ class JobBroker:
         self.executable_path = (config.broker_executable_path or Path(sys.executable)).resolve()
         self.last_job_id = ""
         self.last_error_code = ""
+        self.last_error_detail = ""
         self.active_job_id: Optional[str] = None
         self.active_process: Optional[subprocess.Popen] = None
         self.last_heartbeat = 0.0
@@ -460,9 +465,17 @@ class JobBroker:
             raise ValueError("LOCAL_JOB_BROKER_RUNTIME_MISMATCH")
 
     def _validate_request(self, job_id: str, job_dir: Path, request: Dict[str, Any]) -> None:
+        self.last_error_detail = ""
         if request.get("schema_version") != SCHEMA_VERSION or request.get("request_id") != job_id:
             raise ValueError("LOCAL_JOB_REQUEST_INVALID")
-        if request.get("result_path") != str(job_dir / "result.json") or request.get("error_path") != str(job_dir / "error.json"):
+        result_path = request.get("result_path")
+        error_path = request.get("error_path")
+        if not isinstance(result_path, str) or not isinstance(error_path, str):
+            raise ValueError("LOCAL_JOB_REQUEST_PATH_INVALID")
+        result_matches = canonical_path(result_path) == canonical_path(job_dir / "result.json")
+        error_matches = canonical_path(error_path) == canonical_path(job_dir / "error.json")
+        if not result_matches or not error_matches:
+            self.last_error_detail = f"result_path_match={str(result_matches).lower()}; error_path_match={str(error_matches).lower()}"
             raise ValueError("LOCAL_JOB_REQUEST_PATH_INVALID")
         if not isinstance(request.get("source_path"), str) or not request["source_path"]:
             raise ValueError("LOCAL_JOB_REQUEST_INVALID")
@@ -577,13 +590,13 @@ class JobBroker:
             elif (job_dir / "error.json").exists():
                 atomic_write_json(job_dir / "finished.json", {"schema_version": SCHEMA_VERSION, "job_id": job_id, "finished_at": utc_now(), "state": "failed"})
             else:
-                payload = {"schema_version": SCHEMA_VERSION, "request_id": job_id, "error_code": code, "error_type": type(error).__name__ if error else "BrokerError"}
+                payload = {"schema_version": SCHEMA_VERSION, "request_id": job_id, "error_code": code, "error_type": type(error).__name__ if error else "BrokerError", **({"technical_detail": self.last_error_detail} if self.last_error_detail else {})}
                 atomic_write_json(job_dir / "error.json", payload)
                 atomic_write_json(job_dir / "finished.json", {"schema_version": SCHEMA_VERSION, "job_id": job_id, "finished_at": utc_now(), "state": "failed"})
         except OSError:
             pass
         self._release_claim_lock(job_dir)
-        self._log("任务失败", job_id, code)
+        self._log("任务失败", job_id, code, self.last_error_detail)
 
     def _stop_active(self) -> None:
         if self.active_process is not None and self.active_process.poll() is None:
@@ -628,7 +641,7 @@ class JobBroker:
             "data": data,
         }])
 
-    def _log(self, message: str, job_id: str, code: str = "") -> None:
+    def _log(self, message: str, job_id: str, code: str = "", technical_detail: str = "") -> None:
         if self.log_writer is None:
             return
         event_codes = {
@@ -646,7 +659,7 @@ class JobBroker:
             "component": "broker",
             "event": event_codes.get(message, "broker.event"),
             "message": message,
-            "data": {"request_id": job_id[:8], "stable_error_code": code},
+            "data": {"request_id": job_id[:8], "stable_error_code": code, **({"technical_detail": technical_detail} if technical_detail else {})},
         }])
 
 

@@ -1,10 +1,10 @@
-import { ClearFormattingPreviewUseCase, FormatDocumentUseCase, PreviewDocumentUseCase, RecognizeDocumentUseCase } from "../../../packages/application/src/format-document-usecase.js";
+import { ClearFormattingPreviewUseCase, PreviewDocumentUseCase, RecognizeDocumentUseCase } from "../../../packages/application/src/format-document-usecase.js";
 import { LocalProcessRecognitionTransport, LocalWheelRecognitionProvider, type WpsApplicationLike } from "../../../packages/recognition-client/src/index.js";
 import { LocalFormatCommandGenerator, type LocalFormatProfile } from "../../../packages/local-format-engine/src/index.js";
 import { CommandValidator } from "../../../packages/security/src/index.js";
 import { NoOpTelemetry } from "../../../packages/diagnostics/src/index.js";
 import type { DiagnosticReporter } from "../../../packages/diagnostics/src/index.js";
-import { WpsApiDocumentExecutor, WpsCapabilityProvider, WpsDocumentReader, WpsFontCapabilityProvider, WpsPreviewCommentService, WpsTransactionManager } from "../../../packages/wps-adapter/src/index.js";
+import { WpsCapabilityProvider, WpsDocumentReader, WpsFontCapabilityProvider, WpsPreviewCommentService } from "../../../packages/wps-adapter/src/index.js";
 import type { PreviewMutationTracker } from "../../../packages/application/src/ports.js";
 
 export interface ClassifiedRuntimeConfig {
@@ -65,9 +65,7 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
   );
   const commands = new LocalFormatCommandGenerator(readDefaultProfile());
   const validator = new CommandValidator();
-  const transaction = new WpsTransactionManager();
   const capability = new WpsCapabilityProvider();
-  const executor = new WpsApiDocumentExecutor(undefined, capability, undefined, transaction, { yieldEvery: 15 });
   const fonts = new WpsFontCapabilityProvider();
   const license = new OfflineLicenseProvider();
   let preview: PreviewMutationTracker | null = null;
@@ -79,7 +77,6 @@ export function createClassifiedProductionComposition(config: ClassifiedRuntimeC
     recognizeUseCase: new RecognizeDocumentUseCase(reader, recognition),
     previewUseCase: new PreviewDocumentUseCase(reader, recognition, commands, validator, capability, license, fonts, previewComments, tracker),
     clearPreviewUseCase: new ClearFormattingPreviewUseCase(previewComments, tracker),
-    formatUseCase: new FormatDocumentUseCase(reader, recognition, commands, validator, executor, transaction, capability, license, fonts),
   };
 }
 

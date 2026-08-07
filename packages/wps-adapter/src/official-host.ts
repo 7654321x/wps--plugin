@@ -49,15 +49,6 @@ function sectionTarget(args: SetPageSetupArguments, setup: WpsObject): { width: 
   return { width: value(args.page_height_cm), height: value(args.page_width_cm), top: value(args.margin_left_cm), bottom: value(args.margin_right_cm), left: value(args.margin_bottom_cm), right: value(args.margin_top_cm) };
 }
 
-async function activeRevision(): Promise<string> {
-  const document = app().ActiveDocument as WpsObject | undefined;
-  if (!document) throw new Error("NO_ACTIVE_DOCUMENT");
-  const count = Number(document.Paragraphs?.Count ?? 0);
-  const text: string[] = [];
-  for (let index = 0; index < count; index += 1) text.push(normalizeText(paragraphAt(document, index).Range.Text));
-  const sourceSha256 = await sha256(text.join("\u001f"));
-  return sourceSha256 + ":" + count;
-}
 function property(value: unknown): string { return value === undefined || value === null ? "" : String(value); }
 async function formattingRevision(document: WpsObject, count: number, diagnostics?: DiagnosticReporter): Promise<string> {
   const started = Date.now();
@@ -246,11 +237,24 @@ export class WpsTargetLocator {
     const fragment = rawSliceUtf16(rawText, target.host_raw_start_utf16, target.host_raw_end_utf16);
     if (fragment === null) throw new Error("HOST_RANGE_OUT_OF_BOUNDS");
     if (await sha256(fragment) !== target.text_sha256) throw new Error("HOST_RANGE_HASH_MISMATCH");
-    const paragraphStart = Number(selected.Range.Start);
-    const start = paragraphStart + target.host_raw_start_utf16;
-    const end = paragraphStart + target.host_raw_end_utf16;
-    if (!Number.isFinite(paragraphStart) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("HOST_RANGE_OUT_OF_BOUNDS");
-    const range = document.Range(start, end) as WpsObject;
+    const paragraphRange = selected.Range as WpsObject;
+    const characters = paragraphRange.Characters as WpsObject | undefined;
+    if (!characters || typeof characters.Item !== "function") throw new Error("HOST_RANGE_CHARACTERS_UNSUPPORTED");
+    const characterOrdinal = (offset: number): number => {
+      let position = 0; let ordinal = 0;
+      for (const character of rawText) { if (position === offset) return ordinal; position += character.length; ordinal += 1; }
+      if (position === offset) return ordinal;
+      throw new Error("HOST_RANGE_UTF16_BOUNDARY_INVALID");
+    };
+    const firstOrdinal = characterOrdinal(target.host_raw_start_utf16);
+    const lastOrdinal = characterOrdinal(target.host_raw_end_utf16);
+    const firstCharacter = characters.Item(firstOrdinal + 1) as WpsObject | undefined;
+    const lastCharacter = characters.Item(lastOrdinal) as WpsObject | undefined;
+    if (!firstCharacter || !lastCharacter || typeof firstCharacter.SetRange !== "function") throw new Error("HOST_RANGE_CHARACTER_BOUNDARY_INVALID");
+    const start = Number(firstCharacter.Start); const end = Number(lastCharacter.End);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("HOST_RANGE_OUT_OF_BOUNDS");
+    firstCharacter.SetRange(start, end);
+    const range = firstCharacter;
     const readback = normalizeText(range.Text);
     if (await sha256(readback) !== target.text_sha256) throw new Error("HOST_RANGE_TEXT_MISMATCH");
     return { paragraph: selected, range };
@@ -280,11 +284,9 @@ export class WpsApiDocumentExecutor implements DocumentExecutor {
     const executed: string[] = [];
     try {
       assertFormattingCommandSet(commandSet, commandSet.request_id);
-      if (await activeRevision() !== revision) throw new Error("DOCUMENT_CHANGED");
       const yieldEvery = Math.max(1, this.options.yieldEvery ?? 15);
       for (let index = 0; index < commandSet.commands.length; index += 1) {
         const command = commandSet.commands[index];
-        if ((index + 1) % yieldEvery === 0 && await activeRevision() !== revision) throw new Error("ACTIVE_DOCUMENT_CHANGED");
         if (!supported.has(command.required_capability)) throw new Error("CLIENT_CAPABILITY_MISSING");
         this.transaction.capture(transactionId, await this.apply(command));
         executed.push(command.command_id);

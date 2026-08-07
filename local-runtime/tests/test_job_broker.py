@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import job_broker
 
@@ -63,6 +65,22 @@ def test_atomic_write_and_uuid_validation(tmp_path):
     assert not target.with_name("status.json.tmp").exists()
     assert job_broker.safe_job_id("5f47f6a0-10c2-4ed0-a909-6a54e61a8db5")
     assert not job_broker.safe_job_id("../../bad")
+
+
+def test_request_paths_accept_equivalent_windows_spelling_and_reject_other_directory(tmp_path):
+    root = tmp_path / "Docxtool"
+    runtime_files(root)
+    job_id = "5f47f6a0-10c2-4ed0-a909-6a54e61a8db5"
+    job = enqueue(root, job_id)
+    request_path = job / "request.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["result_path"] = str(job / "." / "result.json")
+    request["error_path"] = str(job / "." / "error.json")
+    broker = job_broker.JobBroker(job_broker.BrokerConfig(root))
+    broker._validate_request(job_id, job, request)
+    request["result_path"] = str(root / "other" / "result.json")
+    with pytest.raises(ValueError, match="LOCAL_JOB_REQUEST_PATH_INVALID"):
+        broker._validate_request(job_id, job, request)
 
 
 def test_broker_claims_and_launches_one_job(tmp_path, monkeypatch):

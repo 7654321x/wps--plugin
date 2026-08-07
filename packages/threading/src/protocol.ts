@@ -131,7 +131,7 @@ export type PipelineWorkerEvent =
   | { type: "pipeline.ready"; build_id: string }
   | { type: "pipeline.progress"; job_id: string; build_id: string; stage: PipelineStage; completed: number; total: number; batch_size: number; detail: string }
   | { type: "pipeline.diagnostic"; job_id: string; build_id: string; event: string; data: { [key: string]: JsonValue } }
-  | { type: "pipeline.completed"; job_id: string; build_id: string; command: PipelineCommand; snapshot_summary: SnapshotSummary; recognition_result?: import("../../contracts/src/index.js").RecognitionResult; formatting_commands?: import("../../contracts/src/index.js").FormattingCommandSet; preview_result?: { session_id: string; comment_count: number; plan_count: number } }
+  | { type: "pipeline.completed"; job_id: string; build_id: string; command: PipelineCommand; snapshot_summary: SnapshotSummary; recognition_result?: import("../../contracts/src/index.js").RecognitionResult; formatting_commands?: import("../../contracts/src/index.js").FormattingCommandSet; preview_result?: { session_id: string; comment_count: number; plan_count: number }; format_result?: { executed_command_count: number; skipped_command_count: number; batch_count: number } }
   | { type: "pipeline.failed"; job_id: string; build_id: string; error: SerializedHostError }
   | { type: "pipeline.cancelled"; job_id: string; build_id: string };
 

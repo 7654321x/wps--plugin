@@ -8,7 +8,7 @@ import { createPreviewPlan, type PreviewPlanItem } from "../../../packages/wps-a
 import { LocalHttpControlTransport, StaticControlEndpointProvider, assertControlJobResult, type ControlJobRequest, type ControlJobResult } from "../../../packages/control-client/src/index.js";
 
 type WorkerScopeLike = { postMessage: (value: unknown) => void; onmessage: ((event: { data: unknown }) => void) | null };
-type SnapshotStage = "idle" | "capturing_descriptor" | "reading_paragraphs" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "generating_commands" | "writing_preview" | "completed" | "failed" | "cancelled";
+type SnapshotStage = "idle" | "capturing_descriptor" | "reading_paragraphs" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "generating_commands" | "validating_targets" | "writing_preview" | "applying_format" | "rolling_back" | "completed" | "failed" | "cancelled";
 interface SnapshotJobContext {
   job: PipelineJob; stage: SnapshotStage; cancelled: boolean; descriptor: DocumentDescriptor | null;
   paragraphs: HostParagraphData[]; started_at_ms: number; batch: AdaptiveBatchController; batch_sizes: number[];
@@ -16,6 +16,7 @@ interface SnapshotJobContext {
   recognition_job_id: string | null;
   control_job_id: string | null;
   preview_session_id: string | null;
+  format_transaction_id: string | null;
 }
 interface PendingRpc { resolve: (value: RpcResponse<JsonValue>) => void; reject: (error: Error) => void; job_id: string; started_at_ms: number; timer: ReturnType<typeof setTimeout>; }
 export interface SnapshotWorkerOptions { rpc_timeout_ms?: number; paragraph_rpc_timeout_ms?: number; }
@@ -121,9 +122,9 @@ export class SnapshotPipelineWorkerRuntime {
     try { job = parsePipelineJob(message.job); }
     catch { return; }
     if (job.build_id !== this.buildId) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUILD_MISMATCH", message: "PIPELINE_BUILD_MISMATCH" } }); return; }
-    if (!["snapshot_shadow", "diagnostic", "recognize", "preview"].includes(job.command)) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_COMMAND_NOT_IMPLEMENTED", message: "PIPELINE_COMMAND_NOT_IMPLEMENTED" } }); return; }
+    if (!["snapshot_shadow", "diagnostic", "recognize", "preview", "format"].includes(job.command)) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_COMMAND_NOT_IMPLEMENTED", message: "PIPELINE_COMMAND_NOT_IMPLEMENTED" } }); return; }
     if (this.active) { this.post({ type: "pipeline.failed", job_id: job.job_id, build_id: job.build_id, error: { code: "PIPELINE_BUSY", message: "PIPELINE_BUSY" } }); return; }
-    const context: SnapshotJobContext = { job, stage: "idle", cancelled: false, descriptor: null, paragraphs: [], started_at_ms: performance.now(), batch: new AdaptiveBatchController(), batch_sizes: [], host_rpc_durations: [], worker_roundtrip_durations: [], recognition_job_id: null, control_job_id: null, preview_session_id: null };
+    const context: SnapshotJobContext = { job, stage: "idle", cancelled: false, descriptor: null, paragraphs: [], started_at_ms: performance.now(), batch: new AdaptiveBatchController(), batch_sizes: [], host_rpc_durations: [], worker_roundtrip_durations: [], recognition_job_id: null, control_job_id: null, preview_session_id: null, format_transaction_id: null };
     this.active = context;
     void this.run(context);
   }
@@ -135,8 +136,8 @@ export class SnapshotPipelineWorkerRuntime {
       assertNotCancelled(context);
       const controlResult = context.job.command === "snapshot_shadow" ? null : await this.controlJob(context, built.snapshot);
       const recognition = context.job.command === "snapshot_shadow" ? undefined : (controlResult?.recognition_result as RecognitionResult | undefined) ?? await this.recognize(context, built.snapshot);
-      let commands: FormattingCommandSet | undefined; let previewResult: { session_id: string; comment_count: number; plan_count: number } | undefined;
-      if (context.job.command === "preview") {
+      let commands: FormattingCommandSet | undefined; let previewResult: { session_id: string; comment_count: number; plan_count: number } | undefined; let formatResult: { executed_command_count: number; skipped_command_count: number; batch_count: number } | undefined;
+      if (context.job.command === "preview" || context.job.command === "format") {
         if (!this.config) throw new Error("PIPELINE_WORKER_CONFIG_REQUIRED");
         context.stage = "generating_commands";
         if (controlResult) {
@@ -146,11 +147,16 @@ export class SnapshotPipelineWorkerRuntime {
           commands = await generateWorkerCommands(recognition!, context.job.job_id, this.config);
         }
         this.diagnostic(context, "pipeline.commands.complete", { command_count: commands.commands.length });
-        const plan = createPreviewPlan(built.snapshot, recognition!, commands, "all");
-        previewResult = await this.writePreview(context, plan);
+        if (context.job.command === "preview") {
+          const plan = createPreviewPlan(built.snapshot, recognition!, commands, "all");
+          previewResult = await this.writePreview(context, plan);
+        } else {
+          await this.verifySnapshot(context, built.snapshot);
+          formatResult = await this.applyFormat(context, built.snapshot, commands);
+        }
       }
       context.stage = "completed";
-      this.post({ type: "pipeline.completed", job_id: context.job.job_id, build_id: context.job.build_id, command: context.job.command, snapshot_summary: built.summary, ...(recognition ? { recognition_result: recognition } : {}), ...(commands ? { formatting_commands: commands } : {}), ...(previewResult ? { preview_result: previewResult } : {}) });
+      this.post({ type: "pipeline.completed", job_id: context.job.job_id, build_id: context.job.build_id, command: context.job.command, snapshot_summary: built.summary, ...(recognition ? { recognition_result: recognition } : {}), ...(commands ? { formatting_commands: commands } : {}), ...(previewResult ? { preview_result: previewResult } : {}), ...(formatResult ? { format_result: formatResult } : {}) });
     } catch (error) {
       const code = errorCode(error);
       if (context.preview_session_id) await this.clearPreview(context).catch(() => undefined);
@@ -280,6 +286,57 @@ export class SnapshotPipelineWorkerRuntime {
       intervalMs = Math.min(1_000, intervalMs + 100);
     }
     throw new Error("LOCAL_RECOGNITION_TIMEOUT");
+  }
+
+  private async verifySnapshot(context: SnapshotJobContext, expected: SerializableLocalDocumentSnapshot): Promise<void> {
+    context.stage = "validating_targets";
+    const descriptorResult = await this.rpc<DocumentDescriptor>(context, "host.capture_document_descriptor", {});
+    const descriptor = descriptorResult.value;
+    if (!context.descriptor || descriptor.document_token !== context.descriptor.document_token || descriptor.local_docx_path_hash !== expected.documentFullNameHash || descriptor.paragraph_count !== expected.paragraphs.length || descriptor.section_count !== expected.sectionCount) throw new Error("DOCUMENT_CHANGED");
+    const paragraphs: HostParagraphData[] = [];
+    let index = 0;
+    while (index < descriptor.paragraph_count) {
+      assertNotCancelled(context);
+      const batchSize = Math.min(10, descriptor.paragraph_count - index);
+      const result = await this.rpc<HostParagraphData[]>(context, "host.read_paragraph_batch", { start_index: index, batch_size: batchSize }, descriptor.document_token, this.options.paragraph_rpc_timeout_ms ?? 15_000);
+      if (!Array.isArray(result.value) || result.value.length === 0 || result.value.length > batchSize) throw new Error("HOST_PARAGRAPH_BATCH_INVALID");
+      paragraphs.push(...result.value); index += result.value.length;
+      this.post({ type: "pipeline.progress", job_id: context.job.job_id, build_id: context.job.build_id, stage: "validating_targets", completed: index, total: descriptor.paragraph_count, batch_size: result.value.length, detail: `正在核对文档 ${index}/${descriptor.paragraph_count}` });
+    }
+    const current = await createEquivalentSnapshot(descriptor, paragraphs);
+    if (current.sourceSha256 !== expected.sourceSha256 || current.paragraphOrderHash !== expected.paragraphOrderHash || current.textRevision !== expected.textRevision) throw new Error("DOCUMENT_CHANGED");
+    context.descriptor = descriptor;
+    this.diagnostic(context, "pipeline.snapshot.verify.complete", { paragraph_count: paragraphs.length, source_sha256_prefix: current.sourceSha256.slice(0, 8) });
+  }
+
+  private async applyFormat(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot, commandSet: FormattingCommandSet): Promise<{ executed_command_count: number; skipped_command_count: number; batch_count: number }> {
+    if (!context.descriptor) throw new Error("PIPELINE_DESCRIPTOR_REQUIRED");
+    context.stage = "applying_format";
+    const begin = await this.rpc<Record<string, JsonValue>>(context, "host.begin_transaction", { document_revision: snapshot.revision }, context.descriptor.document_token);
+    const transactionId = String(begin.value.transaction_id ?? "");
+    if (!transactionId) throw new Error("FORMAT_TRANSACTION_INVALID");
+    context.format_transaction_id = transactionId;
+    let executed = 0; let batches = 0;
+    try {
+      for (let index = 0; index < commandSet.commands.length; index += 12) {
+        assertNotCancelled(context);
+        const batch = commandSet.commands.slice(index, index + 12);
+        const batchSet: FormattingCommandSet = { ...commandSet, commands: batch };
+        const response = await this.rpc<Record<string, JsonValue>>(context, "host.apply_format_batch", { transaction_id: transactionId, document_revision: snapshot.revision, command_set: batchSet as unknown as JsonValue }, context.descriptor.document_token, 30_000);
+        const applied = Number(response.value.executed_count ?? 0);
+        if (applied !== batch.length) throw new Error("FORMAT_BATCH_INCOMPLETE");
+        executed += applied; batches += 1;
+        this.post({ type: "pipeline.progress", job_id: context.job.job_id, build_id: context.job.build_id, stage: "applying_format", completed: executed, total: commandSet.commands.length, batch_size: applied, detail: `正在应用格式 ${executed}/${commandSet.commands.length}` });
+      }
+      await this.rpc<Record<string, JsonValue>>(context, "host.commit_transaction", { transaction_id: transactionId }, context.descriptor.document_token);
+      context.format_transaction_id = null;
+      return { executed_command_count: executed, skipped_command_count: 0, batch_count: batches };
+    } catch (error) {
+      context.stage = "rolling_back";
+      await this.rpc<Record<string, JsonValue>>(context, "host.rollback_batch", { transaction_id: transactionId }, context.descriptor.document_token).catch(() => undefined);
+      context.format_transaction_id = null;
+      throw error;
+    }
   }
 
   private async writePreview(context: SnapshotJobContext, plan: PreviewPlanItem[]): Promise<{ session_id: string; comment_count: number; plan_count: number }> {

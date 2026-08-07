@@ -14,6 +14,7 @@ type LocalCommandName = "recognize_document" | "preview_document" | "clear_previ
 type LocalCommandSource = "ribbon" | "taskpane" | "test";
 type LocalApplicationCommandName = LocalCommandName | "show_about";
 type LocalApplicationCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
+type PipelineCompletedEvent = Extract<PipelineWorkerEvent, { type: "pipeline.completed" }>;
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface TaskPaneLike { ID: number | string; Visible: boolean; Delete?: () => void; Navigate?: (url: string) => void; Width?: number; DockPosition?: unknown; }
 interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: WpsFileSystemApi; Env?: { GetAppDataPath?: () => string }; }
@@ -182,11 +183,13 @@ export class TaskPaneManager {
 export class LocalApplicationRuntime {
   private readonly registry: Record<LocalApplicationCommandName, (result: CommandResult) => Promise<string>>;
   private pipelineStart?: (command: PipelineCommand) => SnapshotCommandReceipt;
+  private pipelineRun?: (command: PipelineCommand) => Promise<PipelineCompletedEvent>;
   private threadedPreviewCleanup?: () => Promise<void>;
   constructor(private readonly app: ApplicationLike, private readonly panes: TaskPaneManager, private readonly store: HostResultStore, private readonly config: ClassifiedRuntimeConfig) {
     this.registry = { recognize_document: (result) => this.recognize(result), preview_document: (result) => this.preview(result), clear_preview: () => this.clearPreview(), format_document: (result) => this.format(result), health_check: () => this.health(), probe_shell_execute_one_argument: async () => { const value = await hostWindow.DocxtoolNativeLaunchProbe?.(); if (!value) throw new Error("LOCAL_LAUNCH_PROBE_UNAVAILABLE"); return `单参数 ShellExecute 返回 ${Math.round(value.returned_in_ms)} ms`; }, open_taskpane: async () => { this.panes.show(); return "任务窗格已打开"; }, close_taskpane: async () => { this.panes.hide(); return "任务窗格已关闭"; }, toggle_taskpane: async () => { const pane = this.panes.toggle(); return pane?.Visible ? "任务窗格已打开" : "任务窗格已关闭"; }, show_about: async () => { this.panes.show(); this.store.update({ active_view: "issues", latest_error: "Docxtool 涉密版，仅连接本机服务。" }); return "关于信息已显示"; } };
   }
   attachPipelineStarter(start: (command: PipelineCommand) => SnapshotCommandReceipt): void { this.pipelineStart = start; }
+  attachPipelineRunner(run: (command: PipelineCommand) => Promise<PipelineCompletedEvent>): void { this.pipelineRun = run; }
   attachThreadedPreviewCleanup(cleanup: () => Promise<void>): void { this.threadedPreviewCleanup = cleanup; }
   async run(name: LocalApplicationCommandName, source: LocalCommandSource | "e2e" = "ribbon", requestId = id("local"), taskpaneBuildId = this.store.read().build_id): Promise<CommandResult> {
     const started = now(); const startedMs = Date.now();
@@ -231,7 +234,15 @@ export class LocalApplicationRuntime {
   }
   private composition() { return getClassifiedProductionComposition(this.config, hostWindow.DocxtoolDiagnosticLogger); }
   private async documentIdentity(): Promise<string> { const document = this.app.ActiveDocument; if (!document) throw new Error("ACTIVE_DOCUMENT_NOT_FOUND"); return hash(`${document.FullName ?? "unsaved"}|${document.Paragraphs?.Count ?? 0}`); }
-  private async recognize(_result: CommandResult): Promise<string> { const identity = await this.documentIdentity(); const recognition = await this.composition().recognizeUseCase.execute(); const models = recognition.paragraphs.map(recognitionModel); this.store.update({ document_identity_hash: identity, paragraph_recognition_models: models, recognition_summary: recognitionSummary(recognition), active_view: "recognition" }); return "识别完成"; }
+  private async recognize(_result: CommandResult): Promise<string> {
+    this.panes.show();
+    if (!this.pipelineRun) throw new Error("PIPELINE_RUNNER_NOT_READY");
+    const event = await this.pipelineRun("recognize");
+    if (!event.recognition_result) throw new Error("RECOGNITION_RESULT_MISSING");
+    const identity = await this.documentIdentity();
+    this.store.update({ document_identity_hash: identity, paragraph_recognition_models: event.recognition_result.paragraphs.map(recognitionModel), recognition_summary: recognitionSummary(event.recognition_result), active_view: "recognition", formatting_progress: "识别完成" });
+    return "识别完成";
+  }
   private async preview(_result: CommandResult): Promise<string> {
     const mode = this.config.threadedPreviewMode ?? (this.config.threadedPreviewEnabled === true ? "enabled" : "disabled");
     if (mode === "disabled") throw new Error("THREADED_PREVIEW_RECOGNITION_LAUNCH_BLOCKED");
@@ -290,15 +301,18 @@ export class LocalApplicationRuntime {
     let phase = "preview_preserved";
     hostLog("INFO", "format.lifecycle.start", "一键排版保存生命周期开始，保留现有预览批注", { phase, document_identity_hash: identity, preview_comments_policy: "preserve" });
     try {
+      this.panes.show();
       phase = "save_before_format";
       await saveActiveDocument(this.app, false, "before_format");
-      phase = "format_use_case";
-      hostLog("INFO", "format.use_case.start", "开始执行正式排版用例", { phase });
-      const value = await this.composition().formatUseCase.execute(id("format"), { onProgress: (_stage, detail) => this.store.update({ formatting_progress: detail ?? "处理中", active_view: "execution" }) });
+      phase = "worker_format";
+      hostLog("INFO", "format.worker.start", "开始执行 Worker 正式排版", { phase });
+      if (!this.pipelineRun) throw new Error("PIPELINE_RUNNER_NOT_READY");
+      const event = await this.pipelineRun("format");
+      if (!event.format_result) throw new Error("FORMAT_RESULT_MISSING");
       phase = "save_after_format";
       await saveActiveDocument(this.app, true, "after_format");
-      const summary = `已执行 ${value.executed_command_ids.length} 项；跳过 ${value.skipped_command_ids.length} 项`;
-      hostLog("INFO", "format.lifecycle.completed", "一键排版保存生命周期完成，预览批注已保留", { phase, executed_command_count: value.executed_command_ids.length, skipped_command_count: value.skipped_command_ids.length, preview_comments_policy: "preserve" });
+      const summary = `已执行 ${event.format_result.executed_command_count} 项；跳过 ${event.format_result.skipped_command_count} 项`;
+      hostLog("INFO", "format.lifecycle.completed", "一键排版保存生命周期完成，预览批注已保留", { phase, executed_command_count: event.format_result.executed_command_count, skipped_command_count: event.format_result.skipped_command_count, format_batch_count: event.format_result.batch_count, preview_comments_policy: "preserve" });
       this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "预览批注已保留；如需删除请点击清除预览", active_view: "execution" });
       return summary;
     } catch (error) {
@@ -437,13 +451,14 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   const store = new HostResultStore(application.PluginStorage, build, hostContextId); application.PluginStorage.setItem("docxtool_classified_host_error_v1", ""); const paneUrl = `${new URL(hostWindow.DocxtoolTaskPanePath ?? "ui/taskpane.html", hostWindow.location.href)}?host_build=${encodeURIComponent(build.build_id)}&host_context=${encodeURIComponent(store.hostContextId)}`; const panes = new TaskPaneManager(application, application.PluginStorage, paneUrl); const runtime = new LocalApplicationRuntime(application, panes, store, config);
   let heartbeatTimer: number | undefined; let heartbeatExpected = 0; let heartbeatMaxDrift = 0;
   let running = false; let pipelineBusy = false; let activePipelineCommand: PipelineCommand | null = null;
+  const pipelineWaiters = new Map<string, { resolve: (event: PipelineCompletedEvent) => void; reject: (error: Error) => void }>();
   const invalidate = () => { const ribbon = application.ribbonUI as { InvalidateControl?: (id: string) => void } | undefined; ribbon?.InvalidateControl?.("preview"); ribbon?.InvalidateControl?.("apply"); ribbon?.InvalidateControl?.("health"); };
   const startHeartbeat = () => { heartbeatMaxDrift = 0; heartbeatExpected = performance.now() + 50; if (heartbeatTimer !== undefined) hostWindow.clearInterval(heartbeatTimer); heartbeatTimer = hostWindow.setInterval(() => { const current = performance.now(); heartbeatMaxDrift = Math.max(heartbeatMaxDrift, Math.max(0, current - heartbeatExpected)); heartbeatExpected = current + 50; }, 50); };
   const stopHeartbeat = () => { if (heartbeatTimer !== undefined) hostWindow.clearInterval(heartbeatTimer); heartbeatTimer = undefined; return heartbeatMaxDrift; };
   const onPipelineEvent = (event: PipelineWorkerEvent) => {
     if (event.type === "pipeline.ready") { hostLog("INFO", "pipeline.worker.ready", "后台线程状态机已就绪", { build_id: event.build_id }); return; }
     if (event.type === "pipeline.diagnostic") { hostLog("DEBUG", event.event, "后台线程快照阶段事件", event.data); return; }
-    if (event.type === "pipeline.progress") { store.update({ formatting_progress: event.detail }); hostLog("DEBUG", activePipelineCommand === "preview" ? "pipeline.preview.progress" : activePipelineCommand === "diagnostic" ? "pipeline.diagnostic.progress" : "worker.snapshot.shadow.progress", event.detail, { stage: event.stage, completed: event.completed, total: event.total, batch_size: event.batch_size }); return; }
+    if (event.type === "pipeline.progress") { store.update({ formatting_progress: event.detail }); hostLog("DEBUG", activePipelineCommand === "preview" ? "pipeline.preview.progress" : activePipelineCommand === "format" ? "pipeline.format.progress" : activePipelineCommand === "diagnostic" ? "pipeline.diagnostic.progress" : "worker.snapshot.shadow.progress", event.detail, { stage: event.stage, completed: event.completed, total: event.total, batch_size: event.batch_size }); return; }
     const mainThreadMaxDrift = stopHeartbeat();
     pipelineBusy = false; hostWindow.DocxtoolCommandBusy = running; invalidate();
     const current = store.read().active_command;
@@ -454,6 +469,10 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
       const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index)).size;
       store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "诊断识别完成（未写入）", finished_at: now() } : null, active_view: "recognition", recognition_summary: recognitionSummary(recognition), paragraph_recognition_models: recognitionModels, formatting_preview_models: [], preview_comment_status: "诊断模式：未写入批注或格式", formatting_progress: "诊断识别完成", formatting_result: "诊断模式未生成格式命令", latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
       hostLog("INFO", "pipeline.diagnostic.complete", "后台线程诊断识别完成（未写入）", { ...event.snapshot_summary, recognized_paragraph_count: recognition.paragraphs.length, unresolved_block_count: unresolved, mixed_paragraph_count: mixed, main_thread_max_drift_ms: mainThreadMaxDrift });
+    } else if (event.type === "pipeline.completed" && event.command === "recognize" && event.recognition_result) {
+      const recognition = event.recognition_result;
+      store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "识别完成", finished_at: now() } : null, active_view: "recognition", recognition_summary: recognitionSummary(recognition), paragraph_recognition_models: recognition.paragraphs.map(recognitionModel), formatting_progress: "识别完成", latest_error: "" });
+      hostLog("INFO", "pipeline.recognition.complete", "后台线程识别完成", { ...event.snapshot_summary, recognized_paragraph_count: recognition.paragraphs.length, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed" && event.command === "preview" && event.recognition_result && event.formatting_commands && event.preview_result) {
       const recognition = event.recognition_result; const commands = event.formatting_commands; const grouped = new Map<number, FormattingCommandSet["commands"]>();
       for (const command of commands.commands) { const values = grouped.get(command.target.source_paragraph_index) ?? []; values.push(command); grouped.set(command.target.source_paragraph_index, values); }
@@ -462,9 +481,18 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
       const unresolved = recognition.unresolved_blocks?.length ?? 0; const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index)).size;
       store.update({ command_status: "PASS", active_command: current ? { ...current, status: "PASS", stage: "completed", summary: "预览排版完成", finished_at: now() } : null, active_view: "preview", recognition_summary: recognitionSummary(recognition), paragraph_recognition_models: recognitionModels, formatting_preview_models: previewModels, preview_comment_status: `已创建 ${event.preview_result.comment_count} 条临时批注`, formatting_progress: "预览排版完成", formatting_result: `后台线程生成 ${commands.commands.length} 条格式命令`, latest_error: "", unresolved_block_count: unresolved, mixed_paragraph_count: mixed });
       hostLog("INFO", "pipeline.preview.complete", "后台线程正式预览完成", { ...event.snapshot_summary, preview_comment_count: event.preview_result.comment_count, formatting_command_count: commands.commands.length, main_thread_max_drift_ms: mainThreadMaxDrift });
+    } else if (event.type === "pipeline.completed" && event.command === "format" && event.format_result) {
+      store.update({ formatting_progress: "格式写入完成，正在保存", active_view: "execution", latest_error: "" });
+      hostLog("INFO", "pipeline.format.complete", "后台线程正式排版写入完成", { ...event.snapshot_summary, executed_command_count: event.format_result.executed_command_count, format_batch_count: event.format_result.batch_count, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed") { store.update({ formatting_progress: `后台线程快照完成：${event.snapshot_summary.paragraph_count} 段`, formatting_result: `快照 ${event.snapshot_summary.source_sha256_prefix}；Host RPC P95 ${event.snapshot_summary.p95_host_rpc_ms.toFixed(1)} ms` }); hostLog("INFO", "worker.snapshot.shadow.complete", "后台线程影子快照完成", { ...event.snapshot_summary, main_thread_max_drift_ms: mainThreadMaxDrift }); }
     else if (event.type === "pipeline.cancelled") { store.update({ command_status: "CANCELLED", active_command: current ? { ...current, status: "CANCELLED", stage: "cancelled", summary: "后台任务已取消", finished_at: now() } : null, formatting_progress: "后台任务已取消" }); hostLog("WARN", "pipeline.job.cancelled", "后台线程任务已取消", { command: activePipelineCommand ?? "", main_thread_max_drift_ms: mainThreadMaxDrift }); }
     else { store.update({ command_status: "FAIL", active_command: current ? { ...current, status: "FAIL", stage: "failed", summary: "后台任务失败", error_code: event.error.code, finished_at: now() } : null, formatting_progress: "后台线程任务失败", latest_error: event.error.code, active_view: "issues" }); hostLog("ERROR", "pipeline.job.failed", "后台线程任务失败", { command: activePipelineCommand ?? "", stable_error_code: event.error.code, main_thread_max_drift_ms: mainThreadMaxDrift }); }
+    const waiter = "job_id" in event ? pipelineWaiters.get(event.job_id) : undefined;
+    if (waiter && "job_id" in event) {
+      pipelineWaiters.delete(event.job_id);
+      if (event.type === "pipeline.completed") waiter.resolve(event);
+      else waiter.reject(new Error(event.type === "pipeline.failed" ? event.error.code : "PIPELINE_CANCELLED"));
+    }
     activePipelineCommand = null;
   };
   const debugProbeEnabled = ["127.0.0.1", "localhost"].includes(hostWindow.location.hostname);
@@ -479,6 +507,11 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline", ...(config.controlServerEnabled && config.controlEndpointManifest ? { control_endpoint: config.controlEndpointManifest } : {}) }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
   const startPipeline = (command: PipelineCommand) => { const receipt = pipeline.start(command); if (receipt.accepted) { activePipelineCommand = command; pipelineBusy = true; hostWindow.DocxtoolCommandBusy = true; startHeartbeat(); invalidate(); hostWindow.setTimeout(() => { const active = store.read().active_command; if (active) store.update({ command_status: "RUNNING", active_command: { ...active, status: "RUNNING", stage: "pipeline", summary: "后台线程处理中", finished_at: "" } }); }, 0); } return receipt; };
   runtime.attachPipelineStarter(startPipeline);
+  runtime.attachPipelineRunner((command) => {
+    const receipt = startPipeline(command);
+    if (!receipt.accepted) return Promise.reject(new Error(receipt.reason ?? "PIPELINE_START_REJECTED"));
+    return new Promise<PipelineCompletedEvent>((resolve, reject) => { pipelineWaiters.set(receipt.command_id, { resolve, reject }); });
+  });
   hostWindow.DocxtoolLocalApplication = { runtime, panes, store, build, pipeline };
   hostWindow.DocxtoolRunSnapshotShadow = () => { const receipt = startPipeline("snapshot_shadow"); if (receipt.accepted) store.update({ formatting_progress: "后台线程快照：运行中" }); return receipt; };
   hostWindow.DocxtoolCancelSnapshotShadow = () => pipeline.cancelActiveJob();

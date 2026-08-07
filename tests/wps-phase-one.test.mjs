@@ -694,6 +694,20 @@ test("WpsHostBridge single-argument ShellExecute probe never supplies a second p
   assert.equal(rejected.error.code, "HOST_DEBUG_PROBE_DISABLED");
 });
 
+test("WpsHostBridge applies and commits a formal format batch without comments", async () => {
+  const { paragraph } = fakeWps();
+  const bridge = new WpsHostBridge(globalThis.Application);
+  const base = { type: "host.rpc.request", job_id: "format-job-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, rpc_id: "format-rpc-1", operation: "host.capture_document_descriptor" });
+  const started = await bridge.handle({ ...base, rpc_id: "format-rpc-2", operation: "host.begin_transaction", document_token: descriptor.value.document_token });
+  const hash = hashText("测试段落");
+  const command = { command_id: "cmd-000001", kind: "paragraph.set_font", target: commandTarget(hash), arguments: { east_asia_font_name: "仿宋_GB2312", latin_font_name: "Times New Roman", font_size_pt: 16, bold: false }, required_capability: "paragraph.font", on_unsupported: "fail" };
+  const applied = await bridge.handle({ ...base, rpc_id: "format-rpc-3", operation: "host.apply_format_batch", document_token: descriptor.value.document_token, payload: { transaction_id: started.value.transaction_id, document_revision: `${hash}:1`, command_set: commandSet([command], "format-job-1") } });
+  assert.equal(applied.ok, true); assert.equal(applied.value.executed_count, 1); assert.equal(paragraph.Range.Font.NameFarEast, "仿宋_GB2312");
+  const committed = await bridge.handle({ ...base, rpc_id: "format-rpc-4", operation: "host.commit_transaction", document_token: descriptor.value.document_token, payload: { transaction_id: started.value.transaction_id } });
+  assert.equal(committed.ok, true); assert.equal(committed.value.committed, true);
+});
+
 test("recognition Worker owns polling and returns the mapped RecognitionResult", async () => {
   const paragraphs = [{ Range: { Text: "脱敏段落\r", Tables: { Count: 0 }, Start: 0, End: 5 } }]; let probes = 0;
   const bridge = {
@@ -708,6 +722,35 @@ test("recognition Worker owns polling and returns the mapped RecognitionResult",
   class LoopbackWorker { onmessage = null; onerror = null; onmessageerror = null; scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) }; runtime = new SnapshotPipelineWorkerRuntime(this.scope); postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); } terminate() {} }
   const terminal = new Promise((resolve) => { const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } }); assert.equal(client.start("recognize").accepted, true); });
   const result = await terminal; assert.equal(result.type, "pipeline.completed"); assert.equal(result.command, "recognize"); assert.equal(result.recognition_result.recognition_engine_version, "4.0"); assert.equal(probes, 2);
+});
+
+test("format Worker verifies the document and applies bounded batches without preview cleanup", async () => {
+  const text = "脱敏段落"; const operations = []; const applied = [];
+  const descriptor = { document_token: "doc-1", saved: true, local_docx_path: "C:\\fixture.docx", local_docx_path_hash: hashText("c:\\fixture.docx"), paragraph_count: 1, section_count: 1, extension: ".docx" };
+  const recognitionPlan = withHostBinding({ paragraphs: [{ sourceParagraphIndex: 0, text, isInTable: false }] }, { schema_version: "1.0", engine_version: "4.0", document_mode: "normal", document_mode_confidence: 1, blocks: [wheelBlock({ physicalText: text })] });
+  const bridge = { async handle(request) {
+    operations.push(request.operation);
+    const base = { type: "host.rpc.result", rpc_id: request.rpc_id, job_id: request.job_id, build_id: request.build_id, ok: true, duration_ms: 1 };
+    if (request.operation === "host.capture_document_descriptor") return { ...base, value: descriptor };
+    if (request.operation === "host.read_paragraph_batch") return { ...base, value: [{ host_paragraph_index: 0, raw_text: text, is_in_table: false, range_start: 0, range_end: text.length }] };
+    if (request.operation === "host.launch_recognition") return { ...base, value: { recognition_job_id: "local-format-1", queued_at: new Date().toISOString(), request_path: "C:\\request.json", result_path: "C:\\result.json", error_path: "C:\\error.json", cancel_path: "C:\\cancel.json", launch_mode: "file_queue_broker" } };
+    if (request.operation === "host.probe_recognition") return { ...base, value: { state: "completed", recognition_plan: recognitionPlan } };
+    if (request.operation === "host.begin_transaction") return { ...base, value: { transaction_id: "tx-format-1" } };
+    if (request.operation === "host.apply_format_batch") { const commands = request.payload.command_set.commands; applied.push(...commands); return { ...base, value: { executed_count: commands.length, total_executed_count: applied.length } }; }
+    if (request.operation === "host.commit_transaction") return { ...base, value: { committed: true, executed_count: applied.length } };
+    if (request.operation === "host.rollback_batch") return { ...base, value: { rolled_back: true } };
+    throw new Error(`UNEXPECTED_RPC:${request.operation}`);
+  } };
+  const profile = { id: "default", version: "1.0", page_setup: { page_width_cm: 21, page_height_cm: 29.7, margin_top_cm: 3.7, margin_bottom_cm: 3.5, margin_left_cm: 2.8, margin_right_cm: 2.6, lines_per_page: 22, chars_per_line: 28, grid_alignment: "文字对齐字符网络", grid_mode: "line_only", normal_east_asia_font_name: "仿宋_GB2312", normal_latin_font_name: "Times New Roman", normal_font_size_pt: 16 }, styles: { body: { east_asia_font_name: "仿宋_GB2312", latin_font_name: "Times New Roman", font_size_pt: 16, bold: false, alignment: "justify", first_line_indent_chars: 2, left_indent_chars: 0, right_indent_chars: 0, space_before_lines: 0, space_after_lines: 0, line_spacing_rule: "exactly", line_spacing_pt: 28, page_break_before: false, outline_level: 10 } } };
+  const capabilities = { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: ["paragraph.font", "paragraph.alignment", "paragraph.indent", "paragraph.spacing", "section.page_setup"] };
+  class LoopbackWorker { onmessage = null; onerror = null; onmessageerror = null; scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) }; runtime = new SnapshotPipelineWorkerRuntime(this.scope); postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); } terminate() {} }
+  const terminal = new Promise((resolve) => { const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerConfig: { profile, client_capabilities: capabilities, authorization_scope: "classified-offline" }, workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } }); assert.equal(client.start("format").accepted, true); });
+  const result = await terminal;
+  assert.equal(result.type, "pipeline.completed", JSON.stringify(result)); assert.equal(result.command, "format"); assert.equal(result.format_result.executed_command_count, 5); assert.equal(result.format_result.batch_count, 1);
+  assert.equal(operations.filter((value) => value === "host.capture_document_descriptor").length, 2);
+  assert.equal(operations.filter((value) => value === "host.read_paragraph_batch").length, 2);
+  assert.equal(operations.includes("host.clear_preview_batch"), false);
+  assert.deepEqual(operations.slice(-3), ["host.begin_transaction", "host.apply_format_batch", "host.commit_transaction"]);
 });
 
 test("control-enabled Worker submits and polls through ControlTransport without Host recognition RPC", async () => {
@@ -758,7 +801,9 @@ test("Worker command generation is field-equivalent to the legacy local format g
 function fakeWps(text = "测试段落\r") {
   const format = { Alignment: 0, CharacterUnitFirstLineIndent: 0, CharacterUnitLeftIndent: 0, CharacterUnitRightIndent: 0, LineUnitBefore: 0, LineUnitAfter: 0, LineSpacingRule: 0, LineSpacing: 0, PageBreakBefore: 0, OutlineLevel: 10, SnapToGrid: true };
   const pageSetup = { PageWidth: 600, PageHeight: 800, TopMargin: 70, BottomMargin: 70, LeftMargin: 70, RightMargin: 70, LinesPage: 22, CharsLine: 28, LayoutMode: 1, ShowGrid: true };
-  const paragraph = { Range: { Start: 0, End: text.length, Text: text, Font: { Name: "宋体", NameAscii: "宋体", NameOther: "宋体", NameFarEast: "宋体", Size: 12, Bold: 0, Spacing: 2, Scaling: 90, DisableCharacterSpaceGrid: false }, ParagraphFormat: format, PageSetup: pageSetup } };
+  const range = { Start: 0, End: text.length, Text: text, Font: { Name: "宋体", NameAscii: "宋体", NameOther: "宋体", NameFarEast: "宋体", Size: 12, Bold: 0, Spacing: 2, Scaling: 90, DisableCharacterSpaceGrid: false }, ParagraphFormat: format, PageSetup: pageSetup };
+  range.Characters = { Item(index) { const character = Array.from(text)[index - 1]; const start = Array.from(text).slice(0, index - 1).join("").length; return { Start: start, End: start + character.length, Text: character, Font: range.Font, ParagraphFormat: range.ParagraphFormat, PageSetup: range.PageSetup, SetRange(from, to) { this.Start = from; this.End = to; this.Text = text.slice(from, to); } }; } };
+  const paragraph = { Range: range };
   const paragraphs = { Count: 1, Item(index) { assert.equal(index, 1); return paragraph; } };
   globalThis.Application = { ActiveDocument: { FullName: "C:\\redacted.docx", Saved: true, Paragraphs: paragraphs, PageSetup: pageSetup, Range(start, end) { return { ...paragraph.Range, Start: start, End: end, Text: text.slice(start, end) }; } } };
   return { paragraph, format };
@@ -1309,6 +1354,7 @@ test("production preview starts only the Worker while legacy preview remains unr
   const host = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
   const client = await readFile(new URL("../apps/classified-offline/src/pipeline-worker-client.ts", import.meta.url), "utf8");
   const worker = await readFile(new URL("../apps/classified-offline/src/pipeline-worker.ts", import.meta.url), "utf8");
+  const recognizeBlock = host.slice(host.indexOf("private async recognize("), host.indexOf("private async preview("));
   const previewBlock = host.slice(host.indexOf("private async preview("), host.indexOf("/** @deprecated Retained only for legacy equivalence tests"));
   const legacyPreviewBlock = host.slice(host.indexOf("private async legacyPreview("), host.indexOf("private async clearPreview("));
   const formatBlock = host.slice(host.indexOf("private async format("), host.indexOf("private async health("));
@@ -1318,11 +1364,13 @@ test("production preview starts only the Worker while legacy preview remains unr
   assert.match(previewBlock, /this\.pipelineStart\?\.\("diagnostic"\)/);
   assert.equal(previewBlock.includes("previewUseCase.execute"), false);
   assert.equal(previewBlock.includes("readSnapshot"), false);
+  assert.match(recognizeBlock, /this\.pipelineRun\("recognize"\)/);
+  assert.equal(recognizeBlock.includes("recognizeUseCase.execute"), false);
   assert.match(legacyPreviewBlock, /this\.composition\(\)\.previewUseCase\.execute/);
-  assert.match(formatBlock, /this\.composition\(\)\.formatUseCase\.execute/);
+  assert.match(formatBlock, /this\.pipelineRun\("format"\)/);
   const cleanupAt = formatBlock.indexOf("this.threadedPreviewCleanup");
   const firstSaveAt = formatBlock.indexOf("saveActiveDocument");
-  const formatAt = formatBlock.indexOf("formatUseCase.execute");
+  const formatAt = formatBlock.indexOf('pipelineRun("format")');
   const finalSaveAt = formatBlock.indexOf("saveActiveDocument", firstSaveAt + 1);
   assert.equal(cleanupAt, -1);
   assert.equal(firstSaveAt >= 0 && firstSaveAt < formatAt && formatAt < finalSaveAt, true);
