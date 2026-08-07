@@ -1324,7 +1324,9 @@ test("production preview starts only the Worker while legacy preview remains unr
   const firstSaveAt = formatBlock.indexOf("saveActiveDocument");
   const formatAt = formatBlock.indexOf("formatUseCase.execute");
   const finalSaveAt = formatBlock.indexOf("saveActiveDocument", firstSaveAt + 1);
-  assert.equal(cleanupAt >= 0 && cleanupAt < firstSaveAt && firstSaveAt < formatAt && formatAt < finalSaveAt, true);
+  assert.equal(cleanupAt, -1);
+  assert.equal(firstSaveAt >= 0 && firstSaveAt < formatAt && formatAt < finalSaveAt, true);
+  assert.match(formatBlock, /preview_comments_policy: "preserve"/);
   assert.match(shadowBlock, /startPipeline\("snapshot_shadow"\)/);
   for (const forbidden of ["PreviewDocumentUseCase", "FormatDocumentUseCase", "readSnapshot"]) {
     assert.equal(client.includes(forbidden), false);
@@ -1438,7 +1440,7 @@ test("classified Ribbon preserves a safe error when the host queue is stale", as
   assert.equal(storage.get("docxtool_classified_host_error_v1") !== undefined, true);
 });
 
-test("one-click formatting removes the tracked preview then re-recognizes the current document", async () => {
+test("one-click formatting keeps the tracked preview without removing comments", async () => {
   const events = [];
   const baseline = { ...snapshot, paragraphOrderHash: "order", formattingRevision: "format", sectionCount: 1, documentFullNameHash: "path-hash" };
   const trackerValue = { preview_session_id: "preview", document_id: baseline.documentId, document_full_name_hash: "path-hash", baseline_revision: baseline.revision, baseline_text_hash: baseline.sourceSha256, baseline_paragraph_count: 1, baseline_paragraph_order_hash: "order", baseline_formatting_revision: "format", baseline_section_count: 1, baseline_saved_state: false, user_comment_fingerprint: "user", created_comment_markers: [], paragraph_anchors: [], created_at: "now" };
@@ -1456,8 +1458,8 @@ test("one-click formatting removes the tracked preview then re-recognizes the cu
     { current() { return tracker; }, clear() { tracker = null; } },
   );
   const result = await useCase.execute("request-00000001");
-  assert.equal(result.failed_command_id, null); assert.equal(recognitionCalls, 1); assert.equal(tracker, null);
-  assert.ok(events.indexOf("remove_preview") < events.indexOf("recognize")); assert.ok(events.indexOf("recognize") < events.indexOf("execute"));
+  assert.equal(result.failed_command_id, null); assert.equal(recognitionCalls, 1); assert.equal(tracker, trackerValue);
+  assert.equal(events.includes("remove_preview"), false); assert.ok(events.indexOf("recognize") < events.indexOf("execute"));
 });
 
 test("repeated preview removes the previous session before adding a fresh preview", async () => {
@@ -1471,12 +1473,12 @@ test("repeated preview removes the previous session before adding a fresh previe
   assert.equal(result.summary.preview_comment_count, 1); assert.equal(current.preview_session_id, "new"); assert.ok(events.indexOf("remove") < events.indexOf("recognize")); assert.ok(events.indexOf("recognize") < events.indexOf("add"));
 });
 
-test("preview document identity mismatch refuses cleanup and formatting", async () => {
+test("formatting does not inspect preview identity or remove comments", async () => {
   const baseline = { ...snapshot, paragraphOrderHash: "order", formattingRevision: "format", sectionCount: 1, documentFullNameHash: "new-document" };
   const trackerValue = { preview_session_id: "preview", document_id: baseline.documentId, document_full_name_hash: "old-document", baseline_revision: baseline.revision, baseline_text_hash: baseline.sourceSha256, baseline_paragraph_count: 1, baseline_paragraph_order_hash: "order", baseline_formatting_revision: "format", baseline_section_count: 1, baseline_saved_state: false, user_comment_fingerprint: "", created_comment_markers: [], paragraph_anchors: [], created_at: "now" };
   let removed = false;
   const useCase = new FormatDocumentUseCase({ async readSnapshot() { return baseline; } }, { async recognize() { throw new Error("unexpected"); } }, { async requestCommands() { throw new Error("unexpected"); } }, new CommandValidator(), { async execute() { throw new Error("unexpected"); } }, new MockTransactionManager(), { capabilities() { return { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: [] }; } }, { authorizationScope() { return "classified-offline"; } }, undefined, { async removePreviewComments() { removed = true; }, async verifyPreviewComments() { return { comment_count: 0, user_comment_integrity: true }; } }, { current() { return trackerValue; }, clear() {} });
-  await assert.rejects(() => useCase.execute("request-00000001"), /DOCUMENT_CHANGED/); assert.equal(removed, false);
+  await assert.rejects(() => useCase.execute("request-00000001"), /unexpected/); assert.equal(removed, false);
 });
 
 test("classified health check is read-only and returns concrete PASS items", async () => {

@@ -38,22 +38,11 @@ export class FormatDocumentUseCase {
     private readonly commandService: CommandServiceClient, private readonly validator: CommandValidator,
     private readonly executor: DocumentExecutor, private readonly transactionManager: TransactionManager,
     private readonly capabilities: CapabilityProvider, private readonly license: LicenseProvider, private readonly fonts?: FontCapabilityProvider,
-    private readonly previewComments?: PreviewCommentService, private readonly previewTracker?: { current(): PreviewMutationTracker | null; clear(): void },
   ) {}
   async execute(requestId: string, options: FormattingExecutionOptions = {}): Promise<ExecutionResult> {
     const progress = (stage: FormattingProgressStage, detail?: string) => options.onProgress?.(stage, detail);
     progress("preflight", "检查文档"); assertNotCancelled(options.signal);
-    const tracker = this.previewTracker?.current() ?? null;
-    let snapshot = await this.reader.readSnapshot({ allowUnsaved: !!tracker });
-    if (tracker) {
-      if (!unchangedSincePreview(snapshot, tracker)) throw new Error("DOCUMENT_CHANGED");
-      if (!this.previewComments) throw new Error("PREVIEW_COMMENT_CLEANUP_FAILED");
-      await this.previewComments.removePreviewComments(tracker);
-      const afterCleanup = await this.reader.readSnapshot({ allowUnsaved: true });
-      if (!unchangedSincePreview(afterCleanup, tracker)) throw new Error("DOCUMENT_CHANGED");
-      this.previewTracker?.clear();
-      snapshot = afterCleanup;
-    }
+    const snapshot = await this.reader.readSnapshot();
     progress("snapshot", "保存原始文档状态");
     progress("recognition", "识别文档"); assertNotCancelled(options.signal);
     const recognition = await this.recognitionProvider.recognize(snapshot);
@@ -80,7 +69,7 @@ export class FormatDocumentUseCase {
     const commandSet = this.validator.validate(serviceResult, requestId);
     this.assertCapabilities(commandSet);
     this.fonts?.assertAvailable(commandSet.commands.filter((item) => item.kind === "paragraph.set_font").flatMap((item) => [item.arguments.east_asia_font_name, item.arguments.latin_font_name]));
-    const current = await this.reader.readSnapshot({ allowUnsaved: !!tracker });
+    const current = await this.reader.readSnapshot();
     if (current.revision !== snapshot.revision || current.formattingRevision !== snapshot.formattingRevision || current.paragraphOrderHash !== snapshot.paragraphOrderHash || current.sectionCount !== snapshot.sectionCount) throw new Error("DOCUMENT_CHANGED");
     progress("target_resolution", "定位目标"); assertNotCancelled(options.signal);
     const transactionId = this.transactionManager.begin();
