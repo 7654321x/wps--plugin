@@ -577,10 +577,10 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 正确方案：当前构建同时具备首页 served、Bootstrap、Ribbon、Host Runtime、应用运行时安装、Ribbon 加载和 Worker 探针完成事件时，只追加一次 `wps.load.completed`；阶段日志继续保留用于诊断。
 - 自动验证门槛：缺任一必需事件不写完成事件；全部事件只写一次，事件带当前 build_id；真实 WPS 重载后日志出现 `wps.load.completed`，此前仍只能显示等待。
 
-## P068 使用 Document.Range 重建批注目标丢失段落 Range 上下文
+## P068 WPS Range 数值坐标与字符边界不能混用
 
 - 症状：Broker 已完成识别且段落全文、Host UTF-16 子片段哈希均正确，但 Worker 写预览批注时返回 `HOST_RANGE_TEXT_MISMATCH`，WPS 中没有批注。
-- 根因：识别锚点属于当前 `Paragraph.Range`，写入边界却把起止坐标交给 `Document.Range(start, end)` 重新创建 Range。v1.5.9 即使传递快照绝对起点，真实 WPS 仍稳定复现，证明问题不是绝对起点丢失，而是重建 Range 没有保留原段落 Range 的宿主上下文。
+- 根因：识别锚点是 Host 文本中的 UTF-16 边界，但 WPS 写入边界曾用 `Paragraph.Range.Start + 偏移` 计算数值坐标。v1.5.10 实机日志证明 WPS 接受了请求坐标且返回相同长度，读回哈希仍不同，因此 `Paragraph.Range.Start/End` 数值不能直接充当该文本的字符边界。
 - 禁止：删除 `HOST_RANGE_TEXT_MISMATCH`；尝试 `end+1/end-1`；全文搜索；跳过失败目标；把识别成功记录成批注成功。
-- 正确方案：依据项目锁定的 `wps-jsapi 1.0.5` 官方类型定义，直接对刚完成段落全文和子片段哈希核验的 `Paragraph.Range` 调用 `SetRange(Start, End)` 收窄范围，再将该同一 Range 交给 `Comments.Add`。失败日志只记录段落序号、请求/实际坐标、UTF-16 长度和哈希前缀，不记录正文。
-- 自动验证门槛：Mock 中让 `Document.Range` 固定返回错误对象，正式预览仍必须通过 `Paragraph.Range.SetRange` 写入；构造错误 SetRange 读回时继续返回 `HOST_RANGE_TEXT_MISMATCH`，并输出不含正文的精准技术详情。真实 WPS 需出现 `pipeline.preview.complete` 且 `preview_comment_count > 0`，保存后 OOXML 未检查前不得写完整 PASS。
+- 正确方案：识别接口和 UTF-16 锚点保持不变；在 WPS 适配层把 UTF-16 边界转换为字符序号，通过官方 `Paragraph.Range.Characters.Item()` 取得目标首尾字符的真实 Range 边界，再在首字符 Range 上调用 `SetRange(first.Start, last.End)`。创建批注前继续执行 Range.Text 哈希核验；失败日志只记录相对边界、段落坐标、字符坐标、长度和哈希前缀，不记录正文。
+- 自动验证门槛：Mock 中令段落 `Start` 与首字符 `Start` 不同，且 `Document.Range` 固定返回错误对象，正式预览仍必须通过 `Characters.Item` 的首尾边界写入；构造错误字符 Range 读回时继续返回 `HOST_RANGE_TEXT_MISMATCH` 和精准技术详情。真实 WPS 需出现 `pipeline.preview.complete` 且 `preview_comment_count > 0`，保存后 OOXML 未检查前不得写完整 PASS。

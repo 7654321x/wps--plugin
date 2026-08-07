@@ -6,7 +6,7 @@
 |---|---|---|---|---|
 | 加载项任务窗格运行时 | WPS 内置 web task pane 资源 | 运行组件存在 | 12.1.0.26895 | 本机安装目录实测；第三方加载项注册与启动模板仍需使用官方 wpsjs 工具实测。 |
 | 当前文档入口 | Application.ActiveDocument | TYPE_DECLARATION_CONFIRMED；NOT_TESTED | 无 | `wps-jsapi 1.0.5` 类型声明；尚未进入真实加载项上下文。 |
-| 预览批注目标 Range | Paragraph.Range.Start/End/SetRange | TYPE_DECLARATION_CONFIRMED；MOCK_TESTED；REAL_WPS_WRITE_CONFIRMED=NOT_TESTED | 无 | 必须在原 Paragraph.Range 上用 SetRange 收窄；禁止用 Document.Range 重建已绑定的段落子范围。 |
+| 预览批注目标 Range | Paragraph.Range.Characters.Item；Range.Start/End/SetRange | TYPE_DECLARATION_CONFIRMED；MOCK_TESTED；REAL_WPS_WRITE_CONFIRMED=NOT_TESTED | 无 | UTF-16 锚点先转换为字符序号，再使用 WPS 返回的首尾字符边界；禁止用 Paragraph.Start 加偏移或 Document.Range 重建目标。 |
 | 段落字体 | Paragraph.Range.Font；Font.Name/NameFarEast/Size/Bold | TYPE_DECLARATION_CONFIRMED；MOCK_TESTED；REAL_WPS_WRITE_CONFIRMED=NOT_TESTED | 无 | 默认 capability 关闭；只能在脱敏测试文档实机“写入—读回—恢复”后启用。 |
 | 段落对齐/缩进/间距 | Paragraph.Range.ParagraphFormat | TYPE_DECLARATION_CONFIRMED；MOCK_TESTED；REAL_WPS_WRITE_CONFIRMED=NOT_TESTED | 无 | 对齐枚举固定映射 left=0、center=1、right=2、justify=3、distributed=4；缩进使用 CharacterUnit* 成员，间距为点。 |
 | 页面设置 | Document.PageSetup | TYPE_DECLARATION_CONFIRMED；MOCK_TESTED；REAL_WPS_WRITE_CONFIRMED=NOT_TESTED | 无 | 协议厘米值转换为 point（28.3464567 point/cm），不创建新分节。 |

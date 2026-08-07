@@ -35,7 +35,8 @@ Ribbon XML 使用 CustomUI 2006/01 命名空间，并通过 OnAddinLoad 和 OnAc
 | WpsDocument | FullName、Saved、PageSetup | 读；PageSetup 可写 | 保存检查与页面设置 |
 | WpsDocument | Paragraphs | 读 | 段落集合 |
 | WpsParagraph | Range | 读 | 目标段落范围 |
-| WpsRange | Text、Start、End、SetRange、Font、ParagraphFormat | Text/Start/End 可读；SetRange 可调用；后两者可写 | 哈希、在原 Range 上收窄批注目标、字体和段落格式 |
+| WpsRange | Text、Start、End、Characters、SetRange、Font、ParagraphFormat | Text/Start/End/Characters 可读；SetRange 可调用；后两者可写 | 哈希、读取真实字符边界、在原 Range 上收窄批注目标、字体和段落格式 |
+| WpsCharacters | Item | 调用 | 按字符序号取得 WpsRange |
 | WpsFont | Name、NameFarEast、Size、Bold | 可写 | 字体命令 |
 | WpsParagraphFormat | Alignment、CharacterUnitFirstLineIndent、CharacterUnitLeftIndent、CharacterUnitRightIndent、LineUnitBefore、LineUnitAfter、LineSpacingRule、LineSpacing、OutlineLevel | 可写 | 对齐、缩进、行单位间距与大纲级别 |
 | WpsPageSetup | PageWidth、PageHeight、TopMargin、BottomMargin、LeftMargin、RightMargin | 可写 | 页面设置 |

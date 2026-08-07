@@ -465,3 +465,14 @@ def test_wps_load_completion_accepts_only_current_session_unknown_bootstrap(monk
     assert sum(item["event"] == "bootstrap.probe.loaded" for item in current) == 1
     assert main.maybe_log_wps_load_completed() is True
     assert len(logged) == 1
+
+
+def test_wps_load_completion_can_defer_console_output_to_log_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = [{"event": event, "build_id": "build-1"} for event in main.WPS_LOAD_REQUIRED_EVENTS]
+    monkeypatch.setattr(main, "_wps_load_completion_logged", False)
+    monkeypatch.setattr(main, "read_json", lambda _path: {"build_id": "build-1"})
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(main, "log_event", lambda *_args, **kwargs: calls.append(kwargs))
+
+    assert main.maybe_log_wps_load_completed(events, emit_console=False) is True
+    assert calls == [{"component": "main", "emit_console": False}]

@@ -267,10 +267,15 @@ ERROR_CATALOG: Dict[str, Dict[str, str]] = {
         "reason_cn": "WPS 子 Range 读回文字与已经验证的识别锚点不一致",
         "action_cn": "保留本条日志的坐标和摘要技术详情后停止当前预览",
     },
-    "HOST_RANGE_SET_RANGE_UNSUPPORTED": {
-        "stage_cn": "创建 WPS 预览批注目标",
-        "reason_cn": "当前 WPS Range 对象没有提供官方 SetRange 方法",
+    "HOST_RANGE_CHARACTERS_UNSUPPORTED": {
+        "stage_cn": "读取 WPS 预览批注字符边界",
+        "reason_cn": "当前 WPS 段落 Range 没有提供官方 Characters.Item 方法",
         "action_cn": "核对当前 WPS 版本与 wps-jsapi 1.0.5 的实际兼容性",
+    },
+    "HOST_RANGE_CHARACTER_BOUNDARY_INVALID": {
+        "stage_cn": "读取 WPS 预览批注字符边界",
+        "reason_cn": "WPS 没有返回可收窄的首尾字符 Range",
+        "action_cn": "保留当前错误并停止预览，不要猜测字符偏移",
     },
     "WPS_INDEX_RESPONSE_MISMATCH": {
         "stage_cn": "校验 WPS 主资源",

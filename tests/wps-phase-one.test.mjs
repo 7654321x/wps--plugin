@@ -944,8 +944,9 @@ test("preview comments use a paragraph Range and remove only their session marke
 test("Worker PreviewPlan and Host preview batches use the same comment text and preserve user comments", async () => {
   const text = "预览段落"; const hash = hashText(text); const comments = [{ Author: "用户", Initial: "用", Range: { Text: "已有批注" }, Delete() { this.deleted = true; } }];
   const commentCollection = { get Count() { return comments.filter((item) => !item.deleted).length; }, Item(index) { return comments.filter((item) => !item.deleted)[index - 1]; }, Add(reference, value) { const item = { Range: { Text: value }, Reference: reference, Delete() { this.deleted = true; } }; comments.push(item); return item; } };
-  let corruptSetRangeReadback = false;
-  const paragraphRange = () => ({ Text: text + "\r", Start: 10, End: 10 + text.length + 1, Tables: { Count: 0 }, SetRange(start, end) { this.Start = start; this.End = end; const offset = corruptSetRangeReadback ? 1 : 0; this.Text = text.slice(start - 10 + offset, end - 10 + offset); } });
+  let corruptSetRangeReadback = false; const characterBase = 9;
+  const characterRange = (index) => ({ Text: text[index - 1], Start: characterBase + index - 1, End: characterBase + index, SetRange(start, end) { this.Start = start; this.End = end; const offset = corruptSetRangeReadback ? 1 : 0; this.Text = text.slice(start - characterBase + offset, end - characterBase + offset); } });
+  const paragraphRange = () => ({ Text: text + "\r", Start: 10, End: 10 + text.length + 1, Tables: { Count: 0 }, Characters: { Item(index) { return characterRange(index); } } });
   const application = { ActiveDocument: { FullName: "C:\\preview.docx", Saved: true, Sections: { Count: 1 }, Comments: commentCollection, Paragraphs: { Count: 1, Item() { return { Range: paragraphRange() }; } }, Range() { return { Start: 999, End: 1000, Text: "错误的 Document.Range" }; } } };
   const diagnostics = []; const bridge = new WpsHostBridge(application, { writeForComponent(...values) { diagnostics.push(values); } }); const base = { type: "host.rpc.request", job_id: "preview-job-1", build_id: "build-1", payload: {} };
   const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-preview", operation: "host.capture_document_descriptor" });
@@ -965,7 +966,7 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-2", items: plan } });
   assert.equal(mismatched.ok, false); assert.equal(mismatched.error.code, "HOST_RANGE_TEXT_MISMATCH");
   const failedDiagnostic = diagnostics.filter((item) => item[2] === "host.rpc.failed").at(-1);
-  assert.match(failedDiagnostic[4].technical_detail, /paragraph_index=0; requested_start=10; requested_end=14; actual_start=10; actual_end=14; expected_sha256=[0-9a-f]{12}; actual_sha256=[0-9a-f]{12}; expected_length_utf16=4; actual_length_utf16=3/);
+  assert.match(failedDiagnostic[4].technical_detail, /paragraph_index=0; relative_start=0; relative_end=4; paragraph_start=10; paragraph_end=15; character_start=9; character_end=13; actual_start=9; actual_end=13; expected_sha256=[0-9a-f]{12}; actual_sha256=[0-9a-f]{12}; expected_length_utf16=4; actual_length_utf16=3/);
 });
 
 test("preview comments anchor each mixed role to its verified UTF-16 sub-range", async () => {

@@ -84,7 +84,7 @@ class ProcessMetadataResult:
     detail: str = ""
 
 
-def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None, *, component: str = "main") -> None:
+def log_event(level: str, event: str, message: str, data: Optional[Dict[str, object]] = None, error: object = None, *, component: str = "main", emit_console: bool = True) -> None:
     event_value: Dict[str, object] = {
         "timestamp": utc_now(),
         "level": level,
@@ -96,7 +96,8 @@ def log_event(level: str, event: str, message: str, data: Optional[Dict[str, obj
     if error is not None:
         event_value["error"] = {"name": type(error).__name__, "message": str(error)}
     for line in LOG_WRITER.append([event_value]):
-        print(line, flush=True)
+        if emit_console:
+            print(line, flush=True)
 
 
 class StepFailed(RuntimeError):
@@ -1159,7 +1160,7 @@ def current_wps_load_events() -> List[Dict[str, object]]:
     ]
 
 
-def maybe_log_wps_load_completed(events: Optional[List[Dict[str, object]]] = None) -> bool:
+def maybe_log_wps_load_completed(events: Optional[List[Dict[str, object]]] = None, *, emit_console: bool = True) -> bool:
     global _wps_load_completion_logged
     if _wps_load_completion_logged:
         return True
@@ -1177,6 +1178,7 @@ def maybe_log_wps_load_completed(events: Optional[List[Dict[str, object]]] = Non
         "WPS 加载完成",
         {"result_cn": "成功", "build_id": build_id, "summary_lines": ["主页面、Ribbon、Host Runtime、应用运行时和 Worker 探针均已就绪"]},
         component="main",
+        emit_console=emit_console,
     )
     _wps_load_completion_logged = True
     return True
@@ -1242,10 +1244,10 @@ def watch_wps_log(*, announce: bool = True) -> None:
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
                     handle.seek(positions[path])
                     for line in handle:
-                        rendered = line.strip()
-                        if not rendered:
+                        rendered = line.rstrip("\r\n")
+                        if not rendered.strip():
                             continue
-                        fingerprint = rendered
+                        fingerprint = rendered.strip()
                         if fingerprint == last_fingerprint:
                             suppressed_repeats += 1
                             continue
@@ -1255,7 +1257,7 @@ def watch_wps_log(*, announce: bool = True) -> None:
                         last_fingerprint = fingerprint
                         print(rendered, flush=True)
                     positions[path] = handle.tell()
-            maybe_log_wps_load_completed()
+            maybe_log_wps_load_completed(emit_console=False)
             time.sleep(0.5)
     except KeyboardInterrupt:
         if suppressed_repeats:
