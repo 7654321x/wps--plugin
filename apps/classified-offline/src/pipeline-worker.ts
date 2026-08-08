@@ -5,10 +5,10 @@ import { LocalFormatCommandGenerator, type LocalFormatProfile } from "../../../p
 import { COMMAND_REQUEST_VERSION, assertFormattingCommandSet, type CommandRequest, type FormattingCommandSet, type RecognitionResult } from "../../../packages/contracts/src/index.js";
 import type { PipelineWorkerConfig } from "../../../packages/threading/src/protocol.js";
 import { createPreviewPlan, type PreviewPlanItem } from "../../../packages/wps-adapter/src/preview-comments.js";
-import { LocalHttpControlTransport, StaticControlEndpointProvider, assertControlJobResult, type ControlJobRequest, type ControlJobResult } from "../../../packages/control-client/src/index.js";
+import { ControlTransportError, LocalHttpControlTransport, StaticControlEndpointProvider, assertControlJobResult, type ControlJobRequest, type ControlJobResult } from "../../../packages/control-client/src/index.js";
 
 type WorkerScopeLike = { postMessage: (value: unknown) => void; onmessage: ((event: { data: unknown }) => void) | null };
-type SnapshotStage = "idle" | "capturing_descriptor" | "reading_paragraphs" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "generating_commands" | "validating_targets" | "writing_preview" | "applying_format" | "rolling_back" | "completed" | "failed" | "cancelled";
+type SnapshotStage = "idle" | "capturing_descriptor" | "reading_paragraphs" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "normalizing_structure" | "resnapshotting_after_normalization" | "generating_commands" | "validating_targets" | "writing_preview" | "applying_format" | "rolling_back" | "completed" | "failed" | "cancelled";
 interface SnapshotJobContext {
   job: PipelineJob; stage: SnapshotStage; cancelled: boolean; descriptor: DocumentDescriptor | null;
   paragraphs: HostParagraphData[]; started_at_ms: number; batch: AdaptiveBatchController; batch_sizes: number[];
@@ -86,8 +86,74 @@ export async function createEquivalentSnapshot(descriptor: DocumentDescriptor, p
   return {
     snapshotContractVersion: "worker-snapshot-v1", documentId: `wps-${sourceSha256.slice(0, 16)}`, revision: textRevision, textRevision,
     sourceSha256, localDocxPath: descriptor.local_docx_path,
-    paragraphs: paragraphs.map((item) => ({ sourceParagraphIndex: item.host_paragraph_index, text: item.raw_text, isInTable: item.is_in_table })),
+    paragraphs: paragraphs.map((item) => ({ sourceParagraphIndex: item.host_paragraph_index, text: item.raw_text, isInTable: item.is_in_table, hasSectionBreak: Boolean(item.has_section_break), hasPageBreak: Boolean(item.has_page_break), hasObject: Boolean(item.has_object) })),
     paragraphOrderHash, sectionCount: descriptor.section_count, documentFullNameHash: descriptor.local_docx_path_hash,
+  };
+}
+
+export interface StructuralNormalizationPlanItem {
+  host_paragraph_index: number;
+  host_raw_text_sha256: string;
+  boundaries: Array<{ gap_start_utf16: number; gap_end_utf16: number }>;
+  trim_start_utf16: number;
+  trim_end_utf16: number;
+  delete_empty: boolean;
+}
+
+export interface StructuralNormalizationPlan {
+  items: StructuralNormalizationPlanItem[];
+  split_source_paragraph_count: number;
+  created_paragraph_count: number;
+  trimmed_boundary_count: number;
+  removed_empty_paragraph_count: number;
+}
+
+const EMPTY_TEXT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+export function createStructuralNormalizationPlan(snapshot: SerializableLocalDocumentSnapshot, recognition: RecognitionResult): StructuralNormalizationPlan {
+  const sources = new Map(snapshot.paragraphs.map((item) => [item.sourceParagraphIndex, item]));
+  const grouped = new Map<number, RecognitionResult["paragraphs"]>();
+  for (const item of recognition.paragraphs) {
+    if (!item.locator_verified) continue;
+    const values = grouped.get(item.host_paragraph_index) ?? [];
+    values.push(item); grouped.set(item.host_paragraph_index, values);
+  }
+  const items: StructuralNormalizationPlanItem[] = [];
+  for (const [hostParagraphIndex, values] of grouped) {
+    const source = sources.get(hostParagraphIndex);
+    if (!source || source.isInTable || !values.length) continue;
+    const total = Math.max(...values.map((item) => item.segment_count_total));
+    if (values.length !== total || values.some((item) => item.segment_count_located !== total)) continue;
+    const ordered = [...values].sort((left, right) => left.host_raw_start_utf16 - right.host_raw_start_utf16);
+    const hash = ordered[0].host_raw_text_sha256;
+    if (ordered.some((item) => item.host_raw_text_sha256 !== hash)) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+    const boundaries: StructuralNormalizationPlanItem["boundaries"] = [];
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1]; const current = ordered[index];
+      if (previous.host_raw_end_utf16 > current.host_raw_start_utf16) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+      const gap = source.text.slice(previous.host_raw_end_utf16, current.host_raw_start_utf16);
+      if (!/^[\s\v]*$/u.test(gap) || current.host_raw_start_utf16 < 1 || current.host_raw_start_utf16 >= source.text.length) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+      boundaries.push({ gap_start_utf16: previous.host_raw_end_utf16, gap_end_utf16: current.host_raw_start_utf16 });
+    }
+    const trimStart = ordered[0].host_raw_start_utf16;
+    const trimEnd = ordered[ordered.length - 1].host_raw_end_utf16;
+    if (!/^[\s\v]*$/u.test(source.text.slice(0, trimStart)) || !/^[\s\v]*$/u.test(source.text.slice(trimEnd))) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+    if (boundaries.length || trimStart > 0 || trimEnd < source.text.length) items.push({ host_paragraph_index: hostParagraphIndex, host_raw_text_sha256: hash, boundaries, trim_start_utf16: trimStart, trim_end_utf16: trimEnd, delete_empty: false });
+  }
+  for (let index = 1; index < snapshot.paragraphs.length - 1; index += 1) {
+    const source = snapshot.paragraphs[index];
+    if (source.text !== "" || source.isInTable || source.hasSectionBreak || source.hasPageBreak || source.hasObject) continue;
+    const previous = grouped.get(snapshot.paragraphs[index - 1].sourceParagraphIndex) ?? [];
+    const next = grouped.get(snapshot.paragraphs[index + 1].sourceParagraphIndex) ?? [];
+    if (!previous.some((item) => item.locator_verified && /^heading[1-4]$/.test(item.recognized_type)) || !next.some((item) => item.locator_verified && item.recognized_type === "body")) continue;
+    items.push({ host_paragraph_index: source.sourceParagraphIndex, host_raw_text_sha256: EMPTY_TEXT_SHA256, boundaries: [], trim_start_utf16: 0, trim_end_utf16: 0, delete_empty: true });
+  }
+  return {
+    items,
+    split_source_paragraph_count: items.filter((item) => item.boundaries.length > 0).length,
+    created_paragraph_count: items.reduce((totalValue, item) => totalValue + item.boundaries.length, 0),
+    trimmed_boundary_count: items.reduce((totalValue, item) => totalValue + (item.delete_empty ? 0 : Number(item.trim_start_utf16 > 0) + Number(item.trim_end_utf16 < (sources.get(item.host_paragraph_index)?.text.length ?? 0))), 0),
+    removed_empty_paragraph_count: items.filter((item) => item.delete_empty).length,
   };
 }
 
@@ -132,15 +198,39 @@ export class SnapshotPipelineWorkerRuntime {
   private async run(context: SnapshotJobContext): Promise<void> {
     this.diagnostic(context, "pipeline.job.started");
     try {
-      const built = await this.buildSnapshot(context);
+      let built = await this.buildSnapshot(context);
       assertNotCancelled(context);
-      const controlResult = context.job.command === "snapshot_shadow" ? null : await this.controlJob(context, built.snapshot);
-      const recognition = context.job.command === "snapshot_shadow" ? undefined : (controlResult?.recognition_result as RecognitionResult | undefined) ?? await this.recognize(context, built.snapshot);
-      let commands: FormattingCommandSet | undefined; let previewResult: { session_id: string; comment_count: number; plan_count: number } | undefined; let formatResult: { executed_command_count: number; skipped_command_count: number; batch_count: number } | undefined;
+      let controlResult = context.job.command === "snapshot_shadow" ? null : await this.controlJob(context, built.snapshot);
+      let recognition = context.job.command === "snapshot_shadow" ? undefined : (controlResult?.recognition_result as RecognitionResult | undefined) ?? await this.recognize(context, built.snapshot);
+      let splitSourceParagraphCount = 0; let createdParagraphCount = 0; let trimmedBoundaryCount = 0; let removedEmptyParagraphCount = 0;
+      if (context.job.command === "format" && recognition) {
+        const normalizationPlan = createStructuralNormalizationPlan(built.snapshot, recognition);
+        if (normalizationPlan.items.length) {
+          await this.verifySnapshot(context, built.snapshot);
+          context.stage = "normalizing_structure";
+          const expectedVisibleTextSha256 = await sha256(built.snapshot.paragraphs.map((item) => item.text.replace(/[\s\v]/gu, "")).join(""));
+          const normalized = await this.rpc<Record<string, JsonValue>>(context, "host.apply_structural_normalization_batch", { items: normalizationPlan.items as unknown as JsonValue, expected_visible_text_sha256: expectedVisibleTextSha256 }, context.descriptor?.document_token, 30_000);
+          splitSourceParagraphCount = Number(normalized.value.split_source_paragraph_count ?? 0);
+          createdParagraphCount = Number(normalized.value.created_paragraph_count ?? 0);
+          trimmedBoundaryCount = Number(normalized.value.trimmed_boundary_count ?? 0);
+          removedEmptyParagraphCount = Number(normalized.value.removed_empty_paragraph_count ?? 0);
+          if (splitSourceParagraphCount !== normalizationPlan.split_source_paragraph_count || createdParagraphCount !== normalizationPlan.created_paragraph_count || trimmedBoundaryCount !== normalizationPlan.trimmed_boundary_count || removedEmptyParagraphCount !== normalizationPlan.removed_empty_paragraph_count) throw new Error("STRUCTURAL_NORMALIZATION_INCOMPLETE");
+          context.stage = "resnapshotting_after_normalization";
+          this.diagnostic(context, "pipeline.structure.normalization.recheck.start", { split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: createdParagraphCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, paragraph_count_before: built.snapshot.paragraphs.length, expected_paragraph_count_after: built.snapshot.paragraphs.length + createdParagraphCount - removedEmptyParagraphCount });
+          built = await this.buildSnapshot(context);
+          controlResult = await this.controlJob(context, built.snapshot, `${context.job.job_id}-post-normalization`, "recognize_only");
+          recognition = (controlResult?.recognition_result as RecognitionResult | undefined) ?? await this.recognize(context, built.snapshot);
+          const remainingMixed = recognition.paragraphs.filter((item) => item.mixed_structure && item.locator_verified);
+          this.diagnostic(context, remainingMixed.length ? "pipeline.structure.normalization.recheck.failed" : "pipeline.structure.normalization.recheck.completed", { split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: createdParagraphCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, paragraph_count_after: built.snapshot.paragraphs.length, recognition_paragraph_count: recognition.paragraphs.length, unresolved_block_count: recognition.unresolved_blocks?.length ?? 0, remaining_mixed_paragraph_count: new Set(remainingMixed.map((item) => item.physical_paragraph_index)).size, remaining_mixed_items: remainingMixed.map((item) => ({ source_paragraph_index: item.source_paragraph_index, physical_paragraph_index: item.physical_paragraph_index, host_paragraph_index: item.host_paragraph_index, segment_count_total: item.segment_count_total, segment_count_located: item.segment_count_located, locator_verified: item.locator_verified })) });
+          if (remainingMixed.length) throw new Error("STRUCTURAL_NORMALIZATION_INCOMPLETE");
+          this.diagnostic(context, "pipeline.structure.normalization.complete", { split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: createdParagraphCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, paragraph_count_after: built.snapshot.paragraphs.length });
+        }
+      }
+      let commands: FormattingCommandSet | undefined; let previewResult: { session_id: string; comment_count: number; plan_count: number } | undefined; let formatResult: { executed_command_count: number; skipped_command_count: number; skipped_review_count: number; skipped_mixed_count: number; skipped_unresolved_count: number; split_source_paragraph_count: number; created_paragraph_count: number; trimmed_boundary_count: number; removed_empty_paragraph_count: number; batch_count: number } | undefined;
       if (context.job.command === "preview" || context.job.command === "format") {
         if (!this.config) throw new Error("PIPELINE_WORKER_CONFIG_REQUIRED");
         context.stage = "generating_commands";
-        if (controlResult) {
+        if (controlResult && createdParagraphCount === 0 && trimmedBoundaryCount === 0 && removedEmptyParagraphCount === 0) {
           commands = controlResult.formatting_plan as unknown as FormattingCommandSet;
           assertFormattingCommandSet(commands, context.job.job_id);
         } else {
@@ -152,13 +242,14 @@ export class SnapshotPipelineWorkerRuntime {
           previewResult = await this.writePreview(context, plan);
         } else {
           await this.verifySnapshot(context, built.snapshot);
-          formatResult = await this.applyFormat(context, built.snapshot, commands);
+          formatResult = await this.applyFormat(context, built.snapshot, commands, recognition!, splitSourceParagraphCount, createdParagraphCount, trimmedBoundaryCount, removedEmptyParagraphCount);
         }
       }
       context.stage = "completed";
       this.post({ type: "pipeline.completed", job_id: context.job.job_id, build_id: context.job.build_id, command: context.job.command, snapshot_summary: built.summary, ...(recognition ? { recognition_result: recognition } : {}), ...(commands ? { formatting_commands: commands } : {}), ...(previewResult ? { preview_result: previewResult } : {}), ...(formatResult ? { format_result: formatResult } : {}) });
     } catch (error) {
       const code = errorCode(error);
+      if (error instanceof ControlTransportError) this.diagnostic(context, "control.job.failed", { stable_error_code: code, pipeline_stage: context.stage, http_status: error.status ?? 0, ...error.details });
       if (context.preview_session_id) await this.clearPreview(context).catch(() => undefined);
       if (code === "PIPELINE_CANCELLED") {
         context.stage = "cancelled";
@@ -180,13 +271,13 @@ export class SnapshotPipelineWorkerRuntime {
     return new LocalHttpControlTransport(new StaticControlEndpointProvider(endpoint));
   }
 
-  private async controlJob(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot): Promise<ControlJobResult | null> {
+  private async controlJob(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot, requestId = context.job.job_id, modeOverride?: ControlJobRequest["mode"]): Promise<ControlJobResult | null> {
     const transport = this.createControlTransport();
     if (!transport || !context.descriptor) return null;
-    const mode = context.job.command === "preview" ? "preview" : context.job.command === "format" ? "format" : "recognize_only";
+    const mode = modeOverride ?? (context.job.command === "preview" ? "preview" : context.job.command === "format" ? "format" : "recognize_only");
     const request: ControlJobRequest = {
       schema_version: 1,
-      request_id: context.job.job_id,
+      request_id: requestId,
       mode,
       document_token: context.descriptor.document_token,
       document_revision: snapshot.revision,
@@ -224,6 +315,7 @@ export class SnapshotPipelineWorkerRuntime {
   }
 
   private async buildSnapshot(context: SnapshotJobContext): Promise<{ snapshot: SerializableLocalDocumentSnapshot; summary: SnapshotSummary }> {
+    context.paragraphs = []; context.batch_sizes = [];
     context.stage = "capturing_descriptor"; this.diagnostic(context, "pipeline.snapshot.descriptor.start");
     const descriptorResult = await this.rpc<DocumentDescriptor>(context, "host.capture_document_descriptor", {}, undefined, this.options.rpc_timeout_ms ?? 10_000);
     context.host_rpc_durations.push(descriptorResult.host_duration_ms); context.worker_roundtrip_durations.push(descriptorResult.worker_roundtrip_ms); context.descriptor = descriptorResult.value;
@@ -309,7 +401,7 @@ export class SnapshotPipelineWorkerRuntime {
     this.diagnostic(context, "pipeline.snapshot.verify.complete", { paragraph_count: paragraphs.length, source_sha256_prefix: current.sourceSha256.slice(0, 8) });
   }
 
-  private async applyFormat(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot, commandSet: FormattingCommandSet): Promise<{ executed_command_count: number; skipped_command_count: number; batch_count: number }> {
+  private async applyFormat(context: SnapshotJobContext, snapshot: SerializableLocalDocumentSnapshot, commandSet: FormattingCommandSet, recognition: RecognitionResult, splitSourceParagraphCount: number, createdParagraphCount: number, trimmedBoundaryCount: number, removedEmptyParagraphCount: number): Promise<{ executed_command_count: number; skipped_command_count: number; skipped_review_count: number; skipped_mixed_count: number; skipped_unresolved_count: number; split_source_paragraph_count: number; created_paragraph_count: number; trimmed_boundary_count: number; removed_empty_paragraph_count: number; batch_count: number }> {
     if (!context.descriptor) throw new Error("PIPELINE_DESCRIPTOR_REQUIRED");
     context.stage = "applying_format";
     const begin = await this.rpc<Record<string, JsonValue>>(context, "host.begin_transaction", { document_revision: snapshot.revision }, context.descriptor.document_token);
@@ -330,7 +422,12 @@ export class SnapshotPipelineWorkerRuntime {
       }
       await this.rpc<Record<string, JsonValue>>(context, "host.commit_transaction", { transaction_id: transactionId }, context.descriptor.document_token);
       context.format_transaction_id = null;
-      return { executed_command_count: executed, skipped_command_count: 0, batch_count: batches };
+      const formattedTargetIds = new Set(commandSet.commands.filter((item) => item.kind.startsWith("paragraph.")).map((item) => item.target.target_id));
+      const skipped = recognition.paragraphs.filter((item) => !formattedTargetIds.has(item.target_id));
+      const skippedMixed = skipped.filter((item) => item.mixed_structure).length;
+      const skippedReview = skipped.filter((item) => !item.mixed_structure).length;
+      const skippedUnresolved = recognition.unresolved_blocks?.length ?? 0;
+      return { executed_command_count: executed, skipped_command_count: skipped.length + skippedUnresolved, skipped_review_count: skippedReview, skipped_mixed_count: skippedMixed, skipped_unresolved_count: skippedUnresolved, split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: createdParagraphCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, batch_count: batches };
     } catch (error) {
       context.stage = "rolling_back";
       await this.rpc<Record<string, JsonValue>>(context, "host.rollback_batch", { transaction_id: transactionId }, context.descriptor.document_token).catch(() => undefined);

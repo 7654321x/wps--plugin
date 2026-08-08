@@ -33,7 +33,7 @@ class LocalFormattingPlannerPort:
             "profile_id": request["profile_id"],
             "profile_version": request["profile_version"],
             "client_capabilities": capabilities,
-            "product_version": "1.4.0",
+            "product_version": "1.4.3",
             "authorization_scope": "classified-offline",
         }
         try:

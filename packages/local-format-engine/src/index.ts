@@ -145,10 +145,6 @@ export class LocalFormatCommandGenerator implements CommandServiceClient {
       }));
     }
     for (const paragraph of request.recognition_result.paragraphs) {
-      if (paragraph.formatting_disposition !== "apply") {
-        warnings.push(`REVIEW_ONLY_TARGET_SKIPPED:${paragraph.target_id}`);
-        continue;
-      }
       const styleKey = STYLE_ROLE_ALIASES[paragraph.recognized_type] ?? paragraph.recognized_type;
       const style = this.profile.styles[styleKey];
       if (!style) {

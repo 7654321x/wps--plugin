@@ -101,15 +101,16 @@ function focusDocument(): void {
   }
 }
 function rows(id: string, values: string[]): void { node(id).replaceChildren(...values.map((value) => { const row = document.createElement("div"); row.className = "row"; row.textContent = value; return row; })); }
-function reviewText(item: ReviewDisplayModel): string {
+function reviewText(item: ReviewDisplayModel, recognizedType: string, plan = ""): string {
   const reasons: string[] = [];
-  if (item.mixed_structure) reasons.push("混合结构：同一物理段落包含多个角色，正式排版前需要拆段");
+  if (item.mixed_structure) reasons.push("混合结构：按识别范围分别排版");
   if (item.review_level === "review" || item.review_level === "critical_review") reasons.push("识别结果已定位，建议人工复核");
-  if (reasons.length > 0) return reasons.join(" · ");
-  return item.needs_review || item.formatting_disposition === "review_only" ? "需要复核" : "可应用";
+  const willFormat = recognizedType !== "unknown" && plan !== "无可应用命令";
+  if (reasons.length > 0) return `${reasons.join(" · ")} · ${willFormat ? "正式排版会执行" : "正式排版不会执行"}`;
+  return willFormat ? "可应用：正式排版会执行" : "未知或无可用格式：正式排版不会执行";
 }
 function issueText(state: HostState): string {
-  if (state.latest_error === "MIXED_PARAGRAPH_REQUIRES_SPLIT") return `检测到 ${state.mixed_paragraph_count ?? 0} 个物理段落包含多个角色。预览批注已按文字范围分别标出；请先拆分这些段落，再执行一键排版。`;
+  if (state.latest_error === "MIXED_PARAGRAPH_REQUIRES_SPLIT") return `检测到 ${state.mixed_paragraph_count ?? 0} 个物理段落包含多个角色，自动结构化拆段未完成，已停止当前排版。`;
   if (state.latest_error === "RECOGNITION_LOCATOR_UNVERIFIED") return `有 ${state.unresolved_block_count ?? 0} 个识别块无法证明原文位置。系统没有猜测定位，请根据预览批注复核。`;
   if (state.latest_error === "RECOGNITION_LOCATOR_AMBIGUOUS") return `有 ${state.unresolved_block_count ?? 0} 个识别块存在重复位置歧义。系统没有猜测定位，请根据预览批注复核。`;
   return state.latest_error ? errorText(state.latest_error) : "暂无问题。";
@@ -123,9 +124,9 @@ function render(state: HostState): void {
   const build = bridgeWindow.DocxtoolBuildInfo; const expected = new URLSearchParams(location.search).get("host_build");
   if (!build || state.build_id !== build.build_id || (expected && expected !== build.build_id)) { const warning = node("context-warning"); warning.hidden = false; warning.textContent = "ADDIN_CONTEXT_STALE：当前 WPS 加载的是旧版 Docxtool，请关闭全部 WPS 窗口后重新打开。"; return; }
   text("recognition-summary", state.recognition_summary || "等待识别。");
-  rows("recognition-rows", state.paragraph_recognition_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · 置信度 ${Math.round(item.confidence * 100)}% · ${reviewText(item)}`));
+  rows("recognition-rows", state.paragraph_recognition_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · 置信度 ${Math.round(item.confidence * 100)}% · ${reviewText(item, item.recognized_type)}`));
   text("preview-summary", state.preview_comment_status || "不会写入格式；空段落不添加批注。");
-  rows("preview-rows", state.formatting_preview_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · ${item.plan} · ${reviewText(item)}`));
+  rows("preview-rows", state.formatting_preview_models.map((item) => `段落 ${item.paragraph_index + 1} · ${roles[item.recognized_type] ?? "未知"} · ${item.plan} · ${reviewText(item, item.recognized_type, item.plan)}`));
   text("workflow-status", workflowText(state)); text("execution-result", state.formatting_result || ""); text("issues", issueText(state));
   text("health-summary", state.health_report || "尚未运行功能检测。");
   document.body.dataset.activeView = state.active_view;

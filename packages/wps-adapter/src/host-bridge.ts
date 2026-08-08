@@ -12,6 +12,7 @@ import { WpsApiDocumentExecutor, WpsCapabilityProvider, WpsTransactionManager } 
 type WpsObject = Record<string, any>;
 export const HOST_PARAGRAPH_BATCH_LIMIT = 10;
 export const HOST_FORMAT_BATCH_LIMIT = 12;
+export const HOST_STRUCTURAL_NORMALIZATION_LIMIT = 200;
 export interface WpsHostBridgeOptions {
   recognitionExecutablePath?: string;
   recognitionContractVersion?: number;
@@ -38,14 +39,52 @@ function technicalDetail(error: unknown): string { const value = error && typeof
 function snapshot(value: unknown): SerializableLocalDocumentSnapshot {
   const item = value as Partial<SerializableLocalDocumentSnapshot> | null;
   if (!item || item.snapshotContractVersion !== "worker-snapshot-v1" || typeof item.documentId !== "string" || typeof item.revision !== "string" || typeof item.textRevision !== "string" || typeof item.sourceSha256 !== "string" || typeof item.localDocxPath !== "string" || !Array.isArray(item.paragraphs)) throw new Error("INVALID_WORKER_SNAPSHOT");
-  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean") throw new Error("INVALID_WORKER_SNAPSHOT");
+  for (const paragraph of item.paragraphs) if (!paragraph || !Number.isInteger(paragraph.sourceParagraphIndex) || typeof paragraph.text !== "string" || typeof paragraph.isInTable !== "boolean" || typeof paragraph.hasSectionBreak !== "boolean" || typeof paragraph.hasPageBreak !== "boolean" || typeof paragraph.hasObject !== "boolean") throw new Error("INVALID_WORKER_SNAPSHOT");
   return item as SerializableLocalDocumentSnapshot;
+}
+
+interface StructuralNormalizationBoundary { gap_start_utf16: number; gap_end_utf16: number; }
+interface StructuralNormalizationItem { host_paragraph_index: number; host_raw_text_sha256: string; boundaries: StructuralNormalizationBoundary[]; trim_start_utf16: number; trim_end_utf16: number; delete_empty: boolean; }
+
+async function documentVisibleTextSha256(document: WpsObject): Promise<string> {
+  const values: string[] = [];
+  const count = Number(document.Paragraphs?.Count ?? 0);
+  for (let index = 1; index <= count; index += 1) values.push(stripWpsImplicitParagraphTerminator(document.Paragraphs.Item(index)?.Range?.Text).replace(/[\s\v]/gu, ""));
+  return sha256(values.join(""));
+}
+
+function characterOrdinal(rawText: string, offset: number): number {
+  let position = 0; let ordinal = 0;
+  for (const character of rawText) { if (position === offset) return ordinal; position += character.length; ordinal += 1; }
+  if (position === offset) return ordinal;
+  throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+}
+
+function splitRange(paragraphRange: WpsObject, rawText: string, start: number, end: number): WpsObject {
+  const characters = paragraphRange.Characters as WpsObject | undefined;
+  if (!characters || typeof characters.Item !== "function") throw new Error("STRUCTURAL_NORMALIZATION_API_UNSUPPORTED");
+  const firstOrdinal = characterOrdinal(rawText, start);
+  const first = characters.Item(firstOrdinal + 1) as WpsObject | undefined;
+  if (!first || typeof first.SetRange !== "function") throw new Error("STRUCTURAL_NORMALIZATION_API_UNSUPPORTED");
+  const rangeStart = Number(first.Start);
+  if (!Number.isFinite(rangeStart)) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+  if (start === end) {
+    first.SetRange(rangeStart, rangeStart);
+    return first;
+  }
+  const lastOrdinal = characterOrdinal(rawText, end);
+  const last = characters.Item(lastOrdinal) as WpsObject | undefined;
+  const rangeEnd = Number(last?.End);
+  if (!last || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+  first.SetRange(rangeStart, rangeEnd);
+  if (stripWpsImplicitParagraphTerminator(first.Text) !== rawText.slice(start, end)) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+  return first;
 }
 
 export class WpsHostBridge {
   private readonly operationCounts = new Map<string, number>();
   private lastOperationDetail: Record<string, JsonValue> = {};
-  private descriptorIdentity: { document_token: string; full_name: string; paragraph_count: number; section_count: number } | null = null;
+  private descriptorIdentity: { document_token: string; document_path_hash: string; full_name: string; paragraph_count: number; section_count: number } | null = null;
   private readonly recognitionJobs: WpsRecognitionJobService | null;
   private readonly previewBatches: WpsPreviewBatchService;
   private readonly formatTransactions = new WpsTransactionManager();
@@ -62,7 +101,7 @@ export class WpsHostBridge {
     let deleted = 0;
     try {
       for (;;) {
-        const result = this.previewBatches.clear(descriptor.document_token, HOST_PREVIEW_BATCH_LIMIT) as { deleted_count?: number; remaining?: number; user_comment_integrity?: boolean };
+        const result = this.previewBatches.clear(descriptor.document_token, descriptor.local_docx_path_hash, HOST_PREVIEW_BATCH_LIMIT) as { deleted_count?: number; remaining?: number; user_comment_integrity?: boolean };
         if (result.user_comment_integrity === false) throw new Error("PREVIEW_USER_COMMENT_CHANGED");
         deleted += Number(result.deleted_count ?? 0);
         if (Number(result.remaining ?? 0) === 0) {
@@ -106,6 +145,7 @@ export class WpsHostBridge {
     if (request.operation === "host.cancel_recognition") return this.cancelRecognition(request);
     if (request.operation === "host.apply_preview_batch") return this.applyPreviewBatch(request);
     if (request.operation === "host.clear_preview_batch") return this.clearPreviewBatch(request);
+    if (request.operation === "host.apply_structural_normalization_batch") return this.applyStructuralNormalizationBatch(request);
     if (request.operation === "host.begin_transaction") return this.beginFormatTransaction(request);
     if (request.operation === "host.apply_format_batch") return this.applyFormatBatch(request);
     if (request.operation === "host.rollback_batch") return this.rollbackFormatTransaction(request);
@@ -122,7 +162,7 @@ export class WpsHostBridge {
     const sectionCount = Number(document.Sections?.Count ?? 0);
     const tokenHash = await sha256(`${pathHash}:${paragraphCount}:${sectionCount}`);
     const documentToken = `doc-${tokenHash.slice(0, 32)}`;
-    this.descriptorIdentity = { document_token: documentToken, full_name: fullName, paragraph_count: paragraphCount, section_count: sectionCount };
+    this.descriptorIdentity = { document_token: documentToken, document_path_hash: pathHash, full_name: fullName, paragraph_count: paragraphCount, section_count: sectionCount };
     return { document_token: documentToken, saved: document.Saved === true, local_docx_path: fullName, local_docx_path_hash: pathHash, paragraph_count: paragraphCount, section_count: sectionCount, extension: fullName.toLocaleLowerCase().endsWith(".docx") ? ".docx" : "" };
   }
 
@@ -158,13 +198,17 @@ export class WpsHostBridge {
       const range = paragraph.Range as WpsObject;
       elapsed = performance.now() - measured;
       if (elapsed > slowestApiMs) { slowestApi = "Paragraph.Range"; slowestApiMs = elapsed; }
-      measured = performance.now(); const rawText = stripWpsImplicitParagraphTerminator(range.Text); elapsed = performance.now() - measured;
+      measured = performance.now(); const hostRangeText = String(range.Text ?? ""); const rawText = stripWpsImplicitParagraphTerminator(hostRangeText); elapsed = performance.now() - measured;
       if (elapsed > slowestApiMs) { slowestApi = "Range.Text"; slowestApiMs = elapsed; }
       measured = performance.now(); const isInTable = Number(range.Tables?.Count ?? 0) > 0; elapsed = performance.now() - measured;
       if (elapsed > slowestApiMs) { slowestApi = "Range.Tables.Count"; slowestApiMs = elapsed; }
       measured = performance.now(); const rangeStart = Number(range.Start); const rangeEnd = Number(range.End); elapsed = performance.now() - measured;
       if (elapsed > slowestApiMs) { slowestApi = "Range.StartEnd"; slowestApiMs = elapsed; }
-      values.push({ host_paragraph_index: index, raw_text: rawText, is_in_table: isInTable, range_start: rangeStart, range_end: rangeEnd });
+      const hasSectionBreak = hostRangeText.endsWith("\r\f");
+      const emptyParagraphCandidate = rawText === "" && !isInTable;
+      const hasPageBreak = rawText.includes("\f") || (emptyParagraphCandidate && Boolean(range.ParagraphFormat?.PageBreakBefore));
+      const hasObject = emptyParagraphCandidate && (Number(range.InlineShapes?.Count ?? 0) > 0 || Number(range.ShapeRange?.Count ?? 0) > 0 || Number(range.Fields?.Count ?? 0) > 0);
+      values.push({ host_paragraph_index: index, raw_text: rawText, is_in_table: isInTable, range_start: rangeStart, range_end: rangeEnd, has_section_break: hasSectionBreak, has_page_break: hasPageBreak, has_object: hasObject });
     }
     this.lastOperationDetail = { start_index: startIndex, slowest_api: slowestApi, slowest_api_ms: slowestApiMs };
     return values;
@@ -219,12 +263,98 @@ export class WpsHostBridge {
     this.validateDocumentToken(request.document_token);
     const items = request.payload.items;
     if (!Array.isArray(items) || items.length < 1 || items.length > HOST_PREVIEW_BATCH_LIMIT) throw new Error("HOST_PREVIEW_BATCH_INVALID");
-    return this.previewBatches.apply(String(request.document_token ?? ""), String(request.payload.session_id ?? ""), items as unknown as PreviewPlanItem[]);
+    return this.previewBatches.apply(String(request.document_token ?? ""), String(this.descriptorIdentity?.document_path_hash ?? ""), String(request.payload.session_id ?? ""), items as unknown as PreviewPlanItem[]);
   }
 
   private clearPreviewBatch(request: WorkerHostRequest): JsonValue {
     this.validateDocumentToken(request.document_token);
-    return this.previewBatches.clear(String(request.document_token ?? ""), Number(request.payload.batch_size));
+    return this.previewBatches.clear(String(request.document_token ?? ""), String(this.descriptorIdentity?.document_path_hash ?? ""), Number(request.payload.batch_size));
+  }
+
+  private async applyStructuralNormalizationBatch(request: WorkerHostRequest): Promise<JsonValue> {
+    this.validateDocumentToken(request.document_token);
+    const document = this.application.ActiveDocument as WpsObject | undefined;
+    const undoRecord = this.application.UndoRecord as WpsObject | undefined;
+    const rawItems = request.payload.items;
+    const expectedVisibleTextSha256 = String(request.payload.expected_visible_text_sha256 ?? "");
+    if (!document || !Array.isArray(rawItems) || rawItems.length < 1 || !/^[a-f0-9]{64}$/.test(expectedVisibleTextSha256)) throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+    if (!undoRecord || typeof undoRecord.StartCustomRecord !== "function" || typeof undoRecord.EndCustomRecord !== "function" || typeof document.Undo !== "function") throw new Error("STRUCTURAL_NORMALIZATION_API_UNSUPPORTED");
+    if (await documentVisibleTextSha256(document) !== expectedVisibleTextSha256) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+    const items = rawItems as unknown as StructuralNormalizationItem[];
+    const boundaryCount = items.reduce((total, item) => total + (Array.isArray(item.boundaries) ? item.boundaries.length : 0), 0);
+    const removedEmptyParagraphCount = items.filter((item) => item.delete_empty).length;
+    let trimmedBoundaryCount = 0;
+    if (items.length > HOST_STRUCTURAL_NORMALIZATION_LIMIT) throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+    const prepared = [] as Array<StructuralNormalizationItem & { raw_text: string }>;
+    for (const item of items) {
+      if (!Number.isInteger(item.host_paragraph_index) || item.host_paragraph_index < 0 || !/^[a-f0-9]{64}$/.test(item.host_raw_text_sha256) || !Array.isArray(item.boundaries) || !Number.isInteger(item.trim_start_utf16) || !Number.isInteger(item.trim_end_utf16) || typeof item.delete_empty !== "boolean") throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+      const paragraph = document.Paragraphs?.Item(item.host_paragraph_index + 1) as WpsObject | undefined;
+      const paragraphRange = paragraph?.Range as WpsObject | undefined;
+      const hostRangeText = String(paragraphRange?.Text ?? "");
+      const rawText = stripWpsImplicitParagraphTerminator(hostRangeText);
+      if (!paragraphRange || Number(paragraphRange.Tables?.Count ?? 0) > 0 || await sha256(rawText) !== item.host_raw_text_sha256) throw new Error("STRUCTURAL_NORMALIZATION_RANGE_MISMATCH");
+      if (item.delete_empty) {
+        const hasObject = Number(paragraphRange.InlineShapes?.Count ?? 0) > 0 || Number(paragraphRange.ShapeRange?.Count ?? 0) > 0 || Number(paragraphRange.Fields?.Count ?? 0) > 0;
+        if (rawText !== "" || item.boundaries.length || item.trim_start_utf16 !== 0 || item.trim_end_utf16 !== 0 || hostRangeText.endsWith("\r\f") || Boolean(paragraphRange.ParagraphFormat?.PageBreakBefore) || hasObject || typeof paragraphRange.Delete !== "function") throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+        prepared.push({ ...item, raw_text: rawText });
+        continue;
+      }
+      if (item.trim_start_utf16 < 0 || item.trim_end_utf16 < item.trim_start_utf16 || item.trim_end_utf16 > rawText.length || !/^[\s\v]*$/u.test(rawText.slice(0, item.trim_start_utf16)) || !/^[\s\v]*$/u.test(rawText.slice(item.trim_end_utf16))) throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+      trimmedBoundaryCount += Number(item.trim_start_utf16 > 0) + Number(item.trim_end_utf16 < rawText.length);
+      let previousStart = rawText.length + 1;
+      for (const boundary of [...item.boundaries].sort((left, right) => right.gap_start_utf16 - left.gap_start_utf16)) {
+        if (!Number.isInteger(boundary.gap_start_utf16) || !Number.isInteger(boundary.gap_end_utf16) || boundary.gap_start_utf16 < item.trim_start_utf16 || boundary.gap_end_utf16 < boundary.gap_start_utf16 || boundary.gap_end_utf16 > item.trim_end_utf16 || boundary.gap_end_utf16 >= previousStart || !/^[\s\v]*$/u.test(rawText.slice(boundary.gap_start_utf16, boundary.gap_end_utf16))) throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+        previousStart = boundary.gap_start_utf16;
+      }
+      prepared.push({ ...item, boundaries: [...item.boundaries].sort((left, right) => right.gap_start_utf16 - left.gap_start_utf16), raw_text: rawText });
+    }
+    if (boundaryCount + removedEmptyParagraphCount + trimmedBoundaryCount < 1 || boundaryCount + removedEmptyParagraphCount + trimmedBoundaryCount > HOST_STRUCTURAL_NORMALIZATION_LIMIT) throw new Error("STRUCTURAL_NORMALIZATION_PLAN_INVALID");
+    const paragraphCountBefore = Number(document.Paragraphs?.Count ?? 0);
+    let recordStarted = false; let recordEnded = false;
+    try {
+      undoRecord.StartCustomRecord("Docxtool 结构规范化"); recordStarted = true;
+      for (const item of [...prepared].sort((left, right) => right.host_paragraph_index - left.host_paragraph_index)) {
+        if (item.delete_empty) {
+          document.Paragraphs.Item(item.host_paragraph_index + 1).Range.Delete();
+          continue;
+        }
+        const operations: Array<{ start: number; end: number; kind: "trim" | "split" }> = item.boundaries.map((boundary) => ({ start: boundary.gap_start_utf16, end: boundary.gap_end_utf16, kind: "split" }));
+        if (item.trim_end_utf16 < item.raw_text.length) operations.push({ start: item.trim_end_utf16, end: item.raw_text.length, kind: "trim" });
+        if (item.trim_start_utf16 > 0) operations.push({ start: 0, end: item.trim_start_utf16, kind: "trim" });
+        for (const operation of operations.sort((left, right) => right.start - left.start || right.end - left.end)) {
+          const paragraph = document.Paragraphs.Item(item.host_paragraph_index + 1) as WpsObject;
+          const range = splitRange(paragraph.Range, item.raw_text.slice(0, operation.end), operation.start, operation.end);
+          if (operation.kind === "trim") range.Text = "";
+          else if (operation.start === operation.end) {
+            if (typeof range.InsertAfter !== "function") throw new Error("STRUCTURAL_NORMALIZATION_API_UNSUPPORTED");
+            range.InsertAfter("\r");
+          } else range.Text = "\r";
+        }
+      }
+      const paragraphCountAfter = Number(document.Paragraphs?.Count ?? 0);
+      if (paragraphCountAfter !== paragraphCountBefore + boundaryCount - removedEmptyParagraphCount || await documentVisibleTextSha256(document) !== expectedVisibleTextSha256) throw new Error("STRUCTURAL_NORMALIZATION_INCOMPLETE");
+      undoRecord.EndCustomRecord(); recordEnded = true;
+      if (typeof document.Save !== "function") throw new Error("DOCUMENT_SAVE_FAILED");
+      try { document.Save(); }
+      catch (error) { throw new Error("DOCUMENT_SAVE_FAILED", { cause: error }); }
+      for (let attempt = 0; attempt < 30 && document.Saved !== true; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+      if (document.Saved !== true) throw new Error("DOCUMENT_SAVE_FAILED");
+      this.descriptorIdentity = null;
+      const splitSourceParagraphCount = items.filter((item) => item.boundaries.length > 0).length;
+      this.diagnostics?.writeForComponent("wps-host-bridge", "INFO", "structure.normalization.completed", "WPS 文档结构规范化完成", { split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: boundaryCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, paragraph_count_before: paragraphCountBefore, paragraph_count_after: paragraphCountAfter });
+      return { split_source_paragraph_count: splitSourceParagraphCount, created_paragraph_count: boundaryCount, trimmed_boundary_count: trimmedBoundaryCount, removed_empty_paragraph_count: removedEmptyParagraphCount, paragraph_count_after: paragraphCountAfter };
+    } catch (error) {
+      try {
+        if (recordStarted && !recordEnded) undoRecord.EndCustomRecord();
+        document.Undo(1);
+        if (Number(document.Paragraphs?.Count ?? 0) !== paragraphCountBefore || await documentVisibleTextSha256(document) !== expectedVisibleTextSha256) throw new Error("STRUCTURAL_NORMALIZATION_ROLLBACK_FAILED");
+      } catch (rollbackError) {
+        this.descriptorIdentity = null;
+        throw new Error("STRUCTURAL_NORMALIZATION_ROLLBACK_FAILED", { cause: rollbackError });
+      }
+      this.descriptorIdentity = null;
+      throw error;
+    }
   }
 
   private beginFormatTransaction(request: WorkerHostRequest): JsonValue {

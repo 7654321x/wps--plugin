@@ -15,7 +15,7 @@ from typing import Any, Dict, Mapping
 
 
 CONTROL_CONTRACT_VERSION = 1
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.4.3"
 JOB_MODES = frozenset(("preview", "format", "recognize_only"))
 JOB_STATUSES = frozenset(("queued", "recognizing", "planning", "completed", "failed", "cancelled"))
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

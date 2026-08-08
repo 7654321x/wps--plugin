@@ -47,9 +47,7 @@ export class FormatDocumentUseCase {
     progress("recognition", "识别文档"); assertNotCancelled(options.signal);
     const recognition = await this.recognitionProvider.recognize(snapshot);
     const applicable = recognition.paragraphs.filter((item) => (
-      item.formatting_disposition === "apply"
-      && item.binding_status === "confirmed"
-      && item.segment_count_total === item.segment_count_confirmed
+      item.locator_verified
       && item.segment_count_total === item.segment_count_located
     ));
     const skipped = recognition.paragraphs.length - applicable.length + (recognition.unresolved_blocks?.length ?? 0);
@@ -121,7 +119,7 @@ export class PreviewDocumentUseCase {
     const missing = fontReport.filter((item) => !item.installed).map((item) => item.requested_font);
     const mixedParagraphs = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.source_paragraph_index));
     const mixed = mixedParagraphs.size > 0;
-    const base = { recognized_paragraph_count: recognition.paragraphs.length + unresolved, mapped_paragraph_count: recognition.paragraphs.length, review_count: review, unknown_count: unknown, unresolved_block_count: unresolved, mixed_paragraph_count: mixedParagraphs.size, command_count: commands.commands.length, font_command_count: count("paragraph.set_font"), alignment_command_count: count("paragraph.set_alignment"), indent_command_count: count("paragraph.set_indent"), spacing_command_count: count("paragraph.set_spacing"), page_command_count: count("section.set_page_setup"), missing_fonts: [...new Set(missing)], unsupported_capabilities: [...new Set(unsupported)], estimated_skip_count: unsupported.length, blocking_reason: critical ? "CRITICAL_REVIEW_REQUIRED" : unresolved ? "RECOGNITION_LOCATOR_UNVERIFIED" : mixed ? "MIXED_PARAGRAPH_REQUIRES_SPLIT" : unknown ? "UNKNOWN_MAPPING_REVIEW_REQUIRED" : missing.length ? "FONT_NOT_INSTALLED" : null };
+    const base = { recognized_paragraph_count: recognition.paragraphs.length + unresolved, mapped_paragraph_count: recognition.paragraphs.length, review_count: review, unknown_count: unknown, unresolved_block_count: unresolved, mixed_paragraph_count: mixedParagraphs.size, command_count: commands.commands.length, font_command_count: count("paragraph.set_font"), alignment_command_count: count("paragraph.set_alignment"), indent_command_count: count("paragraph.set_indent"), spacing_command_count: count("paragraph.set_spacing"), page_command_count: count("section.set_page_setup"), missing_fonts: [...new Set(missing)], unsupported_capabilities: [...new Set(unsupported)], estimated_skip_count: unsupported.length, blocking_reason: critical ? "CRITICAL_REVIEW_REQUIRED" : unresolved ? "RECOGNITION_LOCATOR_UNVERIFIED" : unknown ? "UNKNOWN_MAPPING_REVIEW_REQUIRED" : missing.length ? "FONT_NOT_INSTALLED" : null };
     // Unknown and missing-font paragraphs are exactly the cases that need a
     // visible review comment.  Only a critical structural decision blocks a
     // preview mutation altogether.

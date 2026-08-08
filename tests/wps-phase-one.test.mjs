@@ -44,7 +44,7 @@ import { ClassifiedHealthChecker } from "../dist/apps/classified-offline/src/hea
 import { errorMessage, errorText } from "../dist/apps/classified-offline/src/error-messages.js";
 import { probeWorkerCapability } from "../dist/apps/classified-offline/src/worker-capability.js";
 import { PipelineWorkerClient } from "../dist/apps/classified-offline/src/pipeline-worker-client.js";
-import { AdaptiveBatchController, SnapshotPipelineWorkerRuntime, createEquivalentSnapshot, generateWorkerCommands } from "../dist/apps/classified-offline/src/pipeline-worker.js";
+import { AdaptiveBatchController, SnapshotPipelineWorkerRuntime, createEquivalentSnapshot, createStructuralNormalizationPlan, generateWorkerCommands } from "../dist/apps/classified-offline/src/pipeline-worker.js";
 import { LocalFormatCommandGenerator } from "../dist/packages/local-format-engine/src/index.js";
 import { DiagnosticRunner, classifyNetworkError } from "../dist/packages/diagnostics/src/index.js";
 import { parsePipelineJob, parseWorkerHostRequest } from "../dist/packages/threading/src/index.js";
@@ -235,6 +235,41 @@ test("snapshot worker uses multiple bounded Host RPC batches for 1000 paragraphs
   assert.ok(result.snapshot_summary.max_batch_size <= 10);
   assert.ok(result.snapshot_summary.worker_roundtrip_p95_ms >= result.snapshot_summary.host_duration_p95_ms);
   assert.ok(events.some((item) => item.type === "pipeline.progress" && item.completed === 1000));
+});
+
+test("structural normalization plan materializes adjacent verified ranges and trims only their outer boundaries", () => {
+  const text = "\n一、标题。正文内容\n";
+  const snapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev", textRevision: "rev", sourceSha256: SHA, localDocxPath: "C:\\fixture.docx", paragraphs: [{ sourceParagraphIndex: 0, text, isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false }, { sourceParagraphIndex: 1, text: "表格", isInTable: true, hasSectionBreak: false, hasPageBreak: false, hasObject: false }], paragraphOrderHash: "order", sectionCount: 1, documentFullNameHash: "path" };
+  const make = (start, end, type, index) => ({ target_id: `doc-1:host:0:r:${start}`, source_paragraph_index: 0, physical_paragraph_index: 0, recognized_type: type, text_length: end - start, occurrence_index: index, confidence: 1, review_level: "review", needs_review: true, mixed_structure: true, formatting_disposition: "review_only", physical_text_sha256: hashText(text), range_start_utf16: start, range_end_utf16: end, locator_verified: true, ...hostFields(text, start, end), segment_count_total: 2, segment_count_located: 2 });
+  const plan = createStructuralNormalizationPlan(snapshot, { paragraphs: [make(1, 6, "heading1", 0), make(6, text.length - 1, "body", 1)] });
+  assert.deepEqual(plan, {
+    items: [{ host_paragraph_index: 0, host_raw_text_sha256: hashText(text), boundaries: [{ gap_start_utf16: 6, gap_end_utf16: 6 }], trim_start_utf16: 1, trim_end_utf16: text.length - 1, delete_empty: false }],
+    split_source_paragraph_count: 1,
+    created_paragraph_count: 1,
+    trimmed_boundary_count: 2,
+    removed_empty_paragraph_count: 0,
+  });
+});
+
+test("structural normalization plan removes only an unprotected empty paragraph between a verified heading and body", () => {
+  const heading = "一、标题"; const body = "正文";
+  const paragraphs = [
+    { sourceParagraphIndex: 0, text: heading, isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false },
+    { sourceParagraphIndex: 1, text: "", isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false },
+    { sourceParagraphIndex: 2, text: body, isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false },
+  ];
+  const make = (hostIndex, text, type) => ({ target_id: `doc-1:host:${hostIndex}:r:0`, source_paragraph_index: hostIndex, physical_paragraph_index: hostIndex, recognized_type: type, text_length: text.length, occurrence_index: 0, confidence: 1, review_level: "confirmed", needs_review: false, mixed_structure: false, formatting_disposition: "apply", physical_text_sha256: hashText(text), range_start_utf16: 0, range_end_utf16: text.length, locator_verified: true, ...hostFields(text, 0, text.length, hostIndex), segment_count_total: 1, segment_count_located: 1 });
+  const plan = createStructuralNormalizationPlan({ snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev", textRevision: "rev", sourceSha256: SHA, localDocxPath: "C:\\fixture.docx", paragraphs, paragraphOrderHash: "order", sectionCount: 1, documentFullNameHash: "path" }, { paragraphs: [make(0, heading, "heading1"), make(2, body, "body")] });
+  assert.deepEqual(plan.items, [{ host_paragraph_index: 1, host_raw_text_sha256: hashText(""), boundaries: [], trim_start_utf16: 0, trim_end_utf16: 0, delete_empty: true }]);
+  assert.equal(plan.removed_empty_paragraph_count, 1);
+  for (const protectedFact of ["isInTable", "hasSectionBreak", "hasPageBreak", "hasObject"]) {
+    const protectedParagraphs = paragraphs.map((item) => ({ ...item })); protectedParagraphs[1][protectedFact] = true;
+    const protectedPlan = createStructuralNormalizationPlan({ snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev", textRevision: "rev", sourceSha256: SHA, localDocxPath: "C:\\fixture.docx", paragraphs: protectedParagraphs, paragraphOrderHash: "order", sectionCount: 1, documentFullNameHash: "path" }, { paragraphs: [make(0, heading, "heading1"), make(2, body, "body")] });
+    assert.equal(protectedPlan.removed_empty_paragraph_count, 0, protectedFact);
+  }
+  const internalBreakText = "正文一\n正文二";
+  const internalBreak = { sourceParagraphIndex: 0, text: internalBreakText, isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false };
+  assert.deepEqual(createStructuralNormalizationPlan({ snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev", textRevision: "rev", sourceSha256: SHA, localDocxPath: "C:\\fixture.docx", paragraphs: [internalBreak], paragraphOrderHash: "order", sectionCount: 1, documentFullNameHash: "path" }, { paragraphs: [make(0, internalBreakText, "body")] }).items, []);
 });
 
 test("snapshot worker cancels after the active small RPC and rejects late results", async () => {
@@ -431,7 +466,7 @@ test("local wheel adapter resolves UTF-16 sub-ranges and skips table cells witho
   assert.equal(result.paragraphs.find((item) => item.source_paragraph_index === 2).formatting_disposition, "apply");
 });
 
-test("formal formatting blocks mixed physical paragraphs before command generation or transaction", async () => {
+test("formal formatting sends located mixed physical paragraphs to command generation", async () => {
   const physicalText = "一、标题。正文内容";
   const localSnapshot = { ...snapshot, paragraphs: [{ sourceParagraphIndex: 0, text: physicalText }] };
   const recognitionProvider = new LocalWheelRecognitionProvider(boundTransport({ async recognize() { return {
@@ -443,15 +478,15 @@ test("formal formatting blocks mixed physical paragraphs before command generati
   let commandCalls = 0; let transactionCalls = 0;
   const useCase = new FormatDocumentUseCase(
     new MockDocumentReader(localSnapshot), recognitionProvider,
-    { async requestCommands() { commandCalls += 1; throw new Error("unexpected"); } }, new CommandValidator(),
+    { async requestCommands(request) { commandCalls += 1; return commandSet([], request.request_id); } }, new CommandValidator(),
     new MockDocumentExecutor(), { begin() { transactionCalls += 1; return "tx"; }, commit() {}, rollback() {} },
     { capabilities() { return { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: [] }; } },
     { authorizationScope() { return "classified-offline"; } },
   );
   const result = await useCase.execute("request-00000001");
   assert.equal(result.executed_command_ids.length, 0);
-  assert.deepEqual(result.warnings, ["SKIPPED_REVIEW_OR_UNRESOLVED=2"]);
-  assert.equal(commandCalls, 0); assert.equal(transactionCalls, 0);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(commandCalls, 1); assert.equal(transactionCalls, 1);
 });
 
 test("preview summary reports unresolved blocks and unique mixed physical paragraphs", async () => {
@@ -660,7 +695,7 @@ test("WpsHostBridge queues recognition and leaves polling to the Worker", async 
     const bridge = new WpsHostBridge(application, { writeForComponent(...values) { diagnostics.push(values); } }, { recognitionExecutablePath: runtimeExecutablePath, recognitionContractVersion: 1, brokerStatusPath: broker.statusPath, brokerJobsPath: broker.jobsPath, brokerRuntimeVersion: "docxtool-test", brokerRuntimeSha256: "runtime-sha" });
     const base = { type: "host.rpc.request", job_id: "recognize-1", build_id: "build-1", payload: {} };
     const descriptor = await bridge.handle({ ...base, rpc_id: "descriptor-1", operation: "host.capture_document_descriptor" });
-    const workerSnapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev-1", textRevision: "rev-1", sourceSha256: SHA, localDocxPath: sourcePath, paragraphs: [{ sourceParagraphIndex: 0, text: "脱敏段落", isInTable: false }], paragraphOrderHash: SHA, sectionCount: 1, documentFullNameHash: descriptor.value.local_docx_path_hash };
+    const workerSnapshot = { snapshotContractVersion: "worker-snapshot-v1", documentId: "doc-1", revision: "rev-1", textRevision: "rev-1", sourceSha256: SHA, localDocxPath: sourcePath, paragraphs: [{ sourceParagraphIndex: 0, text: "脱敏段落", isInTable: false, hasSectionBreak: false, hasPageBreak: false, hasObject: false }], paragraphOrderHash: SHA, sectionCount: 1, documentFullNameHash: descriptor.value.local_docx_path_hash };
     const launched = await bridge.handle({ ...base, rpc_id: "launch-1", operation: "host.launch_recognition", document_token: descriptor.value.document_token, payload: { source_path: sourcePath, snapshot: workerSnapshot, contract_version: 1 } });
     assert.equal(launched.ok, true); assert.equal(reads.filter((value) => value.endsWith("request.json")).length, 0);
     const queuedRequest = JSON.parse(readFileSync(launched.value.request_path, "utf8"));
@@ -692,6 +727,51 @@ test("WpsHostBridge single-argument ShellExecute probe never supplies a second p
   const rejected = await disabled.handle({ type: "host.rpc.request", operation: "host.probe_shell_execute_one_argument", rpc_id: "probe-2", job_id: "job-1", build_id: "build-1", payload: {} });
   assert.equal(rejected.ok, false);
   assert.equal(rejected.error.code, "HOST_DEBUG_PROBE_DISABLED");
+});
+
+function structuralWps(initialTexts) {
+  const paragraphs = [];
+  let undoSnapshot = null;
+  const makeParagraph = (text) => {
+    const paragraph = {};
+    const range = { Tables: { Count: 0 }, InlineShapes: { Count: 0 }, ShapeRange: { Count: 0 }, Fields: { Count: 0 }, ParagraphFormat: { PageBreakBefore: false }, Start: 0, End: text.length + 1 };
+    let selectedStart = 0; let selectedEnd = 0;
+    range.Characters = { Item(index) { const position = index - 1; const character = { Start: position, End: position + 1, SetRange(start, end) { selectedStart = start; selectedEnd = end; }, InsertAfter(value) { if (value !== "\r") throw new Error("TEST_SPLIT_INSERT_INVALID"); const paragraphIndex = paragraphs.indexOf(paragraph); paragraphs.splice(paragraphIndex, 1, makeParagraph(text.slice(0, selectedStart)), makeParagraph(text.slice(selectedStart))); } }; Object.defineProperty(character, "Text", { get: () => text.slice(selectedStart, selectedEnd) || text[position] || "\r", set(value) { const paragraphIndex = paragraphs.indexOf(paragraph); if (value === "") paragraphs.splice(paragraphIndex, 1, makeParagraph(text.slice(0, selectedStart) + text.slice(selectedEnd))); else if (value === "\r") paragraphs.splice(paragraphIndex, 1, makeParagraph(text.slice(0, selectedStart)), makeParagraph(text.slice(selectedEnd))); else throw new Error("TEST_STRUCTURAL_REPLACEMENT_INVALID"); } }); return character; } };
+    Object.defineProperty(range, "Text", { configurable: true, get: () => text + "\r" });
+    range.Delete = () => { if (text !== "") throw new Error("TEST_EMPTY_DELETE_INVALID"); paragraphs.splice(paragraphs.indexOf(paragraph), 1); };
+    paragraph.Range = range; return paragraph;
+  };
+  paragraphs.push(...initialTexts.map(makeParagraph));
+  const document = { FullName: "C:\\fixture.docx", Saved: true, Sections: { Count: 1 }, Paragraphs: { get Count() { return paragraphs.length; }, Item(index) { return paragraphs[index - 1]; } }, Undo() { paragraphs.splice(0, paragraphs.length, ...undoSnapshot.map((text) => makeParagraph(text.slice(0, -1)))); }, Save() { this.Saved = true; } };
+  const application = { ActiveDocument: document, UndoRecord: { StartCustomRecord() { undoSnapshot = paragraphs.map((item) => item.Range.Text); }, EndCustomRecord() {} } };
+  return { application, document, paragraphs };
+}
+
+test("WpsHostBridge materializes a continuous verified boundary and saves the document", async () => {
+  const { application, document, paragraphs } = structuralWps(["标题正文"]);
+  const bridge = new WpsHostBridge(application); const base = { type: "host.rpc.request", job_id: "split-job-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, rpc_id: "split-descriptor", operation: "host.capture_document_descriptor" });
+  const result = await bridge.handle({ ...base, rpc_id: "split-apply", operation: "host.apply_structural_normalization_batch", document_token: descriptor.value.document_token, payload: { expected_visible_text_sha256: hashText("标题正文"), items: [{ host_paragraph_index: 0, host_raw_text_sha256: hashText("标题正文"), boundaries: [{ gap_start_utf16: 2, gap_end_utf16: 2 }], trim_start_utf16: 0, trim_end_utf16: 4, delete_empty: false }] } });
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(result.value.created_paragraph_count, 1); assert.equal(document.Paragraphs.Count, 2); assert.equal(paragraphs[0].Range.Text, "标题\r"); assert.equal(paragraphs[1].Range.Text, "正文\r");
+});
+
+test("WpsHostBridge trims paragraph-edge manual breaks and deletes one planned structural empty paragraph", async () => {
+  const { application, document, paragraphs } = structuralWps(["标题", "", "\v正文\n"]);
+  const bridge = new WpsHostBridge(application); const base = { type: "host.rpc.request", job_id: "normalize-job-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, rpc_id: "normalize-descriptor", operation: "host.capture_document_descriptor" });
+  const result = await bridge.handle({ ...base, rpc_id: "normalize-apply", operation: "host.apply_structural_normalization_batch", document_token: descriptor.value.document_token, payload: { expected_visible_text_sha256: hashText("标题正文"), items: [
+    { host_paragraph_index: 1, host_raw_text_sha256: hashText(""), boundaries: [], trim_start_utf16: 0, trim_end_utf16: 0, delete_empty: true },
+    { host_paragraph_index: 2, host_raw_text_sha256: hashText("\v正文\n"), boundaries: [], trim_start_utf16: 1, trim_end_utf16: 3, delete_empty: false },
+  ] } });
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(result.value.trimmed_boundary_count, 2); assert.equal(result.value.removed_empty_paragraph_count, 1); assert.equal(document.Paragraphs.Count, 2); assert.deepEqual(paragraphs.map((item) => item.Range.Text), ["标题\r", "正文\r"]);
+});
+
+test("WpsHostBridge rolls back the complete structural normalization record when saving fails", async () => {
+  const { application, document, paragraphs } = structuralWps(["标题正文"]); document.Save = () => { throw new Error("disk locked"); };
+  const bridge = new WpsHostBridge(application); const base = { type: "host.rpc.request", job_id: "normalize-rollback-1", build_id: "build-1", payload: {} };
+  const descriptor = await bridge.handle({ ...base, rpc_id: "rollback-descriptor", operation: "host.capture_document_descriptor" });
+  const result = await bridge.handle({ ...base, rpc_id: "rollback-apply", operation: "host.apply_structural_normalization_batch", document_token: descriptor.value.document_token, payload: { expected_visible_text_sha256: hashText("标题正文"), items: [{ host_paragraph_index: 0, host_raw_text_sha256: hashText("标题正文"), boundaries: [{ gap_start_utf16: 2, gap_end_utf16: 2 }], trim_start_utf16: 0, trim_end_utf16: 4, delete_empty: false }] } });
+  assert.equal(result.ok, false); assert.equal(result.error.code, "DOCUMENT_SAVE_FAILED"); assert.equal(document.Paragraphs.Count, 1); assert.equal(paragraphs[0].Range.Text, "标题正文\r");
 });
 
 test("WpsHostBridge applies and commits a formal format batch without comments", async () => {
@@ -775,7 +855,7 @@ test("control-enabled Worker submits and polls through ControlTransport without 
       },
     };
     class LoopbackWorker { onmessage = null; onerror = null; onmessageerror = null; scope = { onmessage: null, postMessage: (value) => queueMicrotask(() => this.onmessage?.({ data: value })) }; runtime = new SnapshotPipelineWorkerRuntime(this.scope); postMessage(value) { queueMicrotask(() => this.scope.onmessage?.({ data: value })); } terminate() {} }
-    const endpoint = { schema_version: 1, instance_id: "11111111-1111-4111-8111-111111111111", pid: 1, process_created_at: new Date().toISOString(), host: "127.0.0.1", port: 43127, base_url: "http://127.0.0.1:43127", session_token: "t".repeat(48), server_version: "1.4.0", contract_version: 1, started_at: new Date().toISOString(), heartbeat_at: new Date().toISOString() };
+    const endpoint = { schema_version: 1, instance_id: "11111111-1111-4111-8111-111111111111", pid: 1, process_created_at: new Date().toISOString(), host: "127.0.0.1", port: 43127, base_url: "http://127.0.0.1:43127", session_token: "t".repeat(48), server_version: "1.4.3", contract_version: 1, started_at: new Date().toISOString(), heartbeat_at: new Date().toISOString() };
     const terminal = new Promise((resolve) => { const client = new PipelineWorkerClient({ workerUrl: "pipeline-worker.js", bridge, buildId: "build-1", workerConfig: { profile: {}, client_capabilities: { schema_version: CLIENT_CAPABILITIES_VERSION, capabilities: [] }, authorization_scope: "classified-offline", control_endpoint: endpoint }, workerFactory: () => new LoopbackWorker(), onEvent(event) { if (["pipeline.completed", "pipeline.failed"].includes(event.type)) resolve(event); } }); assert.equal(client.start("recognize").accepted, true); });
     const result = await terminal;
     assert.equal(result.type, "pipeline.completed");
@@ -796,6 +876,10 @@ test("Worker command generation is field-equivalent to the legacy local format g
   const legacy = await new LocalFormatCommandGenerator(profile).requestCommands(request);
   const worker = await generateWorkerCommands(recognition, requestId, { profile, client_capabilities: clientCapabilities, authorization_scope: "classified-offline" });
   assert.deepEqual(worker, legacy);
+  const reviewRequest = { ...request, recognition_result: { ...recognition, paragraphs: [{ ...recognition.paragraphs[0], needs_review: true, review_level: "review" }] } };
+  const reviewCommands = await new LocalFormatCommandGenerator(profile).requestCommands(reviewRequest);
+  assert.equal(reviewCommands.commands.filter((item) => item.kind.startsWith("paragraph.")).length, 4);
+  assert.deepEqual(reviewCommands.warnings, []);
 });
 
 function fakeWps(text = "测试段落\r") {
@@ -978,6 +1062,7 @@ test("preview comments use a paragraph Range and remove only their session marke
   assert.match(previewText, /^识别结果：主标题 中文字体：方正小标宋简体/);
   assert.equal(previewText.split(/\r?\n/).length, 3);
   for (const value of ["识别结果：主标题", "中文字体：方正小标宋简体", "西文字体：Times New Roman", "字号：二号", "粗体：否", "对齐方式：居中", "首行缩进：0 字符", "左缩进：0 字符", "右缩进：0 字符", "段前：0 行", "段后：0 行", "固定行距：28 磅", "段前分页：否", "复核原因：识别结果已定位，建议人工复核", "识别状态：需要复核", "识别置信度：50%"] ) assert.match(previewText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(previewText, /正式排版：会应用/);
   for (const value of ["[DOCXTOOL_PREVIEW]", "\u2063", "preview_session=", "document_identity=", "paragraph_index=", "reference_start=", "识别代码：", "具体格式：", "固定行距：28 pt"]) assert.doesNotMatch(previewText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   comments[1].Reference = { Start: 11, End: 14 };
   await service.removePreviewComments(created.tracker);
@@ -1009,12 +1094,21 @@ test("Worker PreviewPlan and Host preview batches use the same comment text and 
   await assert.rejects(() => bridge.clearPreviewForCurrentDocument(), /DOCUMENT_CHANGED/);
   assert.equal(comments[1].deleted, undefined);
   application.ActiveDocument.FullName = "C:\\preview.docx";
+  application.ActiveDocument.Paragraphs.Count = 2;
+  comments[1].Delete = () => { throw new Error("STALE_COMMENT_OBJECT"); };
+  comments[1] = { Author: comments[1].Author, Initial: comments[1].Initial, Range: { Text: comments[1].Range.Text }, Reference: comments[1].Reference, Delete() { this.deleted = true; } };
   const cleared = await bridge.clearPreviewForCurrentDocument();
   assert.equal(cleared.deleted_count, 1); assert.equal(cleared.user_comment_integrity, true); assert.equal(comments[0].deleted, undefined);
+  assert.equal(comments[1].deleted, true);
   assert.equal(diagnostics.some((item) => item[2] === "preview.cleanup.batch.start"), true);
   assert.equal(diagnostics.some((item) => item[2] === "preview.cleanup.batch.completed"), true);
+  assert.equal(diagnostics.some((item) => item[2] === "preview.session.rebind.start"), true);
+  assert.equal(diagnostics.some((item) => item[2] === "preview.session.rebind.completed"), true);
+  assert.equal(diagnostics.some((item) => item[2] === "preview.cleanup.resolve.completed"), true);
   corruptSetRangeReadback = true;
-  const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: descriptor.value.document_token, payload: { session_id: "preview-session-2", items: plan } });
+  application.ActiveDocument.Paragraphs.Count = 1;
+  const refreshedDescriptor = await bridge.handle({ ...base, rpc_id: "descriptor-preview-refreshed", operation: "host.capture_document_descriptor" });
+  const mismatched = await bridge.handle({ ...base, rpc_id: "preview-mismatched-range", operation: "host.apply_preview_batch", document_token: refreshedDescriptor.value.document_token, payload: { session_id: "preview-session-2", items: plan } });
   assert.equal(mismatched.ok, false); assert.equal(mismatched.error.code, "HOST_RANGE_TEXT_MISMATCH");
   const failedDiagnostic = diagnostics.filter((item) => item[2] === "host.rpc.failed").at(-1);
   assert.match(failedDiagnostic[4].technical_detail, /paragraph_index=0; relative_start=0; relative_end=4; paragraph_start=10; paragraph_end=15; character_start=9; character_end=13; actual_start=9; actual_end=13; expected_sha256=[0-9a-f]{12}; actual_sha256=[0-9a-f]{12}; expected_length_utf16=4; actual_length_utf16=3/);
@@ -1032,7 +1126,7 @@ test("preview comments anchor each mixed role to its verified UTF-16 sub-range",
   assert.equal(result.comment_count, 2);
   assert.deepEqual(comments.map((item) => [item.Reference.Start, item.Reference.End]), [[100, 100 + title.length], [100 + title.length, 100 + text.length]]);
   assert.match(comments[0].Range.Text, /识别结果：一级标题/); assert.match(comments[1].Range.Text, /识别结果：正文/);
-  assert.match(comments[0].Range.Text, /正式排版前需要拆段/);
+  assert.match(comments[0].Range.Text, /将按识别范围分别排版/);
   assert.match(comments[0].Range.Text, /识别结果已定位，建议人工复核/);
 });
 
@@ -1072,12 +1166,13 @@ test("WPS display mappings cover every supported role omitted from the original 
 test("WPS review wording distinguishes recognition review from mixed structure", async () => {
   const previewSource = await readFile(new URL("../packages/wps-adapter/src/preview-comments.ts", import.meta.url), "utf8");
   const taskpaneSource = await readFile(new URL("../apps/classified-offline/src/taskpane-workflow.ts", import.meta.url), "utf8");
+  assert.match(previewSource, /同一物理段落包含多个角色，将按识别范围分别排版/);
+  assert.match(taskpaneSource, /混合结构：按识别范围分别排版/);
   for (const source of [previewSource, taskpaneSource]) {
-    assert.match(source, /同一物理段落包含多个角色，正式排版前需要拆段/);
     assert.match(source, /识别结果已定位，建议人工复核/);
   }
   assert.match(taskpaneSource, /reasons\.join/);
-  assert.match(taskpaneSource, /formatting_disposition === "review_only"/);
+  assert.match(taskpaneSource, /formatting_disposition: "apply" \| "review_only"/);
 });
 
 test("preview flow never creates a comment inside a table cell", async () => {
@@ -1394,6 +1489,110 @@ test("one-click save lifecycle accepts dirty DOCX files and exposes real save fa
   await assert.rejects(() => saveActiveDocument({ ActiveDocument: { FullName: "C:\\fixture.docx", Saved: false, Save() { throw new Error("disk locked"); } } }, false, "before_format"), /DOCUMENT_SAVE_FAILED/);
 });
 
+function repairControlEndpoint() {
+  const timestamp = new Date().toISOString();
+  return { schema_version: 1, instance_id: "44444444-4444-4444-8444-444444444444", pid: 4321, process_created_at: timestamp, host: "127.0.0.1", port: 43128, base_url: "http://127.0.0.1:43128", session_token: "r".repeat(48), server_version: "1.4.3", contract_version: 1, started_at: timestamp, heartbeat_at: timestamp };
+}
+
+function completedFormatEvent() {
+  return { type: "pipeline.completed", job_id: "format-worker-1", build_id: "build-a", command: "format", format_result: { executed_command_count: 4, skipped_command_count: 0, skipped_review_count: 0, skipped_mixed_count: 0, skipped_unresolved_count: 0, split_source_paragraph_count: 0, created_paragraph_count: 0, trimmed_boundary_count: 0, removed_empty_paragraph_count: 0, batch_count: 1 } };
+}
+
+function repairRuntimeFixture(document) {
+  const mocks = hostMocks(); mocks.application.ActiveDocument = document;
+  const build = { build_id: "build-a", plugin_version: "1", asset_hash: "a", build_timestamp: "now" };
+  const store = new HostResultStore(mocks.storage, build, "host-a");
+  const panes = new TaskPaneManager(mocks.application, mocks.storage, "http://127.0.0.1/taskpane");
+  const runtime = new LocalApplicationRuntime(mocks.application, panes, store, { recognitionExecutablePath: "C:\\runtime\\docxtool-recognize.exe", runtimeVersion: "1", runtimeSha256: "a", controlServerEnabled: true, controlEndpointManifest: repairControlEndpoint() });
+  return { ...mocks, store, runtime };
+}
+
+test("one-click formatting skips repair UI for a clean DOCX and continues to the Worker", async () => {
+  const document = { FullName: "C:\\fixture.docx", Saved: true, Paragraphs: { Count: 1 }, Save() { this.Saved = true; } };
+  const fixture = repairRuntimeFixture(document); let workerCalls = 0;
+  fixture.runtime.attachPipelineRunner(async () => { workerCalls += 1; return completedFormatEvent(); });
+  const previousFetch = globalThis.fetch; const previousConfirm = globalThis.confirm;
+  globalThis.fetch = async () => new Response(JSON.stringify({ schema_version: 1, status: "clean", package_member_count: 5, document_relationship_count: 2, null_relationship_count: 0, dangling_drawing_count: 0 }), { status: 200 });
+  globalThis.confirm = () => { throw new Error("CLEAN_DOCUMENT_MUST_NOT_PROMPT"); };
+  try {
+    const result = await fixture.runtime.run("format_document", "test", "format-clean-1", "build-a");
+    assert.equal(result.status, "PASS"); assert.equal(workerCalls, 1);
+  } finally { globalThis.fetch = previousFetch; if (previousConfirm) globalThis.confirm = previousConfirm; else delete globalThis.confirm; }
+});
+
+test("cancelling a required DOCX repair ends only the current command as CANCELLED", async () => {
+  let saveAsCalls = 0; let workerCalls = 0;
+  const document = { FullName: "C:\\fixture.docx", Saved: false, Paragraphs: { Count: 1 }, Save() { this.Saved = true; }, SaveAs2() { saveAsCalls += 1; } };
+  const fixture = repairRuntimeFixture(document); fixture.runtime.attachPipelineRunner(async () => { workerCalls += 1; return completedFormatEvent(); });
+  const previousFetch = globalThis.fetch; const previousConfirm = globalThis.confirm;
+  globalThis.fetch = async () => new Response(JSON.stringify({ schema_version: 1, status: "repair_required", repair_id: "55555555-5555-4555-8555-555555555555", broken_relationship_count: 1, package_member_count: 5, document_relationship_count: 2, null_relationship_count: 1, dangling_drawing_count: 0 }), { status: 200 });
+  globalThis.confirm = () => false;
+  try {
+    const result = await fixture.runtime.run("format_document", "test", "format-cancel-1", "build-a");
+    assert.equal(result.status, "CANCELLED"); assert.equal(fixture.store.read().command_status, "CANCELLED"); assert.equal(saveAsCalls, 0); assert.equal(workerCalls, 0);
+  } finally { globalThis.fetch = previousFetch; if (previousConfirm) globalThis.confirm = previousConfirm; else delete globalThis.confirm; }
+});
+
+test("confirmed DOCX repair bridges, reopens, commits, and then continues formatting", async () => {
+  const sourcePath = "C:\\fixture.docx"; const repairId = "66666666-6666-4666-8666-666666666666"; const order = []; let bridgeExists = false;
+  const bridge = { FullName: sourcePath, Saved: false, Paragraphs: { Count: 1 }, Save() { order.push("save-before"); this.Saved = true; }, SaveAs2(path, format) { assert.equal(format, 12); order.push("save-as-bridge"); this.FullName = path; this.Saved = true; bridgeExists = true; }, Close() { order.push("close-bridge"); } };
+  const reopened = { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1 }, Save() { order.push("save-after"); this.Saved = true; }, Close() {} };
+  const fixture = repairRuntimeFixture(bridge);
+  fixture.application.Documents = { Open(path) { assert.equal(path, sourcePath); order.push("open-source"); fixture.application.ActiveDocument = reopened; } };
+  fixture.application.FileSystem = { Exists(path) { return bridgeExists && path.includes(".docxtool-repairing-"); }, unlinkSync() { order.push("delete-bridge"); bridgeExists = false; } };
+  fixture.runtime.attachPipelineRunner(async () => { order.push("worker-format"); return completedFormatEvent(); });
+  const previousFetch = globalThis.fetch; const previousConfirm = globalThis.confirm;
+  globalThis.confirm = () => true;
+  globalThis.fetch = async (url, options) => {
+    const pathname = new URL(String(url)).pathname;
+    if (pathname.endsWith("/inspect")) { order.push("inspect"); return new Response(JSON.stringify({ schema_version: 1, status: "repair_required", repair_id: repairId, broken_relationship_count: 1, package_member_count: 5, document_relationship_count: 2, null_relationship_count: 1, dangling_drawing_count: 0 }), { status: 200 }); }
+    if (pathname.endsWith("/apply")) { order.push("apply-repair"); return new Response(JSON.stringify({ schema_version: 1, status: "applied", repair_id: repairId, removed_relationship_count: 1, removed_drawing_count: 1 }), { status: 200 }); }
+    assert.deepEqual(JSON.parse(String(options.body)), { schema_version: 1, outcome: "commit" }); order.push("commit-repair"); return new Response(JSON.stringify({ schema_version: 1, status: "committed", repair_id: repairId }), { status: 200 });
+  };
+  try {
+    const result = await fixture.runtime.run("format_document", "test", "format-repair-1", "build-a");
+    assert.equal(result.status, "PASS"); assert.equal(bridgeExists, false);
+    assert.deepEqual(order, ["save-before", "inspect", "save-as-bridge", "apply-repair", "open-source", "close-bridge", "delete-bridge", "commit-repair", "worker-format", "save-after"]);
+  } finally { globalThis.fetch = previousFetch; if (previousConfirm) globalThis.confirm = previousConfirm; else delete globalThis.confirm; }
+});
+
+test("DOCX repair refuses a changed source and never starts formatting", async () => {
+  const sourcePath = "C:\\fixture.docx"; const repairId = "77777777-7777-4777-8777-777777777777"; let workerCalls = 0; let bridgeExists = false;
+  const bridge = { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1 }, Save() { this.Saved = true; }, SaveAs2(path) { this.FullName = path; bridgeExists = true; }, Close() {} };
+  const reopened = { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1 }, Save() { this.Saved = true; } };
+  const fixture = repairRuntimeFixture(bridge); fixture.application.Documents = { Open() { fixture.application.ActiveDocument = reopened; } }; fixture.application.FileSystem = { Exists() { return bridgeExists; }, unlinkSync() { bridgeExists = false; } };
+  fixture.runtime.attachPipelineRunner(async () => { workerCalls += 1; return completedFormatEvent(); });
+  const previousFetch = globalThis.fetch; const previousConfirm = globalThis.confirm; globalThis.confirm = () => true;
+  globalThis.fetch = async (url) => new URL(String(url)).pathname.endsWith("/inspect")
+    ? new Response(JSON.stringify({ schema_version: 1, status: "repair_required", repair_id: repairId, broken_relationship_count: 1, package_member_count: 5, document_relationship_count: 2, null_relationship_count: 1, dangling_drawing_count: 0 }), { status: 200 })
+    : new Response(JSON.stringify({ error: { code: "DOCUMENT_REPAIR_SOURCE_CHANGED" } }), { status: 409 });
+  try {
+    const result = await fixture.runtime.run("format_document", "test", "format-source-changed-1", "build-a");
+    assert.equal(result.status, "FAIL"); assert.equal(result.error_code, "DOCUMENT_REPAIR_SOURCE_CHANGED"); assert.equal(workerCalls, 0); assert.equal(bridgeExists, false);
+  } finally { globalThis.fetch = previousFetch; if (previousConfirm) globalThis.confirm = previousConfirm; else delete globalThis.confirm; }
+});
+
+test("DOCX reopen failure restores the original before returning a stable failure", async () => {
+  const sourcePath = "C:\\fixture.docx"; const repairId = "88888888-8888-4888-8888-888888888888"; const outcomes = []; let openCalls = 0; let bridgeExists = false; let workerCalls = 0;
+  const bridge = { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1 }, Save() { this.Saved = true; }, SaveAs2(path) { this.FullName = path; bridgeExists = true; }, Close() {} };
+  const restored = { FullName: sourcePath, Saved: true, Paragraphs: { Count: 1 }, Save() { this.Saved = true; } };
+  const fixture = repairRuntimeFixture(bridge);
+  fixture.application.Documents = { Open() { openCalls += 1; if (openCalls === 1) throw new Error("reopen failed"); fixture.application.ActiveDocument = restored; } };
+  fixture.application.FileSystem = { Exists() { return bridgeExists; }, unlinkSync() { bridgeExists = false; } };
+  fixture.runtime.attachPipelineRunner(async () => { workerCalls += 1; return completedFormatEvent(); });
+  const previousFetch = globalThis.fetch; const previousConfirm = globalThis.confirm; globalThis.confirm = () => true;
+  globalThis.fetch = async (url, options) => {
+    const pathname = new URL(String(url)).pathname;
+    if (pathname.endsWith("/inspect")) return new Response(JSON.stringify({ schema_version: 1, status: "repair_required", repair_id: repairId, broken_relationship_count: 1, package_member_count: 5, document_relationship_count: 2, null_relationship_count: 1, dangling_drawing_count: 0 }), { status: 200 });
+    if (pathname.endsWith("/apply")) return new Response(JSON.stringify({ schema_version: 1, status: "applied", repair_id: repairId, removed_relationship_count: 1, removed_drawing_count: 1 }), { status: 200 });
+    const outcome = JSON.parse(String(options.body)).outcome; outcomes.push(outcome); return new Response(JSON.stringify({ schema_version: 1, status: outcome === "restore" ? "restored" : "committed", repair_id: repairId }), { status: 200 });
+  };
+  try {
+    const result = await fixture.runtime.run("format_document", "test", "format-reopen-failed-1", "build-a");
+    assert.equal(result.status, "FAIL"); assert.equal(result.error_code, "DOCUMENT_REPAIR_REOPEN_FAILED"); assert.deepEqual(outcomes, ["restore"]); assert.equal(openCalls, 2); assert.equal(workerCalls, 0); assert.equal(bridgeExists, false);
+  } finally { globalThis.fetch = previousFetch; if (previousConfirm) globalThis.confirm = previousConfirm; else delete globalThis.confirm; }
+});
+
 test("canonical ribbon reports taskpane creation failure instead of swallowing it", async () => {
   const source = await readFile(new URL("../apps/classified-offline/js/ribbon.js", import.meta.url), "utf8");
   const storage = new Map();
@@ -1430,6 +1629,7 @@ test("classified diagnostics cover bootstrap, Ribbon, Host, taskpane and preview
   assert.equal(files.probe.includes("setInterval"), false);
   for (const event of ["ribbon.action.received", "ribbon.command.started", "ribbon.command.completed", "ribbon.command.failed"]) assert.match(files.ribbon, new RegExp(event.replaceAll(".", "\\.")));
   for (const event of ["host.module.loaded", "application.install.attempt", "application.install.success", "application.runtime.run.received", "application.runtime.run.failed", "preview.use_case.start", "preview.comment.readback"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
+  for (const event of ["document.repair.inspect.start", "document.repair.inspect.failed", "document.repair.bridge.save.start", "document.repair.apply.completed", "document.repair.reopen.completed", "document.repair.recovery.start", "document.repair.recovery.failed"]) assert.match(files.host, new RegExp(event.replaceAll(".", "\\.")));
   for (const event of ["taskpane.module.loaded", "taskpane.button.clicked", "taskpane.request.persisted", "taskpane.pending.timeout"]) assert.match(files.taskpane, new RegExp(event.replaceAll(".", "\\.")));
   assert.match(files.recognition, /(recognition\.request\.(start|response|failed)|recognition\.local_process\.start)/);
   assert.match(files.commands, /command_service\.request\.(start|response|failed)|local-format-engine/);
@@ -1474,6 +1674,14 @@ test("canonical entry loads the runtime config, probe, ribbon and classic host e
   assert.match(ribbon, /DocxtoolRunLocalCommand/);
   assert.equal(ribbon.includes("DocxtoolHostEnqueue"), false);
   assert.match(host, /DocxtoolRunLocalCommand/);
+});
+
+test("local-direct Host keeps Control Server for document repair and Broker for Worker recognition", async () => {
+  const source = await readFile(new URL("../apps/classified-offline/src/host-runtime.ts", import.meta.url), "utf8");
+  const workerConfig = source.slice(source.indexOf("const pipeline = new PipelineWorkerClient"), source.indexOf("const startPipeline", source.indexOf("const pipeline = new PipelineWorkerClient")));
+  assert.equal(workerConfig.includes("control_endpoint"), false);
+  assert.match(source, /inspectDocumentRepair\(sourcePath, documentIdentity\)/);
+  assert.match(workerConfig, /authorization_scope:\s*"classified-offline"/);
 });
 
 test("classified Ribbon preserves a safe error when the host queue is stale", async () => {
@@ -1571,6 +1779,8 @@ test("classified UI error messages localize stable WPS error codes", () => {
   assert.match(errorText("DOCUMENT_MUST_BE_SAVED"), /错误码：DOCUMENT_MUST_BE_SAVED/);
   assert.match(errorText("DOCUMENT_SAVE_FAILED"), /文件是否只读或被其他程序占用/);
   assert.match(errorMessage("CONTROL_SERVER_NOT_RUNNING"), /Control Server 未运行/);
+  for (const code of ["DOCUMENT_CHANGED", "PREVIEW_COMMENT_REBIND_FAILED", "PREVIEW_COMMENT_CLEANUP_FAILED", "PREVIEW_USER_COMMENT_CHANGED"]) assert.doesNotMatch(errorMessage(code), /^未知错误/);
+  for (const code of ["DOCUMENT_REPAIR_CANCELLED", "DOCUMENT_REPAIR_SOURCE_CHANGED", "DOCUMENT_REPAIR_FAILED", "DOCUMENT_REPAIR_REOPEN_FAILED", "DOCUMENT_REPAIR_RECOVERY_REQUIRED", "STRUCTURAL_NORMALIZATION_PLAN_INVALID", "STRUCTURAL_NORMALIZATION_API_UNSUPPORTED", "STRUCTURAL_NORMALIZATION_RANGE_MISMATCH", "STRUCTURAL_NORMALIZATION_INCOMPLETE", "STRUCTURAL_NORMALIZATION_ROLLBACK_FAILED"]) assert.doesNotMatch(errorMessage(code), /^未知错误/);
 });
 
 test("diagnostic runner blocks dependent checks and identifies the first root cause", async () => {

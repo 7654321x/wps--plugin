@@ -42,7 +42,7 @@ export function createPreviewCommentText(item: Pick<RecognitionResult["paragraph
   const font = commands.find((command) => command.kind === "paragraph.set_font"); const alignment = commands.find((command) => command.kind === "paragraph.set_alignment"); const indent = commands.find((command) => command.kind === "paragraph.set_indent"); const spacing = commands.find((command) => command.kind === "paragraph.set_spacing");
   const alignmentNames: Record<string, string> = { left: "左对齐", center: "居中", right: "右对齐", justify: "两端对齐", distributed: "分散对齐" };
   const fields = [`识别结果：${role}`];
-  if (item.mixed_structure) fields.push("结构状态：同一物理段落包含多个角色，正式排版前需要拆段");
+  if (item.mixed_structure) fields.push("结构状态：同一物理段落包含多个角色，将按识别范围分别排版");
   if (item.recognized_type === "unknown" || commands.length === 0) fields.push("可应用格式：暂无");
   if (font?.kind === "paragraph.set_font") fields.push(`中文字体：${font.arguments.east_asia_font_name}`, `西文字体：${font.arguments.latin_font_name}`, `字号：${fontSizeName(font.arguments.font_size_pt)}`, `粗体：${font.arguments.bold ? "是" : "否"}`);
   if (alignment?.kind === "paragraph.set_alignment") fields.push(`对齐方式：${alignmentNames[alignment.arguments.alignment] ?? alignment.arguments.alignment}`);
@@ -51,6 +51,9 @@ export function createPreviewCommentText(item: Pick<RecognitionResult["paragraph
   const recognitionReview = item.review_level === "review" || item.review_level === "critical_review";
   if (recognitionReview) fields.push("复核原因：识别结果已定位，建议人工复核");
   const needsReview = item.needs_review || item.recognized_type === "unknown" || commands.length === 0 || item.mixed_structure || item.formatting_disposition === "review_only";
+  const willFormat = item.recognized_type !== "unknown" && commands.length > 0;
+  if (willFormat) fields.push("正式排版：会应用");
+  else fields.push("正式排版：不会执行（未找到可用格式）");
   fields.push(`识别状态：${needsReview ? "需要复核" : "可应用"}`, `识别置信度：${Math.round(item.confidence * 100)}%`);
   return [fields.slice(0, 5), fields.slice(5, 10), fields.slice(10)].filter((group) => group.length > 0).map((group) => group.join(" ")).join("\n");
 }

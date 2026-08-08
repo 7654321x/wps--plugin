@@ -20,6 +20,7 @@ export const HOST_RPC_OPERATIONS = [
   "host.cancel_recognition",
   "host.apply_preview_batch",
   "host.clear_preview_batch",
+  "host.apply_structural_normalization_batch",
   "host.begin_transaction",
   "host.apply_format_batch",
   "host.rollback_batch",
@@ -74,6 +75,9 @@ export interface HostParagraphData {
   is_in_table: boolean;
   range_start: number;
   range_end: number;
+  has_section_break: boolean;
+  has_page_break: boolean;
+  has_object: boolean;
 }
 
 export interface RecognitionJobHandle {
@@ -99,7 +103,7 @@ export interface SerializableLocalDocumentSnapshot {
   textRevision: string;
   sourceSha256: string;
   localDocxPath: string;
-  paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable: boolean }>;
+  paragraphs: Array<{ sourceParagraphIndex: number; text: string; isInTable: boolean; hasSectionBreak: boolean; hasPageBreak: boolean; hasObject: boolean }>;
   paragraphOrderHash: string;
   sectionCount: number;
   documentFullNameHash: string;
@@ -125,13 +129,13 @@ export interface SnapshotSummary {
   text_revision: string;
 }
 
-export type PipelineStage = "idle" | "capturing_descriptor" | "reading_snapshot" | "reading_paragraphs" | "hashing_snapshot" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "generating_commands" | "validating_targets" | "writing_preview" | "applying_format" | "rolling_back" | "completed" | "failed" | "cancelled";
+export type PipelineStage = "idle" | "capturing_descriptor" | "reading_snapshot" | "reading_paragraphs" | "hashing_snapshot" | "hashing" | "launching_recognition" | "waiting_recognition" | "mapping_recognition" | "normalizing_structure" | "resnapshotting_after_normalization" | "generating_commands" | "validating_targets" | "writing_preview" | "applying_format" | "rolling_back" | "completed" | "failed" | "cancelled";
 
 export type PipelineWorkerEvent =
   | { type: "pipeline.ready"; build_id: string }
   | { type: "pipeline.progress"; job_id: string; build_id: string; stage: PipelineStage; completed: number; total: number; batch_size: number; detail: string }
   | { type: "pipeline.diagnostic"; job_id: string; build_id: string; event: string; data: { [key: string]: JsonValue } }
-  | { type: "pipeline.completed"; job_id: string; build_id: string; command: PipelineCommand; snapshot_summary: SnapshotSummary; recognition_result?: import("../../contracts/src/index.js").RecognitionResult; formatting_commands?: import("../../contracts/src/index.js").FormattingCommandSet; preview_result?: { session_id: string; comment_count: number; plan_count: number }; format_result?: { executed_command_count: number; skipped_command_count: number; batch_count: number } }
+  | { type: "pipeline.completed"; job_id: string; build_id: string; command: PipelineCommand; snapshot_summary: SnapshotSummary; recognition_result?: import("../../contracts/src/index.js").RecognitionResult; formatting_commands?: import("../../contracts/src/index.js").FormattingCommandSet; preview_result?: { session_id: string; comment_count: number; plan_count: number }; format_result?: { executed_command_count: number; skipped_command_count: number; skipped_review_count: number; skipped_mixed_count: number; skipped_unresolved_count: number; split_source_paragraph_count: number; created_paragraph_count: number; trimmed_boundary_count: number; removed_empty_paragraph_count: number; batch_count: number } }
   | { type: "pipeline.failed"; job_id: string; build_id: string; error: SerializedHostError }
   | { type: "pipeline.cancelled"; job_id: string; build_id: string };
 

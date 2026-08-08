@@ -18,8 +18,11 @@ from urllib.parse import urlsplit
 
 from .contracts import CONTROL_CONTRACT_VERSION, SERVER_VERSION, ContractError, validate_job_request
 from .adapters import default_formatting_planner
+from .document_repair import DocumentRepairError, DocumentRepairManager
 from .jobs import JobCoordinator, JobStore, utc_now
 from .ports import FormattingPlannerPort, RecognitionPort, UnavailableRecognitionPort
+
+WPS_RESOURCE_ORIGIN = "http://127.0.0.1:3889"
 
 
 def default_manifest_path() -> Path:
@@ -96,13 +99,20 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.headers.get("Origin") == WPS_RESOURCE_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", WPS_RESOURCE_ORIGIN)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status: int, code: str) -> None:
-        self._send(status, {"error": {"code": code, "message": code}})
+    def _error(self, status: int, code: str, details: Optional[Dict[str, object]] = None) -> None:
+        self._send(status, {"error": {"code": code, "message": code, **({"details": details} if details else {})}})
 
     def _authorized(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin and origin != WPS_RESOURCE_ORIGIN:
+            self._error(HTTPStatus.FORBIDDEN, "CONTROL_SERVER_ORIGIN_FORBIDDEN")
+            return False
         host = self.headers.get("Host", "")
         if not _loopback_host(host):
             self._error(HTTPStatus.FORBIDDEN, "CONTROL_SERVER_NON_LOOPBACK_HOST")
@@ -113,6 +123,26 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.UNAUTHORIZED, "CONTROL_SERVER_UNAUTHORIZED")
             return False
         return True
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        origin = self.headers.get("Origin", "")
+        requested_method = self.headers.get("Access-Control-Request-Method", "").upper()
+        requested_headers = {
+            value.strip().casefold()
+            for value in self.headers.get("Access-Control-Request-Headers", "").split(",")
+            if value.strip()
+        }
+        if origin != WPS_RESOURCE_ORIGIN or requested_method not in ("GET", "POST") or not requested_headers.issubset({"authorization", "content-type"}):
+            self._error(HTTPStatus.FORBIDDEN, "CONTROL_SERVER_CORS_PREFLIGHT_REJECTED")
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", WPS_RESOURCE_ORIGIN)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Vary", "Origin")
+        self.end_headers()
 
     def _read_json(self) -> Optional[Dict[str, Any]]:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
@@ -170,6 +200,35 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/document-repairs/inspect":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if set(payload) != {"schema_version", "source_path", "document_identity"} or payload.get("schema_version") != 1 or not isinstance(payload.get("source_path"), str) or not isinstance(payload.get("document_identity"), str):
+                self._error(HTTPStatus.BAD_REQUEST, "CONTROL_SERVER_REQUEST_INVALID")
+                return
+            try:
+                self._send(HTTPStatus.OK, self.control.document_repairs.inspect(payload["source_path"]))
+            except DocumentRepairError as exc:
+                self._error(HTTPStatus.CONFLICT, exc.code, exc.details)
+            return
+        repair_action = self.control.document_repair_path(path)
+        if repair_action:
+            repair_id, action = repair_action
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                if action == "apply" and payload == {"schema_version": 1}:
+                    self._send(HTTPStatus.OK, self.control.document_repairs.apply(repair_id))
+                    return
+                if action == "complete" and set(payload) == {"schema_version", "outcome"} and payload.get("schema_version") == 1 and payload.get("outcome") in ("commit", "restore"):
+                    self._send(HTTPStatus.OK, self.control.document_repairs.complete(repair_id, str(payload["outcome"])))
+                    return
+                self._error(HTTPStatus.BAD_REQUEST, "CONTROL_SERVER_REQUEST_INVALID")
+            except DocumentRepairError as exc:
+                self._error(HTTPStatus.CONFLICT, exc.code, exc.details)
+            return
         if path == "/v1/jobs":
             payload = self._read_json()
             if payload is None:
@@ -227,6 +286,7 @@ class ControlServer:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self.store = JobStore()
+        self.document_repairs = DocumentRepairManager()
         self.coordinator = JobCoordinator(
             self.store,
             recognition or UnavailableRecognitionPort(),
@@ -361,6 +421,20 @@ class ControlServer:
         except ValueError:
             return None
         return value
+
+    @staticmethod
+    def document_repair_path(path: str) -> Optional[Tuple[str, str]]:
+        prefix = "/v1/document-repairs/"
+        if not path.startswith(prefix):
+            return None
+        values = path[len(prefix):].split("/")
+        if len(values) != 2 or values[1] not in ("apply", "complete"):
+            return None
+        try:
+            uuid.UUID(values[0])
+        except ValueError:
+            return None
+        return values[0], values[1]
 
 
 def create_server(

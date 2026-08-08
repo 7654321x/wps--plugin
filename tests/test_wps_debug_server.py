@@ -168,8 +168,46 @@ def test_start_finalizes_build_before_resource_service() -> None:
     end = source.index('elif args.action == "prepare":', start)
     block = source[start:end]
     assert block.index("verify()") < block.index("同步最终 WPS 调试包")
-    assert block.index("同步最终 WPS 调试包") < block.index("ensure_control_server()")
+    assert block.index("ensure_control_server()") < block.index("同步最终 WPS 调试包")
+    assert block.index("同步最终 WPS 调试包") < block.index("inject_control_runtime_config()")
+    assert block.index("inject_control_runtime_config()") < block.index("register_addin(force_restart=True)")
     assert "register_addin(force_restart=True)" in block
+
+
+def test_final_debug_package_receives_current_control_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    debug_package = tmp_path / "wps-debug-package"
+    config_path = debug_package / "ui" / "local-runtime-config.js"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("window.DocxtoolLocalRuntimeConfig = {\n  controlServerEnabled: false,\n};\n", encoding="utf-8")
+    manifest_path = tmp_path / "endpoint.json"
+    manifest = {
+        "schema_version": 1,
+        "instance_id": "11111111-1111-4111-8111-111111111111",
+        "pid": 1234,
+        "process_created_at": "2026-08-08T00:00:00Z",
+        "host": "127.0.0.1",
+        "port": 43127,
+        "base_url": "http://127.0.0.1:43127",
+        "session_token": "t" * 48,
+        "server_version": main.CONTROL_SERVER_EXPECTED_VERSION,
+        "contract_version": 1,
+        "started_at": "2026-08-08T00:00:00Z",
+        "heartbeat_at": "2026-08-08T00:00:01Z",
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    events = []
+    monkeypatch.setattr(main, "DEBUG_PACKAGE", debug_package)
+    monkeypatch.setattr(main, "control_manifest_path", lambda: manifest_path)
+    monkeypatch.setattr(main, "log_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    main.inject_control_runtime_config()
+
+    rendered = config_path.read_text(encoding="utf-8")
+    assert "controlServerEnabled: true" in rendered
+    assert '"port":43127' in rendered
+    assert '"session_token":"' + "t" * 48 + '"' in rendered
+    assert "session_token" not in str(events)
+    assert events[0][0][1] == "control_server.config.injected"
 
 
 def test_managed_debug_server_owner_accepts_pyinstaller_child_without_command_line() -> None:

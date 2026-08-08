@@ -10,6 +10,7 @@ import { probeWorkerCapability, type WorkerCapability } from "./worker-capabilit
 import { PipelineWorkerClient, type SnapshotCommandReceipt } from "./pipeline-worker-client.js";
 import type { PipelineCommand, PipelineWorkerEvent } from "../../../packages/threading/src/protocol.js";
 import { safeError } from "../../../packages/diagnostics/src/index.js";
+import { LocalHttpControlTransport } from "../../../packages/control-client/src/index.js";
 type LocalCommandName = "recognize_document" | "preview_document" | "clear_preview" | "format_document" | "health_check" | "open_taskpane" | "close_taskpane" | "toggle_taskpane" | "probe_shell_execute_one_argument";
 type LocalCommandSource = "ribbon" | "taskpane" | "test";
 type LocalApplicationCommandName = LocalCommandName | "show_about";
@@ -17,7 +18,8 @@ type LocalApplicationCommandStatus = "RUNNING" | "PASS" | "FAIL" | "CANCELLED";
 type PipelineCompletedEvent = Extract<PipelineWorkerEvent, { type: "pipeline.completed" }>;
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void; }
 interface TaskPaneLike { ID: number | string; Visible: boolean; Delete?: () => void; Navigate?: (url: string) => void; Width?: number; DockPosition?: unknown; }
-interface ApplicationLike { ActiveDocument?: { FullName?: string; Saved?: boolean; Save?: () => void; SaveCopyAs?: (path: string) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } } }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: WpsFileSystemApi; Env?: { GetAppDataPath?: () => string }; }
+interface WpsDocumentLike { FullName?: string; Saved?: boolean; Save?: () => void; SaveAs2?: (path: string, format?: number) => void; Close?: (saveChanges?: number) => void; Paragraphs?: { Count?: number; Item?: (index: number) => { Range?: { Text?: string } } }; }
+interface ApplicationLike { ActiveDocument?: WpsDocumentLike; Documents?: { Open?: (path: string) => void }; PluginStorage: StorageLike; CreateTaskPane(url: string, title?: string): TaskPaneLike; GetTaskPane(id: number | string): TaskPaneLike; ribbonUI?: { InvalidateControl?: (id: string) => void }; Enum?: { JSKsoEnum_msoCTPDockPositionRight?: unknown }; FileSystem?: WpsFileSystemApi; Env?: { GetAppDataPath?: () => string }; }
 interface BuildInfo { build_id: string; plugin_version: string; asset_hash: string; build_timestamp: string; }
 interface CommandResult { command_id: string; command_name: LocalApplicationCommandName; status: LocalApplicationCommandStatus; stage: string; summary: string; error_code: string; started_at: string; finished_at: string; }
 type ReviewLevel = RecognitionResult["paragraphs"][number]["review_level"];
@@ -54,10 +56,15 @@ type HostWindow = Window & {
   DocxtoolBootstrapLog?: (level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown, component?: string) => void;
   DocxtoolDiagnosticLog?: (level: DiagnosticLevel, component: string, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void;
   DocxtoolDiagnosticLogger?: { writeForComponent: (component: string, level: DiagnosticLevel, event: string, message: string, data?: Record<string, unknown>, error?: unknown) => void };
+  confirm?: (message: string) => boolean;
 };
 const hostWindow = globalThis as unknown as HostWindow;
 hostWindow.DocxtoolBootstrapLog?.("INFO", "host.module.loaded", "Host Runtime 经典脚本已执行", { application_available: Boolean(hostWindow.Application) }, undefined, "host");
 let fallbackIdCounter = 0;
+function diagnosticError(error: unknown): { name: string; message: string } {
+  if (error && typeof error === "object" && !Array.isArray(error) && typeof (error as { name?: unknown }).name === "string" && typeof (error as { message?: unknown }).message === "string" && !("stack" in error)) return error as { name: string; message: string };
+  return safeError(error);
+}
 function randomId(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   if (typeof crypto.getRandomValues === "function") { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join(""); }
@@ -65,15 +72,26 @@ function randomId(): string {
 }
 function hostLog(level: DiagnosticLevel, event: string, message: string, data: Record<string, unknown> = {}, error?: unknown): void {
   try {
-    const safe = error === undefined ? undefined : safeError(error);
+    const safe = error === undefined ? undefined : diagnosticError(error);
     if (hostWindow.DocxtoolDiagnosticLog) { hostWindow.DocxtoolDiagnosticLog(level, "host", event, message, data, safe); return; }
     if (hostWindow.DocxtoolEarlyLog) { hostWindow.DocxtoolEarlyLog(level, "host", event, message, data, safe); return; }
     const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "host", event, message, data, ...(error === undefined ? {} : { error: safeError(error) }) };
+    const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component: "host", event, message, data, ...(safe === undefined ? {} : { error: safe }) };
     queue.push(item);
     if (queue.length > 100) queue.splice(0, queue.length - 100);
     hostWindow.DocxtoolEarlyLogQueue = queue;
   } catch { /* diagnostics never changes WPS host behavior */ }
+}
+function controlFailureDetail(error: unknown): Record<string, unknown> {
+  const transport = safeError(error);
+  const cause = error instanceof Error && "cause" in error ? safeError((error as Error & { cause?: unknown }).cause) : null;
+  const details = error instanceof Error && "details" in error && typeof (error as Error & { details?: unknown }).details === "object" ? (error as Error & { details: Record<string, unknown> }).details : {};
+  const technical = [
+    `transport=${transport.name}`,
+    `message=${transport.message}`,
+    ...Object.entries(details).map(([key, value]) => `${key}=${String(value)}`),
+  ].filter(Boolean).join("; ");
+  return { transport_error_name: transport.name, transport_error_message: transport.message, ...(cause ? { transport_cause_name: cause.name, transport_cause_message: cause.message } : {}), ...details, ...(details.stage ? { stage_cn: `服务端 DOCX 阶段：${String(details.stage)}` } : {}), ...(details.reason ? { reason_cn: `服务端诊断：${String(details.reason)}` } : {}), action_cn: "根据技术详情中的服务端阶段修复真实 DOCX 结构后重试", technical_detail: technical };
 }
 hostLog("INFO", "host.module.loaded", "Host runtime 模块开始执行", { application_available: Boolean(hostWindow.Application), build_info_available: Boolean(hostWindow.DocxtoolBuildInfo), runtime_config_available: Boolean(hostWindow.DocxtoolRuntimeConfig) });
 
@@ -103,7 +121,7 @@ function previewModel(item: RecognitionResult["paragraphs"][number], plan: strin
 }
 function recognitionSummary(recognition: RecognitionResult): string {
   const unresolved = recognition.unresolved_blocks?.length ?? 0;
-  const applicable = recognition.paragraphs.filter((item) => item.formatting_disposition === "apply" && !item.needs_review).length;
+  const applicable = recognition.paragraphs.filter((item) => item.locator_verified && item.segment_count_total === item.segment_count_located).length;
   const mixed = new Set(recognition.paragraphs.filter((item) => item.mixed_structure).map((item) => item.physical_paragraph_index)).size;
   const review = recognition.paragraphs.filter((item) => item.review_level === "review" || item.review_level === "critical_review").length;
   return `总识别项 ${recognition.paragraphs.length + unresolved}；可应用 ${applicable}；其中混合结构 ${mixed}；识别建议复核 ${review}；未定位 ${unresolved}`;
@@ -137,6 +155,7 @@ export class HostResultStore {
   begin(name: LocalApplicationCommandName, commandId: string, view: HostState["active_view"]): CommandResult { const result: CommandResult = { command_id: commandId, command_name: name, status: "RUNNING", stage: "started", summary: "", error_code: "", started_at: now(), finished_at: "" }; this.update({ active_command: result, command_status: "RUNNING", active_view: view, latest_error: "" }); return result; }
   finish(result: CommandResult, summary: string): CommandResult { const done = { ...result, status: "PASS" as const, stage: "completed", summary, finished_at: now() }; this.update({ active_command: done, command_status: "PASS", formatting_progress: summary }); return done; }
   fail(result: CommandResult, code: string): CommandResult { const done = { ...result, status: "FAIL" as const, stage: "failed", error_code: code, finished_at: now() }; this.update({ active_command: done, command_status: "FAIL", active_view: "issues", latest_error: code, formatting_progress: `失败：${errorMessage(code)}` }); return done; }
+  cancel(result: CommandResult, summary: string): CommandResult { const done = { ...result, status: "CANCELLED" as const, stage: "cancelled", summary, error_code: "", finished_at: now() }; this.update({ active_command: done, command_status: "CANCELLED", formatting_progress: summary, latest_error: "" }); return done; }
   callback(entry: CallbackLog): void { this.update({ callback_log: [...this.state.callback_log, entry].slice(-20) }); }
   private save(): void { this.storage.setItem(RESULT_KEY, JSON.stringify(this.state)); }
 }
@@ -214,7 +233,13 @@ export class LocalApplicationRuntime {
       hostLog("INFO", "application.runtime.run.success", "本地应用命令执行完成", { ...context, duration_ms: Date.now() - startedMs });
       return done;
     } catch (error) {
-      const code = stableError(error); const failed = this.store.fail(result, code);
+      const code = stableError(error);
+      if (code === "DOCUMENT_REPAIR_CANCELLED") {
+        const cancelled = this.store.cancel(result, "用户取消文档修复，未执行排版");
+        hostLog("INFO", "application.runtime.run.cancelled", "用户取消文档修复，当前排版操作已终止", { ...context, duration_ms: Date.now() - startedMs });
+        return cancelled;
+      }
+      const failed = this.store.fail(result, code);
       this.store.callback({ callback_name: `${source}:${name}`, build_id: this.store.read().build_id, host_context: this.store.hostContextId, started_at: started, completed_at: now(), status: "FAIL", stable_error_code: code });
       hostLog("ERROR", "application.runtime.run.failed", "本地应用命令执行失败", { ...context, stable_error_code: code, duration_ms: Date.now() - startedMs }, error);
       return failed;
@@ -297,13 +322,15 @@ export class LocalApplicationRuntime {
   }
   private async clearPreview(): Promise<string> { await this.composition().clearPreviewUseCase.execute(); await this.threadedPreviewCleanup?.(); this.store.update({ preview_comment_status: "预览批注已清除" }); return "预览批注已清除"; }
   private async format(_result: CommandResult): Promise<string> {
-    const identity = await this.documentIdentity();
+    let identity = await this.documentIdentity();
     let phase = "preview_preserved";
     hostLog("INFO", "format.lifecycle.start", "一键排版保存生命周期开始，保留现有预览批注", { phase, document_identity_hash: identity, preview_comments_policy: "preserve" });
     try {
       this.panes.show();
       phase = "save_before_format";
       await saveActiveDocument(this.app, false, "before_format");
+      phase = "document_repair_preflight";
+      if (await this.repairActiveDocument(identity)) identity = await this.documentIdentity();
       phase = "worker_format";
       hostLog("INFO", "format.worker.start", "开始执行 Worker 正式排版", { phase });
       if (!this.pipelineRun) throw new Error("PIPELINE_RUNNER_NOT_READY");
@@ -311,14 +338,145 @@ export class LocalApplicationRuntime {
       if (!event.format_result) throw new Error("FORMAT_RESULT_MISSING");
       phase = "save_after_format";
       await saveActiveDocument(this.app, true, "after_format");
-      const summary = `已执行 ${event.format_result.executed_command_count} 项；跳过 ${event.format_result.skipped_command_count} 项`;
-      hostLog("INFO", "format.lifecycle.completed", "一键排版保存生命周期完成，预览批注已保留", { phase, executed_command_count: event.format_result.executed_command_count, skipped_command_count: event.format_result.skipped_command_count, format_batch_count: event.format_result.batch_count, preview_comments_policy: "preserve" });
+      const splitSummary = event.format_result.created_paragraph_count ? `已拆分 ${event.format_result.split_source_paragraph_count} 个物理段落，新增 ${event.format_result.created_paragraph_count} 个结构段落；` : "";
+      const normalizationSummary = event.format_result.trimmed_boundary_count || event.format_result.removed_empty_paragraph_count ? `清理 ${event.format_result.trimmed_boundary_count} 处结构边界，删除 ${event.format_result.removed_empty_paragraph_count} 个冗余空段；` : "";
+      const summary = `${splitSummary}${normalizationSummary}已应用 ${event.format_result.executed_command_count} 条格式命令；跳过 ${event.format_result.skipped_command_count} 个识别项（未定位 ${event.format_result.skipped_unresolved_count}）`;
+      hostLog("INFO", "format.lifecycle.completed", "一键排版保存生命周期完成，预览批注已保留", { phase, executed_command_count: event.format_result.executed_command_count, skipped_command_count: event.format_result.skipped_command_count, skipped_review_count: event.format_result.skipped_review_count, skipped_mixed_count: event.format_result.skipped_mixed_count, skipped_unresolved_count: event.format_result.skipped_unresolved_count, split_source_paragraph_count: event.format_result.split_source_paragraph_count, created_paragraph_count: event.format_result.created_paragraph_count, trimmed_boundary_count: event.format_result.trimmed_boundary_count, removed_empty_paragraph_count: event.format_result.removed_empty_paragraph_count, format_batch_count: event.format_result.batch_count, preview_comments_policy: "preserve" });
       this.store.update({ document_identity_hash: identity, formatting_result: summary, preview_comment_status: "预览批注已保留；如需删除请点击清除预览", active_view: "execution" });
       return summary;
     } catch (error) {
       hostLog("ERROR", "format.lifecycle.failed", "一键排版保存生命周期失败", { phase, stable_error_code: stableError(error), document_identity_hash: identity }, error);
       throw error;
     }
+  }
+  private async repairActiveDocument(documentIdentity: string): Promise<boolean> {
+    const endpoint = this.config.controlEndpointManifest;
+    if (!this.config.controlServerEnabled || !endpoint) {
+      hostLog("ERROR", "document.repair.control_config.missing", "文档修复无法连接 WPS Control Server：当前 WPS 构建未收到控制服务配置", {
+        stable_error_code: "CONTROL_SERVER_NOT_RUNNING",
+        control_server_enabled: this.config.controlServerEnabled === true,
+        control_endpoint_present: Boolean(endpoint),
+        control_endpoint_port: endpoint?.port ?? 0,
+        control_endpoint_instance_suffix: endpoint?.instance_id.slice(-8) ?? "",
+      });
+      throw new Error("CONTROL_SERVER_NOT_RUNNING");
+    }
+    const document = this.app.ActiveDocument;
+    const sourcePath = String(document?.FullName ?? "");
+    if (!document || !sourcePath.toLocaleLowerCase().endsWith(".docx")) {
+      hostLog("ERROR", "document.repair.preflight.failed", "当前活动文档不满足自动修复条件", { stable_error_code: "DOCUMENT_MUST_BE_SAVED", stage_cn: "检查活动 DOCX", reason_cn: "活动文档不存在或尚未保存为本地 DOCX", active_document_available: Boolean(document), docx_extension_confirmed: sourcePath.toLocaleLowerCase().endsWith(".docx") });
+      throw new Error("DOCUMENT_MUST_BE_SAVED");
+    }
+    const transport = new LocalHttpControlTransport(endpoint, { requestTimeoutMs: 30_000, maxHeartbeatAgeMs: Number.MAX_SAFE_INTEGER });
+    hostLog("INFO", "document.repair.preflight.completed", "当前活动 DOCX 已通过自动修复前置检查", { result_cn: "成功", document_identity_hash: documentIdentity, document_saved: document.Saved === true, control_endpoint_port: endpoint.port, control_endpoint_instance_suffix: endpoint.instance_id.slice(-8) });
+    hostLog("INFO", "document.repair.inspect.start", "开始向 Control Server 提交 DOCX 关系完整性检查", { document_identity_hash: documentIdentity, control_endpoint_port: endpoint.port, control_endpoint_instance_suffix: endpoint.instance_id.slice(-8) });
+    let inspection;
+    try {
+      inspection = await transport.inspectDocumentRepair(sourcePath, documentIdentity);
+    } catch (error) {
+      hostLog("ERROR", "document.repair.inspect.failed", "当前 DOCX 关系完整性检查请求失败", { stable_error_code: stableError(error), control_endpoint_port: endpoint.port, control_endpoint_instance_suffix: endpoint.instance_id.slice(-8), ...controlFailureDetail(error) }, error);
+      throw error;
+    }
+    hostLog("INFO", "document.repair.inspect.response", "Control Server 已返回 DOCX 关系检查结果", { result_cn: "成功", inspection_status: inspection.status, package_member_count: inspection.package_member_count, document_relationship_count: inspection.document_relationship_count, null_relationship_count: inspection.null_relationship_count, dangling_drawing_count: inspection.dangling_drawing_count, broken_relationship_count: inspection.status === "repair_required" ? inspection.broken_relationship_count : 0 });
+    if (inspection.status === "clean") {
+      hostLog("INFO", "document.repair.inspect.completed", "当前 DOCX 关系完整，无需修复", { result_cn: "成功", package_member_count: inspection.package_member_count, document_relationship_count: inspection.document_relationship_count });
+      return false;
+    }
+    hostLog("WARN", "document.repair.required", "检测到当前 DOCX 存在可自动修复的损坏关系或悬空图片对象", { broken_relationship_count: inspection.broken_relationship_count, null_relationship_count: inspection.null_relationship_count, dangling_drawing_count: inspection.dangling_drawing_count, package_member_count: inspection.package_member_count, document_relationship_count: inspection.document_relationship_count });
+    if (typeof hostWindow.confirm !== "function") {
+      hostLog("ERROR", "document.repair.confirm.unavailable", "WPS 当前上下文无法显示文档修复确认框", { stable_error_code: "DOCUMENT_REPAIR_FAILED", stage_cn: "确认文档修复", reason_cn: "当前 WPS Host 没有提供 confirm 接口" });
+      throw new Error("DOCUMENT_REPAIR_FAILED");
+    }
+    const accepted = hostWindow.confirm("检测到当前 DOCX 存在损坏关系。继续排版将保存、修复并重新打开当前文件。是否继续？");
+    hostLog("INFO", accepted ? "document.repair.confirm.accepted" : "document.repair.confirm.cancelled", accepted ? "用户已确认修复当前 DOCX" : "用户已取消修复当前 DOCX", { broken_relationship_count: inspection.broken_relationship_count });
+    if (!accepted) throw new Error("DOCUMENT_REPAIR_CANCELLED");
+    if (typeof document.SaveAs2 !== "function" || typeof document.Close !== "function" || typeof this.app.Documents?.Open !== "function") {
+      hostLog("ERROR", "document.repair.host_api.missing", "WPS 文档修复所需宿主接口不完整", { stable_error_code: "DOCUMENT_REPAIR_FAILED", stage_cn: "检查 WPS 文档切换接口", reason_cn: "SaveAs2、Close 或 Documents.Open 不可用", save_as_available: typeof document.SaveAs2 === "function", close_available: typeof document.Close === "function", open_available: typeof this.app.Documents?.Open === "function" });
+      throw new Error("DOCUMENT_REPAIR_FAILED");
+    }
+    const bridgePath = sourcePath.replace(/\.docx$/i, `.docxtool-repairing-${inspection.repair_id.replaceAll("-", "").slice(0, 12)}.docx`);
+    let bridged = false; let applied = false; let reopening = false; let repairPhase = "bridge_save";
+    hostLog("INFO", "document.repair.bridge.start", "开始切换文档以释放原文件", { document_identity_hash: documentIdentity });
+    try {
+      hostLog("INFO", "document.repair.bridge.save.start", "开始将当前文档切换到临时桥接文件", { repair_id_suffix: inspection.repair_id.slice(-8) });
+      try { document.SaveAs2(bridgePath, 12); }
+      catch (error) { throw new Error("DOCUMENT_REPAIR_FAILED", { cause: error }); }
+      bridged = true;
+      hostLog("INFO", "document.repair.bridge.save.completed", "当前文档已另存为桥接文件", { result_cn: "成功", repair_id_suffix: inspection.repair_id.slice(-8) });
+      repairPhase = "bridge_activate";
+      try { await this.waitForActiveDocument(bridgePath); }
+      catch (error) { throw new Error("DOCUMENT_REPAIR_FAILED", { cause: error }); }
+      hostLog("INFO", "document.repair.bridge.active", "WPS 当前活动文档已切换到桥接文件", { result_cn: "成功" });
+      repairPhase = "server_apply";
+      hostLog("INFO", "document.repair.apply.start", "开始原子修复当前 DOCX", { broken_relationship_count: inspection.broken_relationship_count });
+      const repair = await transport.applyDocumentRepair(inspection.repair_id);
+      applied = true;
+      hostLog("INFO", "document.repair.apply.completed", "Control Server 已完成 DOCX 原子修复", { result_cn: "成功", removed_relationship_count: repair.removed_relationship_count, removed_drawing_count: repair.removed_drawing_count });
+      repairPhase = "source_reopen";
+      reopening = true;
+      hostLog("INFO", "document.repair.reopen.start", "开始重新打开修复后的原 DOCX", { repair_id_suffix: inspection.repair_id.slice(-8) });
+      this.app.Documents.Open(sourcePath);
+      await this.waitForActiveDocument(sourcePath);
+      reopening = false;
+      hostLog("INFO", "document.repair.reopen.completed", "修复后的原 DOCX 已重新打开", { result_cn: "成功" });
+      repairPhase = "bridge_cleanup";
+      document.Close(0);
+      this.removeBridgeFile(bridgePath);
+      hostLog("INFO", "document.repair.bridge.cleanup.completed", "桥接文档已关闭并清理", { result_cn: "成功" });
+      repairPhase = "server_commit";
+      hostLog("INFO", "document.repair.commit.start", "开始提交 DOCX 修复事务", { repair_id_suffix: inspection.repair_id.slice(-8) });
+      await transport.completeDocumentRepair(inspection.repair_id, "commit");
+      hostLog("INFO", "document.repair.commit.completed", "DOCX 修复事务已提交", { result_cn: "成功" });
+      hostLog("INFO", "document.repair.completed", "当前 DOCX 已修复并重新打开", { result_cn: "成功", removed_relationship_count: repair.removed_relationship_count, removed_drawing_count: repair.removed_drawing_count });
+      return true;
+    } catch (error) {
+      hostLog("ERROR", "document.repair.lifecycle.failed", "DOCX 修复生命周期在当前阶段失败", { repair_phase: repairPhase, stage_cn: `DOCX 修复阶段：${repairPhase}`, stable_error_code: stableError(error), bridged, applied, reopening, ...controlFailureDetail(error) }, error);
+      if (applied) {
+        try {
+          hostLog("WARN", "document.repair.recovery.start", "开始恢复文档修复前的原文件", { failed_phase: repairPhase });
+          if (normalizeWpsPath(String(this.app.ActiveDocument?.FullName ?? "")).toLocaleLowerCase() === normalizeWpsPath(sourcePath).toLocaleLowerCase()) this.app.ActiveDocument?.Close?.(0);
+          await transport.completeDocumentRepair(inspection.repair_id, "restore");
+          this.app.Documents.Open(sourcePath);
+          await this.waitForActiveDocument(sourcePath);
+          document.Close(0);
+          this.removeBridgeFile(bridgePath);
+          hostLog("INFO", "document.repair.recovery.completed", "文档修复失败后已恢复原文件并重新打开", { result_cn: "成功", failed_phase: repairPhase });
+        } catch (recoveryError) {
+          hostLog("ERROR", "document.repair.recovery.failed", "文档修复失败且自动恢复未完成", { stable_error_code: "DOCUMENT_REPAIR_RECOVERY_REQUIRED", failed_phase: repairPhase, ...controlFailureDetail(recoveryError) }, recoveryError);
+          throw new Error("DOCUMENT_REPAIR_RECOVERY_REQUIRED", { cause: recoveryError });
+        }
+        const failureCode = reopening ? "DOCUMENT_REPAIR_REOPEN_FAILED" : stableError(error);
+        throw new Error(failureCode.startsWith("DOCUMENT_REPAIR_") ? failureCode : "DOCUMENT_REPAIR_FAILED", { cause: error });
+      }
+      if (bridged) {
+        try {
+          hostLog("WARN", "document.repair.bridge.recovery.start", "修复尚未覆盖原文件，开始重新打开原 DOCX", { failed_phase: repairPhase });
+          this.app.Documents.Open(sourcePath);
+          await this.waitForActiveDocument(sourcePath);
+          document.Close(0);
+          this.removeBridgeFile(bridgePath);
+          hostLog("INFO", "document.repair.bridge.recovery.completed", "原 DOCX 已重新打开，桥接文件已清理", { result_cn: "成功", failed_phase: repairPhase });
+        } catch (recoveryError) {
+          hostLog("ERROR", "document.repair.bridge.recovery.failed", "原文件未被覆盖，但 WPS 未能自动切回；桥接文件已保留", { stable_error_code: stableError(recoveryError), failed_phase: repairPhase, ...controlFailureDetail(recoveryError) }, recoveryError);
+        }
+      }
+      throw error;
+    }
+  }
+  private async waitForActiveDocument(expectedPath: string): Promise<void> {
+    const expected = normalizeWpsPath(expectedPath).toLocaleLowerCase();
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (normalizeWpsPath(String(this.app.ActiveDocument?.FullName ?? "")).toLocaleLowerCase() === expected) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("DOCUMENT_REPAIR_REOPEN_FAILED");
+  }
+  private removeBridgeFile(path: string): void {
+    if (!this.app.FileSystem) throw new Error("DOCUMENT_REPAIR_FAILED");
+    const fs = new WpsLocalFileSystem(this.app.FileSystem);
+    if (!fs.exists(path)) return;
+    fs.removeFile(path);
+    if (fs.exists(path)) throw new Error("DOCUMENT_REPAIR_FAILED");
   }
   private async health(): Promise<string> {
     const state = this.store.read();
@@ -436,7 +594,7 @@ function installDiagnosticLogger(_config: ClassifiedRuntimeConfig, build: BuildI
         return;
       }
       const queue = hostWindow.DocxtoolEarlyLogQueue ?? [];
-      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, build_id: build.build_id, data, ...(error === undefined ? {} : { error: safeError(error) }) };
+      const item: DiagnosticEvent = { timestamp: new Date().toISOString(), level, component, event, message, build_id: build.build_id, data, ...(error === undefined ? {} : { error: diagnosticError(error) }) };
       queue.push(item);
       if (queue.length > 100) queue.splice(0, queue.length - 100);
       hostWindow.DocxtoolEarlyLogQueue = queue;
@@ -457,7 +615,11 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
   const stopHeartbeat = () => { if (heartbeatTimer !== undefined) hostWindow.clearInterval(heartbeatTimer); heartbeatTimer = undefined; return heartbeatMaxDrift; };
   const onPipelineEvent = (event: PipelineWorkerEvent) => {
     if (event.type === "pipeline.ready") { hostLog("INFO", "pipeline.worker.ready", "后台线程状态机已就绪", { build_id: event.build_id }); return; }
-    if (event.type === "pipeline.diagnostic") { hostLog("DEBUG", event.event, "后台线程快照阶段事件", event.data); return; }
+    if (event.type === "pipeline.diagnostic") {
+      const failed = event.event.endsWith(".failed"); const control = event.event.startsWith("control.");
+      const technical = failed ? Object.entries(event.data).map(([key, value]) => `${key}=${String(value)}`).join("; ") : "";
+      hostLog(failed ? "ERROR" : control ? "INFO" : "DEBUG", event.event, failed ? "后台线程控制服务请求失败" : control ? "后台线程控制服务阶段完成" : "后台线程快照阶段事件", { ...event.data, ...(technical ? { technical_detail: technical } : {}) }); return;
+    }
     if (event.type === "pipeline.progress") { store.update({ formatting_progress: event.detail }); hostLog("DEBUG", activePipelineCommand === "preview" ? "pipeline.preview.progress" : activePipelineCommand === "format" ? "pipeline.format.progress" : activePipelineCommand === "diagnostic" ? "pipeline.diagnostic.progress" : "worker.snapshot.shadow.progress", event.detail, { stage: event.stage, completed: event.completed, total: event.total, batch_size: event.batch_size }); return; }
     const mainThreadMaxDrift = stopHeartbeat();
     pipelineBusy = false; hostWindow.DocxtoolCommandBusy = running; invalidate();
@@ -483,7 +645,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
       hostLog("INFO", "pipeline.preview.complete", "后台线程正式预览完成", { ...event.snapshot_summary, preview_comment_count: event.preview_result.comment_count, formatting_command_count: commands.commands.length, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed" && event.command === "format" && event.format_result) {
       store.update({ formatting_progress: "格式写入完成，正在保存", active_view: "execution", latest_error: "" });
-      hostLog("INFO", "pipeline.format.complete", "后台线程正式排版写入完成", { ...event.snapshot_summary, executed_command_count: event.format_result.executed_command_count, format_batch_count: event.format_result.batch_count, main_thread_max_drift_ms: mainThreadMaxDrift });
+      hostLog("INFO", "pipeline.format.complete", "后台线程正式排版写入完成", { ...event.snapshot_summary, executed_command_count: event.format_result.executed_command_count, skipped_command_count: event.format_result.skipped_command_count, skipped_review_count: event.format_result.skipped_review_count, skipped_mixed_count: event.format_result.skipped_mixed_count, skipped_unresolved_count: event.format_result.skipped_unresolved_count, split_source_paragraph_count: event.format_result.split_source_paragraph_count, created_paragraph_count: event.format_result.created_paragraph_count, trimmed_boundary_count: event.format_result.trimmed_boundary_count, removed_empty_paragraph_count: event.format_result.removed_empty_paragraph_count, format_batch_count: event.format_result.batch_count, main_thread_max_drift_ms: mainThreadMaxDrift });
     } else if (event.type === "pipeline.completed") { store.update({ formatting_progress: `后台线程快照完成：${event.snapshot_summary.paragraph_count} 段`, formatting_result: `快照 ${event.snapshot_summary.source_sha256_prefix}；Host RPC P95 ${event.snapshot_summary.p95_host_rpc_ms.toFixed(1)} ms` }); hostLog("INFO", "worker.snapshot.shadow.complete", "后台线程影子快照完成", { ...event.snapshot_summary, main_thread_max_drift_ms: mainThreadMaxDrift }); }
     else if (event.type === "pipeline.cancelled") { store.update({ command_status: "CANCELLED", active_command: current ? { ...current, status: "CANCELLED", stage: "cancelled", summary: "后台任务已取消", finished_at: now() } : null, formatting_progress: "后台任务已取消" }); hostLog("WARN", "pipeline.job.cancelled", "后台线程任务已取消", { command: activePipelineCommand ?? "", main_thread_max_drift_ms: mainThreadMaxDrift }); }
     else { store.update({ command_status: "FAIL", active_command: current ? { ...current, status: "FAIL", stage: "failed", summary: "后台任务失败", error_code: event.error.code, finished_at: now() } : null, formatting_progress: "后台线程任务失败", latest_error: event.error.code, active_view: "issues" }); hostLog("ERROR", "pipeline.job.failed", "后台线程任务失败", { command: activePipelineCommand ?? "", stable_error_code: event.error.code, main_thread_max_drift_ms: mainThreadMaxDrift }); }
@@ -504,7 +666,7 @@ function install(application: ApplicationLike, build: BuildInfo, config: Classif
     if (!response.ok) throw new Error(response.error?.code ?? "LOCAL_LAUNCH_PROBE_FAILED");
     return response.value as { returned_in_ms: number };
   };
-  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline", ...(config.controlServerEnabled && config.controlEndpointManifest ? { control_endpoint: config.controlEndpointManifest } : {}) }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
+  const pipeline = new PipelineWorkerClient({ workerUrl: hostWindow.DocxtoolVersionedAsset?.("pipeline-worker.js") ?? new URL("pipeline-worker.js", hostWindow.location.href).toString(), bridge: hostBridge, buildId: build.build_id, workerConfig: { profile: hostWindow.DocxtoolDefaultProfile as unknown as import("../../../packages/threading/src/protocol.js").JsonValue, client_capabilities: new WpsCapabilityProvider().capabilities(), authorization_scope: "classified-offline" }, diagnostics: hostWindow.DocxtoolDiagnosticLogger, onEvent: onPipelineEvent });
   const startPipeline = (command: PipelineCommand) => { const receipt = pipeline.start(command); if (receipt.accepted) { activePipelineCommand = command; pipelineBusy = true; hostWindow.DocxtoolCommandBusy = true; startHeartbeat(); invalidate(); hostWindow.setTimeout(() => { const active = store.read().active_command; if (active) store.update({ command_status: "RUNNING", active_command: { ...active, status: "RUNNING", stage: "pipeline", summary: "后台线程处理中", finished_at: "" } }); }, 0); } return receipt; };
   runtime.attachPipelineStarter(startPipeline);
   runtime.attachPipelineRunner((command) => {
@@ -598,12 +760,14 @@ function tryInstall(): void {
   const installingReadiness = { ...readiness, install_state: installState };
   const started = Date.now();
   try {
-    hostLog("INFO", "application.install.start", "开始安装本地应用运行时", installingReadiness);
+    const endpoint = config.controlEndpointManifest;
+    const controlReadiness = { control_server_enabled: config.controlServerEnabled === true, control_endpoint_present: Boolean(endpoint), control_endpoint_port: endpoint?.port ?? 0, control_endpoint_instance_suffix: endpoint?.instance_id.slice(-8) ?? "" };
+    hostLog("INFO", "application.install.start", "开始安装本地应用运行时", { ...installingReadiness, ...controlReadiness });
     const hostContextId = randomId();
     install(application, build, config, hostContextId);
     installState = "ready";
     stopInstallRetry();
-    hostLog("INFO", "application.install.success", "本地应用运行时安装成功", { ...installingReadiness, install_state: installState, host_context_id: hostContextId, duration_ms: Date.now() - started });
+    hostLog("INFO", "application.install.success", "本地应用运行时安装成功", { ...installingReadiness, ...controlReadiness, install_state: installState, host_context_id: hostContextId, duration_ms: Date.now() - started });
   } catch (error) {
     recordInstallFailure(application, build, { ...installingReadiness, duration_ms: Date.now() - started }, stableError(error), error);
   }

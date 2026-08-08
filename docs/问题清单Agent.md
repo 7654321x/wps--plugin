@@ -632,3 +632,91 @@ WPS 保存批注会重组批注锚点和运行节点，可能只改变格式修�
 - 禁止：只增加超时、只隐藏 WPS 界面卡顿、恢复第二套同步排版链或为了通过旧测试绕过文档变化核验。
 - 正确方案：一键排版使用 Worker `format`，分批读取、识别、二次正文核对和格式写入；任务窗格显示阶段进度；批次间不做全文扫描，每个目标保留局部 Hash 核验和事务回滚。
 - 自动验证门槛：Worker format 完整回归通过；正式 Range 使用字符边界；20/200/1000 段测试有进度且不调用批次间全文扫描；真实 WPS 保存后 DOCX/OOXML 检查完成前不得写完整 PASS。
+
+## P075 预览审阅结果与正式排版应用范围混淆
+
+- 症状：预览批注标出了全部识别结果，但正式排版只改变其中部分内容，用户无法判断哪些项目会被排版。
+- 根因：预览使用完整审阅结果；正式排版需要先把同一物理段落中的多个已定位逻辑块拆成真实段落，否则 WPS 的段落级属性会互相覆盖。
+- 禁止：为了让预览和排版数量相同而强行应用未定位结果；也不得在混合物理段落未拆分时任选一个角色覆盖整段，或把结构化拆段失败伪装成成功。
+- 正确方案：预览保留完整识别审阅结果；已核验定位的结果均进入拆段计划或格式命令，只有真正未定位结果不进入排版。拆段成功后必须重新快照并重新识别，再按原格式 profile 生成命令；拆段失败立即终止当前操作并保留真实错误链。
+- 自动验证门槛：已定位的复核项和混合结构项进入拆段/格式流程；拆段后文字守恒、段落数变化、重新识别和格式应用均有回归测试；未定位结果继续跳过；正式完成事件包含应用数、未定位数和拆段统计；未知且无格式映射的类型仍不生成伪造命令。
+
+## P076 同一物理段落多角色导致段落格式互相覆盖
+
+- 症状：识别和预览都显示成功，但一键排版后同一物理段落内的标题、正文、职务姓名或落款格式互相覆盖，结果与预览审阅不一致。
+- 根因：DOCX/WPS 的 `ParagraphFormat` 作用于物理段落；一个物理段落包含多个逻辑角色时，逐个子 Range 设置对齐、缩进、行距会由最后一次写入覆盖前面的段落属性。
+- 禁止：在 WPS 端重新猜测角色边界；仅按逻辑块序号直接写入；只改字体而继续让多个角色共享一个物理段落；把未定位内容猜测拆分或把拆段失败当作排版成功。
+- 正确方案：仅对定位已核验、范围完整且间隙为连续空白/手工换行的混合物理段落生成结构化拆段计划；按物理段落和边界倒序插入真实段落分隔；保存后重新读取快照并重新识别；仍有混合结构或拆段校验失败时立即终止当前操作。表格和未定位内容保持跳过。
+- 自动验证门槛：拆段前校验文档身份和物理段落哈希；拆段后验证段落新增数量、文字守恒和新快照；重新识别不再产生可拆混合结构；正式格式命令包含所有已定位结果；失败时事务可回滚，真实 WPS 保存后 DOCX/OOXML 检查完成前不得写完整 PASS。
+
+## P077 结构化拆段复核失败缺少定位证据
+
+- 症状：日志只显示 `STRUCTURAL_NORMALIZATION_INCOMPLETE`，无法判断结构规范化后仍有多少物理段落混合、哪些定位块未完成或二次识别是否读取了新段落。
+- 根因：Worker 在二次识别后直接抛出错误，没有在失败边界记录拆段统计和脱敏的识别定位摘要。
+- 禁止：放宽 `mixed_structure` 失败条件、把拆段成功当成排版成功，或记录用户文档正文、完整路径和完整哈希。
+- 正确方案：二次快照和识别前后记录阶段事件；失败时记录拆段前后段落数、计划/边界数、识别项数、未定位数、仍混合物理段落数及每项的段落索引和定位计数；继续终止当前排版操作。
+- 自动验证门槛：真实日志出现 `pipeline.structure.normalization.recheck.start` 与 `pipeline.structure.normalization.recheck.failed/completed`；失败日志包含上述统计且不含正文；`STRUCTURAL_NORMALIZATION_INCOMPLETE` 和回滚语义保持不变。
+
+## P078 DOCX 损坏关系不能只删除 rels 或在打开状态下覆盖
+
+- 症状：DOCX 包含规范化后为 `../NULL` 的图片关系，`python-docx` 或其他 OPC 读取器报缺少 `NULL` 成员；仅删除关系后仍残留引用该关系的 drawing，直接覆盖 WPS 正在打开的原文件又可能失败或丢失恢复入口。
+- 根因：损坏关系、正文中的 `a:blip`/`w:drawing` 和 WPS 文件占用属于同一个修复事务，过去没有统一的检查、释放、回滚、覆盖和重开闭环。
+- 禁止：忽略关系错误继续排版；只删 `document.xml.rels` 而保留悬空 drawing；接受执行阶段传入任意路径；在 WPS 仍占用原文件时直接覆盖；修复失败后删除唯一可恢复的桥接文件。
+- 正确方案：Control Server 检查时绑定源路径与 SHA-256 并返回一次性 `repair_id`；WPS 确认后用 `SaveAs2(..., wdFormatXMLDocument)` 切换同目录桥接文件。执行阶段仅接受 `repair_id`，创建同目录回滚副本，只删除目标规范化为 `../NULL` 的图片关系、对应 drawing 和空 run，验证 ZIP/XML、成员、正常关系、缺失目标与悬空引用后原子覆盖；重开成功才提交，失败则恢复原文件，恢复失败保留桥接文件。
+- 自动验证门槛：正常 DOCX 返回 clean 且不生成修复记录；损坏 fixture 和当前样本临时副本均删除 1 个关系及 1 个 drawing，`../NULL=0`、悬空引用=0、ZIP CRC 正常、未修改成员字节一致；源 SHA 变化拒绝覆盖；Host 测试覆盖取消、确认、重开失败恢复和 `CANCELLED` 状态。真实 WPS 自动重开未运行时必须记为 `NOT RUN`。
+
+## P079 已定位逻辑块必须先物化为物理段落再应用段落格式
+
+- 症状：识别已经给出标题和正文的连续 UTF-16 范围，但两者仍共享一个 WPS 物理段落，段落级缩进、对齐和行距互相覆盖；结构空段和段首/段尾手工换行继续影响最终版式。
+- 根因：识别逻辑块、DOCX 物理段落和 WPS `ParagraphFormat` 粒度不同；旧拆段只处理有间隙边界，没有处理零长度连续边界、逻辑块外侧换行和经结构证明的空段。
+- 禁止：在共享物理段落的子 Range 上继续写不同段落格式；把全部空段全局删除；删除表格、分节符、分页符、对象或逻辑块内部换行；对未定位内容猜测边界。
+- 正确方案：只依据已核验 source spans 生成结构规范化计划；零长度连续边界也插入真实段落分隔，只清理逻辑块外侧纯空白/手工换行，只删除标题与正文之间且无表格、分节、分页或对象事实的结构冗余空段。按段落和边界倒序放入一个自定义撤销记录，保存后重新快照、重新识别；仍有已定位混合结构时停止格式写入。
+- 自动验证门槛：计划与 Host 测试覆盖连续边界、外侧换行、段内换行保留、受保护空段不删、结构空段删除、保存失败完整撤销；当前样本只读基线识别出 1 个连续混合段、1 个结构空段和 4 处边界换行。真实 WPS 保存后必须达到 78 个非空主故事段落、0 个独立空段，并完成 DOCX/OOXML 格式复查后才可写 PASS。
+
+## P080 Control Server 已运行但最终 WPS 包未注入 endpoint
+
+- 症状：启动器明确显示随机 loopback Control Server 已就绪，WPS 也加载了当前构建；点击“一键排版”保存文档后却立即返回 `CONTROL_SERVER_NOT_RUNNING`，且没有 `document.repair.inspect.start`。
+- 根因：启动流程先从 `dist` 同步最终调试包，之后才启动或复用 Control Server；静态 `local-runtime-config.js` 中的 `controlServerEnabled: false` 因此原样进入 WPS 实际加载包，当前 endpoint 从未注入 Host Runtime。
+- 禁止：删除文档修复前置检查；在 WPS 内启动服务；用固定端口、旧 endpoint、PluginStorage 缓存或无鉴权请求兜底；在日志中记录 Bearer token。
+- 正确方案：先启动或复用 Control Server，取得当前 endpoint；随后同步最终调试包并只向该本机运行包注入 `controlServerEnabled: true` 和完整 endpoint，再启动资源服务。Host 安装日志只记录启用状态、endpoint 是否存在、端口和 instance 后缀。
+- 自动验证门槛：启动顺序回归固定为 `ensure_control_server → 同步最终调试包 → inject_control_runtime_config → register_addin`；注入测试证明最终包包含当前端口和 token，但日志不含 token；真实 WPS 安装日志显示 endpoint 已存在，点击一键排版后出现 `document.repair.inspect.start`。
+
+## P081 WPS 跨端口 Control Server 请求必须通过浏览器 CORS 预检
+
+- 症状：最终 WPS 包已注入当前 endpoint，日志已进入 `document.repair.inspect.start`，但数毫秒内返回 `CONTROL_SERVER_UNREACHABLE`；启动器和本机健康检查仍显示 Control Server 正常。
+- 根因：插件页面来源是 `http://127.0.0.1:3889`，Control Server 使用随机 loopback 端口。携带 `Authorization` 和 `Content-Type: application/json` 的跨源 POST 会先发送 OPTIONS；旧服务未实现 OPTIONS，真实预检返回 501，浏览器因此不发送 POST。
+- 禁止：删除 Bearer 鉴权、改回固定端口、使用 `Access-Control-Allow-Origin: *` 配合授权请求、允许任意来源或把浏览器 CORS 失败误判为服务未启动。
+- 正确方案：Control Server 只接受 `http://127.0.0.1:3889` 来源；OPTIONS 仅允许 GET/POST 和 Authorization/Content-Type，实际响应返回相同精确来源。升级 Control Server 版本并由启动器替换旧版本，避免复用不支持 CORS 的旧进程。
+- 自动验证门槛：真实 OPTIONS 返回 204、精确 Allow-Origin/Methods/Headers；非法来源返回 403；带合法 Origin 的健康响应返回 Allow-Origin；Host 请求失败日志保留稳定错误码、原始异常类型和请求阶段，但不记录 token、完整路径或正文。
+
+## P082 本机直连 Worker 不得因修复 endpoint 切换到 Control Server 识别
+
+- 症状：DOCX 修复 endpoint 已正确注入后，预览排版在 Worker 启动阶段返回 `CONTROL_SERVER_STALE`；即使放宽静态心跳，后续也会进入未配置本机识别器的 Control Server 链路。
+- 根因：Host 把仅供 DOCX 修复使用的 endpoint 同时传入 Worker；Worker 因存在 `control_endpoint` 改走远程/受控识别，而本机直连模式按合同应继续使用 Broker 文件队列。
+- 禁止：通过无限放宽 endpoint 心跳掩盖链路选错；让本机 Worker 走 Control Server 识别；为此给 Control Server 再接一套重复的本机识别执行链。
+- 正确方案：classified-offline 本机 Host 只在 `repairActiveDocument` 使用 Control Server；Worker 配置不携带 `control_endpoint`，识别、预览和正式排版继续使用现有 Broker 文件队列。独立的远程/受控部署测试仍保留 ControlTransport 能力。
+- 自动验证门槛：源码回归证明本机 Host Worker 配置不含 `control_endpoint`，文档修复仍调用 inspect 接口；本机预览日志出现 Broker 入队/领取/完成，不再出现 `CONTROL_SERVER_STALE`。
+
+## P083 DOCX 修复通用错误必须带服务端具体阶段
+
+- 症状：`document.repair.inspect.start` 后只返回 `DOCUMENT_REPAIR_FAILED`，无法区分源文件不可访问、ZIP CRC、关系部件缺失、关系目标缺失、悬空引用、drawing 数量不符、原子替换或恢复失败。
+- 根因：DocumentRepairManager 十多个失败边界共用同一个错误码，HTTP 错误响应未携带结构化详情；Host 修复生命周期又缺少桥接、应用、重开、提交和恢复的逐阶段日志。
+- 禁止：记录完整文件路径、正文、Token 或完整哈希；只在顶层重复打印同一个错误码；捕获恢复异常后静默继续。
+- 正确方案：稳定错误码保持不变，服务端额外返回 `stage`、`reason`、异常类型、内部 OOXML 成员和必要数量；Transport 保留这些字段；Host 以开始/成功/失败事件记录 inspect、确认、桥接保存、活动文档切换、apply、重开、桥接清理、commit 和 recovery。
+- 自动验证门槛：缺失文件测试返回 `inspect.source/source_path_not_accessible/FileNotFoundError`；Transport 保留结构化详情；Host 源码门禁覆盖修复与恢复阶段事件；统一日志错误行可见阶段、原因和技术详情且敏感信息仍脱敏。
+
+## P084 WPS 保存后可能删除坏关系但保留悬空 drawing
+
+- 症状：修复检查返回 `validate.references/xml_contains_dangling_relationship_reference/member=word/document.xml`，没有进入自动修复确认；用户看到“损坏关系未能修复”。
+- 根因：WPS 保存损坏 DOCX 时可能删除 `document.xml.rels` 中的 `../NULL` 关系，但不删除 `word/document.xml` 中仍引用旧关系 ID 的 `w:drawing/a:blip`。旧修复器只把仍存在的 `../NULL` 关系识别为修复对象，悬空 drawing 被完整性校验提前阻断。
+- 禁止：放宽悬空引用校验后继续排版；删除所有 drawing 或图片；把任意缺失关系都猜测为图片；要求用户手工解压修改 OOXML。
+- 正确方案：检查阶段同时收集规范化为 `../NULL` 的图片关系，以及 `word/document.xml` 中缺少对应关系的 `a:blip r:embed`；只对可定位到所属 `w:drawing` 的悬空图片引用建立修复记录。修复时删除现存坏关系和两类损坏 drawing，空 run 一并移除，随后执行原有 ZIP/XML/关系/成员验证。
+- 自动验证门槛：分别覆盖“坏关系仍存在”和“关系已被 WPS 删除但 drawing 悬空”；后一种必须报告 `null_relationship_count=0`、`dangling_drawing_count=1`，apply 返回删除关系 0、drawing 1，提交后 ZIP CRC 正常且悬空 ID 为 0。
+
+## P085 同一路径文档重开或排版后清除预览误报 DOCUMENT_CHANGED
+
+- 症状：预览成功后执行自动 DOCX 修复、重开或结构规范化，一键排版也已完成；随后点击“清除预览”却返回 `DOCUMENT_CHANGED`，预览批注仍留在文档中。
+- 根因：预览会话只保存了由路径、段落数和节数共同生成的快照令牌；同一原文件重开或段落数变化后令牌必然改变，并且会话仍持有重开前已经失效的 WPS 批注对象。
+- 禁止：取消真正跨文档保护；令牌不同时扫描并删除任意 `DocxTool·` 批注；继续调用重开前的旧 WPS 批注对象；记录完整路径、完整哈希或批注正文。
+- 正确方案：预览创建时同时保存脱敏路径哈希和批注内存签名。清除时先以路径哈希确认仍是同一文件；同一路径允许把会话迁移到当前快照令牌，并从当前文档按本次会话签名重新定位批注对象后分批删除。路径哈希不同继续返回 `DOCUMENT_CHANGED`；定位数量不完整返回 `PREVIEW_COMMENT_REBIND_FAILED`，不得猜测删除。
+- 自动验证门槛：回归覆盖“同一路径、段落数变化、旧批注对象失效”仍可清除；真实不同路径继续拒绝且不删除；用户批注完整性保持；日志包含 `preview.session.rebind.start/completed`、`preview.cleanup.resolve.completed/failed` 和每批删除结果。

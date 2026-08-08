@@ -1,4 +1,4 @@
-import { assertControlJobRequest, assertControlJobResult, parseControlEndpointManifest, type ControlCapabilities, type ControlEndpointManifest, type ControlHealth, type ControlJobRequest, type ControlJobResult, type ControlJobStatus, type SubmittedJob } from "./contracts.js";
+import { assertControlJobRequest, assertControlJobResult, assertDocumentRepairApplied, assertDocumentRepairCompleted, assertDocumentRepairInspection, isUuid, parseControlEndpointManifest, type ControlCapabilities, type ControlEndpointManifest, type ControlHealth, type ControlJobRequest, type ControlJobResult, type ControlJobStatus, type DocumentRepairApplied, type DocumentRepairCompleted, type DocumentRepairInspection, type SubmittedJob } from "./contracts.js";
 import { ControlTransportError, asControlError } from "./errors.js";
 import type { ControlEndpointProvider } from "./endpoint-provider.js";
 
@@ -15,6 +15,10 @@ function endpointUrl(manifest: ControlEndpointManifest, path: string): URL {
   const endpoint = new URL(path.replace(/^\//, ""), base);
   if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || endpoint.port !== String(manifest.port) || endpoint.search || endpoint.hash) throw new ControlTransportError("CONTROL_SERVER_ENDPOINT_INVALID");
   return endpoint;
+}
+function errorDetails(value: unknown): Record<string, string | number | boolean> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string | number | boolean] => ["string", "number", "boolean"].includes(typeof entry[1])));
 }
 
 export class LocalHttpControlTransport {
@@ -50,6 +54,26 @@ export class LocalHttpControlTransport {
     await this.request(`/v1/jobs/${jobId}/cancel`, "POST", {}, signal);
   }
 
+  async inspectDocumentRepair(sourcePath: string, documentIdentity: string, signal?: AbortSignal): Promise<DocumentRepairInspection> {
+    const value = await this.request<DocumentRepairInspection>("/v1/document-repairs/inspect", "POST", { schema_version: 1, source_path: sourcePath, document_identity: documentIdentity }, signal);
+    assertDocumentRepairInspection(value);
+    return value;
+  }
+
+  async applyDocumentRepair(repairId: string, signal?: AbortSignal): Promise<DocumentRepairApplied> {
+    if (!isUuid(repairId)) throw new ControlTransportError("DOCUMENT_REPAIR_FAILED");
+    const value = await this.request<DocumentRepairApplied>(`/v1/document-repairs/${repairId}/apply`, "POST", { schema_version: 1 }, signal);
+    assertDocumentRepairApplied(value, repairId);
+    return value;
+  }
+
+  async completeDocumentRepair(repairId: string, outcome: "commit" | "restore", signal?: AbortSignal): Promise<DocumentRepairCompleted> {
+    if (!isUuid(repairId)) throw new ControlTransportError("DOCUMENT_REPAIR_FAILED");
+    const value = await this.request<DocumentRepairCompleted>(`/v1/document-repairs/${repairId}/complete`, "POST", { schema_version: 1, outcome }, signal);
+    assertDocumentRepairCompleted(value, repairId, outcome);
+    return value;
+  }
+
   private async manifest(signal?: AbortSignal): Promise<ControlEndpointManifest> {
     const value = isProvider(this.source) ? await this.source.manifest(signal) : this.source;
     try { return parseControlEndpointManifest(value, Date.now(), this.options.maxHeartbeatAgeMs ?? 10_000); }
@@ -70,8 +94,9 @@ export class LocalHttpControlTransport {
       try { payload = JSON.parse(raw) as unknown; }
       catch { throw new ControlTransportError("CONTROL_SERVER_INVALID_JSON", response.status); }
       if (!response.ok) {
-        const code = payload && typeof payload === "object" && !Array.isArray(payload) && "error" in payload && (payload as { error?: unknown }).error && typeof (payload as { error: { code?: unknown } }).error.code === "string" ? (payload as { error: { code: string } }).error.code : `CONTROL_SERVER_HTTP_${response.status}`;
-        throw new ControlTransportError(code, response.status, response.status >= 500 || response.status === 408 || response.status === 429);
+        const responseError = payload && typeof payload === "object" && !Array.isArray(payload) && "error" in payload && (payload as { error?: unknown }).error && typeof (payload as { error?: unknown }).error === "object" ? (payload as { error: { code?: unknown; details?: unknown } }).error : null;
+        const code = responseError && typeof responseError.code === "string" ? responseError.code : `CONTROL_SERVER_HTTP_${response.status}`;
+        throw new ControlTransportError(code, response.status, response.status >= 500 || response.status === 408 || response.status === 429, { details: errorDetails(responseError?.details) });
       }
       return payload as T;
     } catch (error) {

@@ -47,6 +47,7 @@ WPSJS_PROCESS = ROOT / ".runtime" / "wpsjs-debug-process.json"
 RESOURCE_PROBE = ROOT / ".runtime" / "resource-probe.json"
 JOB_BROKER_PROCESS = ROOT / ".runtime" / "local-job-broker-process.json"
 CONTROL_SERVER_PROCESS = ROOT / ".runtime" / "control-server-process.json"
+CONTROL_SERVER_EXPECTED_VERSION = "1.4.3"
 BROKER_READY_TIMEOUT_SECONDS = 10.0
 BROKER_HEARTBEAT_MAX_AGE_SECONDS = 3.0
 PROCESS_METADATA_TIMEOUT_SECONDS = 2.0
@@ -248,7 +249,7 @@ def control_server_health() -> Dict[str, object]:
     heartbeat = manifest.get("heartbeat_at")
     if not base_url or not token or manifest.get("host") != "127.0.0.1" or not isinstance(port, int) or port == 9528:
         return {}
-    if not isinstance(manifest.get("pid"), int) or not isinstance(manifest.get("instance_id"), str) or not isinstance(manifest.get("process_created_at"), str) or not isinstance(manifest.get("server_version"), str) or manifest.get("contract_version") != 1:
+    if not isinstance(manifest.get("pid"), int) or not isinstance(manifest.get("instance_id"), str) or not isinstance(manifest.get("process_created_at"), str) or manifest.get("server_version") != CONTROL_SERVER_EXPECTED_VERSION or manifest.get("contract_version") != 1:
         return {}
     if not process_is_alive(manifest.get("pid")):
         return {}
@@ -322,6 +323,32 @@ def ensure_control_server() -> Dict[str, object]:
         if process.poll() is not None:
             raise StepFailed("启动 WPS Control Server", "control-server/run.py", "CONTROL_SERVER_EXITED")
     raise StepFailed("启动 WPS Control Server", "control-server/run.py", "CONTROL_SERVER_READY_TIMEOUT")
+
+
+def inject_control_runtime_config() -> None:
+    manifest = read_json(control_manifest_path())
+    config_path = DEBUG_PACKAGE / "ui" / "local-runtime-config.js"
+    source = config_path.read_text(encoding="utf-8")
+    marker = "  controlServerEnabled: false,"
+    if source.count(marker) != 1:
+        raise StepFailed("注入 WPS 控制服务配置", str(config_path), "CONTROL_RUNTIME_CONFIG_MARKER_INVALID")
+    endpoint = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+    config_path.write_text(
+        source.replace(marker, f"  controlServerEnabled: true,\n  controlEndpointManifest: {endpoint},"),
+        encoding="utf-8",
+    )
+    log_event(
+        "INFO",
+        "control_server.config.injected",
+        "WPS 控制服务配置已写入最终调试包",
+        {
+            "result_cn": "成功",
+            "control_server_enabled": True,
+            "control_endpoint_present": True,
+            "control_endpoint_port": manifest["port"],
+            "control_endpoint_instance_suffix": str(manifest["instance_id"])[-8:],
+        },
+    )
 
 
 def stop_control_server() -> None:
@@ -1286,8 +1313,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.action == "start":
             prepare(rebuild_runtime=False)
             verify()
-            run_step("同步最终 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "最终 WPS 调试包已同步。", timeout=60)
             ensure_control_server()
+            run_step("同步最终 WPS 调试包", "pwsh -NoProfile -File scripts/prepare-wps-debug-package.ps1", "最终 WPS 调试包已同步。", timeout=60)
+            inject_control_runtime_config()
             register_addin(force_restart=True)
             print_status(startup=True, watch_logs=not args.once)
             if not args.once:
